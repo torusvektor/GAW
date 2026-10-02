@@ -1,3 +1,7 @@
+# Unreleased — hosted web build
+
+New `npm run build:web`: one URL opens the full editor on laptops and the touch VJ surface on phones, installs as a PWA on macOS, iOS and Android, works offline after the first visit, and deploys to GitHub Pages via `.github/workflows/pages.yml`.
+
 # Ghost Arcade 2.0.16 — October 2, 2026
 
 Fix Windows Screen output routing so projector calibration, source warp and overlap blending reach the projector. See [release notes](docs/releases/v2.0.16.md).

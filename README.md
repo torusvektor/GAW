@@ -54,6 +54,20 @@ npm start
 ```
 Then open `http://localhost:1420`.
 
+### Web App (MacBook, iPhone, Android — no install)
+The browser build is a static site that runs in Safari, Chrome, Edge and Firefox and can be installed as an app (PWA).
+
+```bash
+npm run build:web      # → dist-web/
+npm run preview:web    # serve dist-web/ on http://localhost:4173
+```
+
+- **Laptop / desktop** gets the full editor; **phones and small tablets** get the touch-first standalone VJ surface. Force a layout with `?ui=desktop` or `?ui=mobile` (remembered), reset with `?ui=auto`.
+- **Hosting:** `dist-web/` uses relative paths, so it works from any static host or subfolder. `.github/workflows/pages.yml` deploys it to GitHub Pages on every push to `main` — enable it once under *Settings → Pages → Source: GitHub Actions*.
+- **Install as an app:** iPhone/iPad — Safari → Share → *Add to Home Screen*. Android — Chrome → ⋮ → *Install app*. macOS — Chrome/Edge install icon in the address bar, or Safari → File → *Add to Dock*.
+- **Offline:** a service worker caches the app shell and everything you've opened, so it starts without a network after the first visit.
+- **Browser limits:** no Spout/Syphon/NDI, native file dialogs, MIDI on iOS, or LAN companion server. Camera and microphone need HTTPS (or `localhost`). "Remote to Desktop" mode on a phone needs the desktop app's own LAN URL, not the hosted site.
+
 ### Mobile Companion
 1. Run the desktop app.
 2. Click the QR-code button in the toolbar.
