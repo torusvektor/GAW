@@ -47,6 +47,14 @@ macOS/iOS 26. Tests run natively: `cargo test --manifest-path web-core/Cargo.tom
 | Audio uniforms, beat clock, output gate (blackout) | yes |
 | Commands: `upsert_layer`, `set_layer_visibility`, `set_layer_color`, `set_layer_tint`, `set_layer_native_params`, `remove_layer`, `clear_layers`, `set_audio_state`, `set_beat_clock` + web-only `set_layer_source`, `set_layer_effects`, `set_output_gate` | yes |
 
+## Verified
+
+In headless Chromium with WebGPU (SwiftShader): the page renders at 60 fps,
+a full-screen red layer reads back as (143, 0, 0) because heartbeat.wgsl
+draws plain colour fills at 56 % alpha (`color.a * 0.56`), exactly as the
+native core does, and `set_output_gate` false reads back pure black.
+Not yet tried on real GPUs (Mac Chrome, Android Chrome, iOS 26 Safari).
+
 ## Not yet
 
 - Video and image sources (frame slots): needs `<video>`/WebCodecs →
