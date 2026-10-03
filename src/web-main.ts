@@ -61,6 +61,7 @@ registerServiceWorker();
 function addMobileLayoutButton() {
   const button = document.createElement('button');
   button.type = 'button';
+  button.className = 'ga-mobile-layout-btn';
   button.textContent = 'Mobile layout';
   button.setAttribute('aria-label', 'Switch to the mobile layout');
   button.style.cssText = [
@@ -80,5 +81,15 @@ if (ui === 'mobile') {
   void import('./native-mobile-main');
 } else {
   void import('./main');
-  if (!isPopup && looksLikeTouchDevice()) addMobileLayoutButton();
+  if (!isPopup) {
+    const touch = looksLikeTouchDevice();
+    if (touch) addMobileLayoutButton();
+    // Phones (portrait or landscape) and narrow windows get the one-region
+    // compact layout with a bottom tab bar.
+    void import('./lib/web/compactEditor').then(({ installCompactEditor }) =>
+      installCompactEditor(matchMedia('(max-width: 960px)'), {
+        onMobileLayout: touch ? () => switchWebUi('mobile') : undefined,
+      }),
+    );
+  }
 }
