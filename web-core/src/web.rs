@@ -7,6 +7,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
 
+use crate::autoscale::{AutoScale, DEFAULT_BUDGET_MS};
 use crate::layout::{CompositorLayout, compositor_layout};
 use crate::scene::Scene;
 
@@ -37,6 +38,8 @@ pub struct WebCore {
     /// Milliseconds from the last submit until the GPU reported it done
     /// (f64 bits; written from the queue's work-done callback).
     gpu_ms: Arc<AtomicU64>,
+    /// Dynamic resolution; None while the page picks the scale itself.
+    autoscale: Option<AutoScale>,
 }
 
 fn js_error(message: impl std::fmt::Display) -> JsValue {
@@ -263,6 +266,7 @@ impl WebCore {
             last_time: 0.0,
             adapter_info,
             gpu_ms: Arc::new(AtomicU64::new(0)),
+            autoscale: None,
         })
     }
 
@@ -315,6 +319,10 @@ impl WebCore {
     /// which also sidesteps std::time::Instant, unavailable in wasm32.
     pub fn render(&mut self, time_seconds: f64) -> Result<(), JsValue> {
         self.last_time = time_seconds;
+        let gpu_ms = self.gpu_ms();
+        if let Some(auto) = self.autoscale.as_mut() {
+            auto.sample(gpu_ms);
+        }
         let (layer_bytes, layer_count) = self.scene.pack_layers(&self.layout);
         if layer_bytes.len() as u64 > self.layer_buffer.size() {
             // Grow to the next power of two so adding layers one by one does
@@ -383,6 +391,20 @@ impl WebCore {
         self.queue.present(frame);
         self.frame = self.frame.wrapping_add(1);
         Ok(())
+    }
+
+    /// Turns dynamic resolution on (starting at `start`, 0.25..=1) or off.
+    /// While on, read `renderScale` each frame and size the canvas backing
+    /// store to CSS size x DPR x renderScale, then call `resize`.
+    #[wasm_bindgen(js_name = setAutoResolution)]
+    pub fn set_auto_resolution(&mut self, enabled: bool, start: f32) {
+        self.autoscale = enabled.then(|| AutoScale::new(start, 0.25, 1.0, DEFAULT_BUDGET_MS));
+    }
+
+    /// Scale chosen by dynamic resolution, or 1 when it is off.
+    #[wasm_bindgen(getter, js_name = renderScale)]
+    pub fn render_scale(&self) -> f32 {
+        self.autoscale.as_ref().map_or(1.0, AutoScale::scale)
     }
 
     /// Last measured submit-to-done time in milliseconds.

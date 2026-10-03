@@ -55,6 +55,26 @@ draws plain colour fills at 56 % alpha (`color.a * 0.56`), exactly as the
 native core does, and `set_output_gate` false reads back pure black.
 Not yet tried on real GPUs (Mac Chrome, Android Chrome, iOS 26 Safari).
 
+## Dynamic resolution
+
+`autoscale.rs` keeps the compositor inside a 13 ms GPU budget by scaling the
+render target (time grows with scale², since heartbeat.wgsl is one large
+per-pixel shader). Enable it with `core.setAutoResolution(true, 1)`, then
+size the canvas to CSS size × DPR × `core.renderScale` whenever it changes.
+Decisions use 30-frame windows with a 20-frame cooldown: about 1–2 s to
+react at 30–60 fps.
+
+Galaxy S25 Ultra, Chrome, 678×786 CSS px at DPR 2, colour layers:
+
+| Scale | GPU (submit→done) | fps |
+|---|---|---|
+| 25 % | 9 ms | 60 |
+| 50 % | 14 ms | 60 |
+| 75 % | 16 ms | 60 |
+| 100 % | 46 ms (queue backed up) | 52 |
+
+MacBook Pro (Radeon Pro Vega 20), Chrome: 4452×2228 at ~55 fps.
+
 ## Not yet
 
 - Video and image sources (frame slots): needs `<video>`/WebCodecs →

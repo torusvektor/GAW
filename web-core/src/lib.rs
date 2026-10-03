@@ -14,6 +14,7 @@
 #[path = "../../native-renderer/src/compositor.rs"]
 #[allow(dead_code)]
 mod compositor;
+pub mod autoscale;
 pub mod layout;
 pub mod scene;
 

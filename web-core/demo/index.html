@@ -69,7 +69,7 @@
   <label class="control" for="pin"><input id="pin" type="checkbox" checked /><span>Corner pin</span></label>
   <label class="control" for="scale"><span>Rozlišení</span>
     <select id="scale">
-      <option value="1">100 %</option><option value="0.75">75 %</option><option value="0.5">50 %</option><option value="0.25">25 %</option>
+      <option value="auto" selected>Auto</option><option value="1">100 %</option><option value="0.75">75 %</option><option value="0.5">50 %</option><option value="0.25">25 %</option>
     </select></label>
   <label class="control" for="gate"><input id="gate" type="checkbox" /><span>Blackout</span></label>
 </div>
@@ -82,8 +82,13 @@
   const $ = (id) => document.getElementById(id);
   const setStatus = (text, error = false) => { statusEl.textContent = text; statusEl.classList.toggle('error', error); };
 
+  // Manual picks set the scale directly; "auto" lets the core's dynamic
+  // resolution choose it from measured GPU time.
+  let core = null;
+  const isAuto = () => $('scale').value === 'auto';
+  const currentScale = () => (isAuto() ? (core ? core.renderScale : 1) : Number($('scale').value));
   function fitCanvas() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2) * Number($('scale').value);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2) * currentScale();
     canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
     canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
   }
@@ -118,7 +123,6 @@
     }
     await init();
     fitCanvas();
-    let core;
     try {
       core = await WebCore.create(canvas);
     } catch (error) {
@@ -128,7 +132,10 @@
     core.apply(JSON.stringify([{ type: 'set_beat_clock', beat: 0, bpm: 120 }]));
     const refit = () => { fitCanvas(); core.resize(canvas.width, canvas.height); };
     new ResizeObserver(refit).observe(canvas);
-    $('scale').addEventListener('change', refit);
+    let appliedScale = 1;
+    const applyMode = () => { core.setAutoResolution(isAuto(), 1); appliedScale = currentScale(); refit(); };
+    $('scale').addEventListener('change', applyMode);
+    applyMode();
 
     // Per-window stats: frame intervals bucketed by display refresh, the
     // JS + Wasm time spent per frame, and the GPU submit-to-done time.
@@ -146,6 +153,10 @@
         setStatus('Chyba vykreslení:\n' + error, true);
         return;
       }
+      if (isAuto() && core.renderScale !== appliedScale) {
+        appliedScale = core.renderScale;
+        refit();
+      }
       const interval = now - prev;
       prev = now;
       win.frames++;
@@ -159,7 +170,7 @@
         const fps = Math.round(n * 1000 / (now - win.start));
         setStatus(
           `${core.adapter || 'WebGPU'}\n` +
-          `${canvas.width}×${canvas.height} px · ${fps} fps · ${core.layerCount} vrstvy\n` +
+          `${canvas.width}×${canvas.height} px (${isAuto() ? 'auto ' : ''}${Math.round(currentScale() * 100)} %) · ${fps} fps · ${core.layerCount} vrstvy\n` +
           `GPU ${ms(win.gpu / n)} ms (max ${ms(win.gpuMax)}) · JS+Wasm ${ms(win.cpu / n)} ms\n` +
           `snímky ≤20 ms: ${win.fast} · 20–40 ms: ${win.mid} · >40 ms: ${win.slow}`
         );
