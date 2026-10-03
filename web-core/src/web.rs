@@ -1,5 +1,8 @@
 //! WebGPU renderer and the wasm-bindgen surface. Browser-only.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 use wgpu::util::DeviceExt;
@@ -31,6 +34,9 @@ pub struct WebCore {
     frame: u64,
     last_time: f64,
     adapter_info: String,
+    /// Milliseconds from the last submit until the GPU reported it done
+    /// (f64 bits; written from the queue's work-done callback).
+    gpu_ms: Arc<AtomicU64>,
 }
 
 fn js_error(message: impl std::fmt::Display) -> JsValue {
@@ -256,6 +262,7 @@ impl WebCore {
             frame: 0,
             last_time: 0.0,
             adapter_info,
+            gpu_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -366,9 +373,22 @@ impl WebCore {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        // Submit-to-done latency: GPU time plus queueing. Timestamp queries
+        // would be exact but are an optional feature many phones lack.
+        let submitted = now_ms();
+        let gpu_ms = Arc::clone(&self.gpu_ms);
+        self.queue.on_submitted_work_done(move || {
+            gpu_ms.store((now_ms() - submitted).to_bits(), Ordering::Relaxed);
+        });
         self.queue.present(frame);
         self.frame = self.frame.wrapping_add(1);
         Ok(())
+    }
+
+    /// Last measured submit-to-done time in milliseconds.
+    #[wasm_bindgen(getter, js_name = gpuMs)]
+    pub fn gpu_ms(&self) -> f64 {
+        f64::from_bits(self.gpu_ms.load(Ordering::Relaxed))
     }
 
     #[wasm_bindgen(getter)]
@@ -386,4 +406,8 @@ impl WebCore {
     pub fn layout_info(&self) -> String {
         format!("uniforms {} B, layer stride {} B", self.layout.uniforms.size, self.layout.layer.size)
     }
+}
+
+fn now_ms() -> f64 {
+    web_sys::window().and_then(|window| window.performance()).map(|performance| performance.now()).unwrap_or(0.0)
 }
