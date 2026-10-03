@@ -2,6 +2,13 @@
 
 ---
 
+## Unreleased
+
+- New hosted web build (`npm run build:web`): one URL opens the full editor on
+  laptops and the touch VJ surface on phones, installs as a PWA on macOS, iOS
+  and Android, works offline after the first visit, and deploys to GitHub
+  Pages via `.github/workflows/pages.yml`.
+
 ## v1.9.99 - Live Performance and Control Polish (July 2026)
 
 - Layer blending, armed video triggering, master-warp keyboard nudging, and

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 dist-native-mobile/
+dist-web/
 dist-electron*/
 dist-release/
 .vite/

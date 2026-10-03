@@ -89,7 +89,14 @@ async function init() {
     return;
   }
 
-  await mountMobile(null);
+  // Hosted web build: honour the mode picked on a previous visit so the
+  // picker only shows once, like in the native shell.
+  let stored: MobileMode | null = null;
+  try {
+    const raw = localStorage.getItem(MOBILE_MODE_KEY);
+    if (raw === 'standalone' || raw === 'remote') stored = raw;
+  } catch { /* private mode */ }
+  await mountMobile(stored);
   hideSplash();
 }
 
