@@ -331,6 +331,11 @@ export class StandaloneRenderer {
       gl.deleteProgram(compiled.program);
     }
     this.effectCache.clear();
+    // Hand the context back now instead of at garbage collection. Browsers
+    // cap live WebGL contexts (Chrome on Android at a handful) and evict
+    // the oldest when a new one is created, so thumbnail renderers that
+    // linger would cost the live layers their contexts.
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
 
   private render() {
@@ -627,6 +632,12 @@ export class StandaloneRenderer {
     gl.shaderSource(shader, source);
     gl.compileShader(shader);
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      // A lost context fails every compile with an empty log; say so
+      // instead of blaming the shader source.
+      if (gl.isContextLost()) {
+        gl.deleteShader(shader);
+        throw new Error('WebGL context lost (GPU reset or too many WebGL contexts)');
+      }
       const info = gl.getShaderInfoLog(shader) || 'unknown compile error';
       gl.deleteShader(shader);
       throw new Error(`Shader compile failed: ${info}\n\n${source.slice(0, 600)}`);

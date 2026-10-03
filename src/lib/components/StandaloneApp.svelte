@@ -1637,17 +1637,52 @@
   }
 
   // ── Lifecycle ──
+  // Builds layer i's renderer and reloads what the layer shows. Also used
+  // after a lost WebGL context is restored, when every GPU resource the
+  // old renderer held is gone.
+  function buildRenderer(i: number): void {
+    const c = canvases[i];
+    if (!c) return;
+    const r = new StandaloneRenderer(c);
+    renderers[i] = r;
+    r.start();
+    const layer = state.layers[i];
+    const media = mediaElements[i];
+    if (layer.sourceType === 'media' && media) r.loadMediaSource(media);
+    else if (layer.shaderId) void fetchAndLoad(r, layer.shaderId);
+    r.setClipParams({ speed: layer.playbackSpeed, intensity: layer.audioIntensity });
+    pushLayerEffects(i);
+  }
+
+  // Android drops WebGL contexts after GPU resets or when the browser's
+  // context limit is hit; without this the layer stays black and every
+  // later shader load fails. preventDefault() asks for a restore.
+  const contextListeners: Array<() => void> = [];
+  function watchContext(i: number): void {
+    const c = canvases[i];
+    if (!c) return;
+    const onLost = (event: Event) => {
+      event.preventDefault();
+      // stop(), not destroy(): destroy() would release the context that
+      // is about to be restored.
+      renderers[i]?.stop();
+      renderers[i] = null;
+    };
+    const onRestored = () => buildRenderer(i);
+    c.addEventListener('webglcontextlost', onLost);
+    c.addEventListener('webglcontextrestored', onRestored);
+    contextListeners.push(() => {
+      c.removeEventListener('webglcontextlost', onLost);
+      c.removeEventListener('webglcontextrestored', onRestored);
+    });
+  }
+
   onMount(() => {
     // Spin up one renderer per layer. The layer's currently-assigned
     // shader (if any) loads immediately so first paint shows content.
     for (let i = 0; i < N_LAYERS; i++) {
-      const c = canvases[i];
-      if (!c) continue;
-      const r = new StandaloneRenderer(c);
-      renderers[i] = r;
-      r.start();
-      if (state.layers[i].shaderId) void fetchAndLoad(r, state.layers[i].shaderId);
-      pushLayerEffects(i);
+      buildRenderer(i);
+      watchContext(i);
     }
     pumpTimer = setInterval(pumpAudio, 16);
     resizeObs = new ResizeObserver(() => {
@@ -1663,6 +1698,7 @@
 	  onDestroy(() => {
     if (pumpTimer) clearInterval(pumpTimer);
     resizeObs?.disconnect();
+    for (const remove of contextListeners) remove();
     for (let i = 0; i < N_LAYERS; i++) cleanupMediaLayer(i);
     for (const r of renderers) r?.destroy();
     renderers = new Array(N_LAYERS).fill(null);
