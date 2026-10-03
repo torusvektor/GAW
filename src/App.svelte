@@ -590,7 +590,10 @@
   // older Android Chrome) fall back to the plain WebGL editor instead of
   // showing the bridge error. Runtime-only: the saved setting is kept so
   // the same profile in a WebGPU-capable browser still uses the bridge.
-  let webgpuUnavailable = false;
+  // No navigator.gpu at all (e.g. Safari on macOS 14) is known up front,
+  // so the bridge never mounts there; a null adapter is only known after
+  // the async probe and swaps the editor to WebGL once it resolves.
+  let webgpuUnavailable = typeof navigator !== 'undefined' && !(navigator as any).gpu;
   void probeWebGPU().then((ok) => {
     if (!ok) {
       webgpuUnavailable = true;
