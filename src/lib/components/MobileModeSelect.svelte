@@ -1,5 +1,9 @@
 <script lang="ts">
   export let onSelect: (mode: 'standalone' | 'remote') => void;
+  /** Set by the hosted web build (GitHub Pages and similar), which can
+   *  also open the full editor but cannot reach a desktop over ws://. */
+  export let onOpenEditor: (() => void) | null = null;
+  export let remoteUnavailable = false;
 </script>
 
 <div data-help-page="mobile-control" class="mode-select">
@@ -12,9 +16,19 @@
     <div class="mode-desc">VJ + projection mapping from this device alone. Plug into a projector with USB-C → HDMI.</div>
   </button>
 
-  <button class="mode-card" onclick={() => onSelect('remote')}>
+  {#if onOpenEditor}
+    <button class="mode-card" onclick={onOpenEditor}>
+      <div class="mode-title">Full Editor</div>
+      <div class="mode-desc">The complete desktop editor: layers, mapping, Looks, VJ decks and the 3D stage. Best on a tablet or in landscape.</div>
+    </button>
+  {/if}
+
+  <button class="mode-card" onclick={() => onSelect('remote')} disabled={remoteUnavailable}>
     <div class="mode-title">Remote to Desktop</div>
     <div class="mode-desc">Control a desktop Ghost Arcade running on your computer over WiFi.</div>
+    {#if remoteUnavailable}
+      <div class="mode-note">Not available on this website: browsers block a secure page from connecting to the desktop app on your network. Scan the QR code in the desktop app instead.</div>
+    {/if}
   </button>
 
   <p class="footnote">You can switch modes any time from settings.</p>
@@ -67,6 +81,17 @@
   .mode-card:active {
     transform: scale(0.98);
     background: #1c1c24;
+  }
+  .mode-card:disabled {
+    cursor: default;
+    opacity: 0.55;
+    transform: none;
+  }
+  .mode-note {
+    margin-top: 8px;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--text-muted, #aaa);
   }
   .mode-card.primary {
     border-color: #BB86FC;

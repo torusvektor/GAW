@@ -5,6 +5,7 @@ import './lib/theming/store';
 import './lib/theming/fonts.css';
 import './lib/theming/studio-skin.css';
 import { installRangeProgressSync } from './lib/theming/rangeProgress';
+import { isHostedWeb, switchWebUi } from './lib/webUi';
 
 installRangeProgressSync();
 silenceThreeSerializationNoise();
@@ -46,9 +47,12 @@ async function mountMobile(mode: MobileMode | null) {
   }
 
   const { default: MobileModeSelect } = await import('./lib/components/MobileModeSelect.svelte');
+  const hosted = isHostedWeb();
   mount(MobileModeSelect, {
     target,
     props: {
+      onOpenEditor: hosted ? () => switchWebUi('desktop') : null,
+      remoteUnavailable: hosted && window.location.protocol === 'https:',
       onSelect: (picked: MobileMode) => {
         try { localStorage.setItem(MOBILE_MODE_KEY, picked); } catch { /* private mode */ }
         void mountMobile(picked);
@@ -90,11 +94,14 @@ async function init() {
   }
 
   // Hosted web build: honour the mode picked on a previous visit so the
-  // picker only shows once, like in the native shell.
+  // picker only shows once, like in the native shell. Remote cannot reach a
+  // desktop from an https page (ws:// is blocked), so a stored "remote"
+  // from before that was known falls back to the picker.
   let stored: MobileMode | null = null;
   try {
     const raw = localStorage.getItem(MOBILE_MODE_KEY);
-    if (raw === 'standalone' || raw === 'remote') stored = raw;
+    if (raw === 'standalone') stored = raw;
+    else if (raw === 'remote' && window.location.protocol !== 'https:') stored = raw;
   } catch { /* private mode */ }
   await mountMobile(stored);
   hideSplash();

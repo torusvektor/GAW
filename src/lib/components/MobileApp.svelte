@@ -1289,6 +1289,9 @@
   // when the user is already inside an installed native app.
   const isCapacitorNative = !!(window as any).Capacitor?.isNativePlatform?.();
   const showVisionMode = isCapacitorNative;
+  // The hosted web build (web-main.ts) also boots through the mode picker,
+  // so it needs the way back out just like the native shell.
+  const canSwitchMode = isCapacitorNative || !!document.documentElement.dataset.webUi;
 
   $: if (!showVisionMode && mobileMode === 'vision') {
     stopPhoneVision(false);
@@ -3176,7 +3179,7 @@
   {#if !connected}
     <!-- Connection Screen -->
     <div class="connect-screen">
-      {#if isCapacitorNative}
+      {#if canSwitchMode}
         <button class="switch-mode-link" onclick={switchMobileMode}>‹ Switch mode</button>
       {/if}
       <img class="connect-logo" src="{import.meta.env.BASE_URL}icon-new.png" alt="Ghost Arcade" />
