@@ -77,7 +77,7 @@
   function resetFx() { stage3dScene.setAtmosphere({ ...DEFAULT_ATMOSPHERE }); }
 </script>
 
-<div class="lighting">
+<div data-help-page="stage-simulator" class="lighting">
   <div class="head">
     <span>Lighting</span>
     <button class="reset" onclick={reset} title="Reset to venue defaults">Reset</button>
@@ -405,7 +405,7 @@
   }
   .val {
     text-align: right;
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'Geist Mono', monospace;
     font-size: 11px;
     color: #4af2ff;
   }

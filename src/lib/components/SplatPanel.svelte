@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { project, selectedLayer } from '../stores/layers';
+  import { project, selectedLayer, scheduleHistorySnapshot } from '../stores/layers';
   import type {
     SplatContent,
     SplatAnimationType,
@@ -7,6 +7,7 @@
     SplatColorEffectType,
     SplatOpacityEffectType,
     SplatCreativeEffectType,
+    SplatEffectBlendMode,
     SplatRenderMode,
     SplatMouseInteraction,
     SplatImportOrientation,
@@ -106,6 +107,16 @@
     { value: 'echo', label: 'Echo / Ghost' },
   ];
 
+  // How the constellation sparkle combines with the point's own colour.
+  // Per-splat, evaluated in the fragment shader — distinct from the
+  // layer-level blend mode that composites the whole layer downstream.
+  const constellationBlendModes: { value: SplatEffectBlendMode; label: string }[] = [
+    { value: 'add', label: 'Add' },
+    { value: 'screen', label: 'Screen' },
+    { value: 'multiply', label: 'Multiply' },
+    { value: 'replace', label: 'Replace' },
+  ];
+
   // Render modes
   const renderModes: { value: SplatRenderMode; label: string }[] = [
     { value: 'points', label: 'Points' },
@@ -191,7 +202,9 @@
   let showAnimation = true;
   let showDisplacement = false;
   let showLighting = false;
+  let showMaterial = false;
   let showAtmosphere = false;
+  let showVolumetrics = false;
   let showColorEffects = false;
   let showOpacityEffects = false;
   let showCreativeEffects = false;
@@ -224,6 +237,7 @@
       onUpdate(normalizedUpdates);
     } else if (layer) {
       project.updateSplatContent(layer.id, normalizedUpdates);
+      scheduleHistorySnapshot();
       for (const [paramKey, value] of Object.entries(normalizedUpdates)) {
         const descriptor = SPLAT_AUTOMATABLE_PARAM_MAP.get(paramKey as keyof SplatContent & string);
         if (!descriptor || typeof value !== 'number') continue;
@@ -401,7 +415,7 @@
 {/snippet}
 
 {#if isVJMode ? sc : layer && sc}
-  <div class="splat-panel" class:compact>
+  <div data-help-page="point-clouds" class="splat-panel" class:compact>
     {#if !compact}<h3>Splat / Point Cloud</h3>{/if}
 
     <!-- File Loading -->
@@ -734,7 +748,7 @@
             <input
               type="range"
               min="0.1"
-              max="5"
+              max="20"
               step="0.05"
               value={sc.pointSize}
               oninput={(e) => doUpdate({ pointSize: parseFloat((e.target as HTMLInputElement).value) })}
@@ -1470,6 +1484,358 @@
       {/if}
     </div>
 
+    <!-- Material Section -->
+    <!-- Splat previously had a lighting rig but no material model at all.
+         These shape how the lighting lands: lobe tightness, highlight and
+         rim tints independent of light colour, plus a per-point glow. -->
+    <div class="section collapsible" class:open={showMaterial}>
+      <button class="section-header" onclick={() => (showMaterial = !showMaterial)}>
+        <span>Material &amp; Glow</span>
+        <span class="chevron">{showMaterial ? '−' : '+'}</span>
+      </button>
+      {#if showMaterial}
+        <div class="section-content">
+          <div class="property-row">
+            <label>Shininess</label>
+            <input
+              type="range" min="1" max="128" step="1"
+              value={sc.specularShininess ?? 24}
+              oninput={(e) => doUpdate({ specularShininess: parseFloat((e.target as HTMLInputElement).value) })}
+              data-midi-path="map:splat:specularShininess"
+              data-midi-label="Shininess"
+              data-midi-min="1" data-midi-max="128" data-midi-step="1"
+            />
+            {@render splatModButton('specularShininess')}
+            <span class="value">{(sc.specularShininess ?? 24).toFixed(0)}</span>
+          </div>
+
+          <div class="property-row">
+            <label>Metallic</label>
+            <input
+              type="range" min="0" max="1" step="0.01"
+              value={sc.metallic ?? 0}
+              oninput={(e) => doUpdate({ metallic: parseFloat((e.target as HTMLInputElement).value) })}
+              data-midi-path="map:splat:metallic"
+              data-midi-label="Metallic"
+              data-midi-min="0" data-midi-max="1" data-midi-step="0.01"
+            />
+            {@render splatModButton('metallic')}
+            <span class="value">{(sc.metallic ?? 0).toFixed(2)}</span>
+          </div>
+
+          <div class="property-row">
+            <label>Fresnel Power</label>
+            <input
+              type="range" min="0.5" max="8" step="0.05"
+              value={sc.fresnelPower ?? 3}
+              oninput={(e) => doUpdate({ fresnelPower: parseFloat((e.target as HTMLInputElement).value) })}
+              data-midi-path="map:splat:fresnelPower"
+              data-midi-label="Fresnel Power"
+              data-midi-min="0.5" data-midi-max="8" data-midi-step="0.05"
+            />
+            {@render splatModButton('fresnelPower')}
+            <span class="value">{(sc.fresnelPower ?? 3).toFixed(2)}</span>
+          </div>
+
+          <div class="property-row">
+            <label>Emissive</label>
+            <input
+              type="range" min="0" max="3" step="0.01"
+              value={sc.emissiveStrength ?? 0}
+              oninput={(e) => doUpdate({ emissiveStrength: parseFloat((e.target as HTMLInputElement).value) })}
+              data-midi-path="map:splat:emissiveStrength"
+              data-midi-label="Emissive"
+              data-midi-min="0" data-midi-max="3" data-midi-step="0.01"
+            />
+            {@render splatModButton('emissiveStrength')}
+            <span class="value">{(sc.emissiveStrength ?? 0).toFixed(2)}</span>
+          </div>
+
+          <div class="property-row">
+            <label>Specular Tint</label>
+            <input
+              type="color"
+              value={sc.specularTint ?? '#ffffff'}
+              oninput={(e) => doUpdate({ specularTint: (e.target as HTMLInputElement).value })}
+            />
+          </div>
+
+          <div class="property-row">
+            <label>Rim Tint</label>
+            <input
+              type="color"
+              value={sc.rimTint ?? '#ffffff'}
+              oninput={(e) => doUpdate({ rimTint: (e.target as HTMLInputElement).value })}
+            />
+          </div>
+
+          <div class="subsection-label">Glow</div>
+          <p class="hint">
+            Per-point glow that stays welded to bright points as they move.
+            For a full-frame bloom, add the Bloom effect from the layer's
+            Effects list instead.
+          </p>
+
+          <div class="property-row">
+            <label>Glow Strength</label>
+            <input
+              type="range" min="0" max="3" step="0.01"
+              value={sc.bloom ?? 0}
+              oninput={(e) => doUpdate({ bloom: parseFloat((e.target as HTMLInputElement).value) })}
+              data-midi-path="map:splat:bloom"
+              data-midi-label="Glow Strength"
+              data-midi-min="0" data-midi-max="3" data-midi-step="0.01"
+            />
+            {@render splatModButton('bloom')}
+            <span class="value">{(sc.bloom ?? 0).toFixed(2)}</span>
+          </div>
+
+          <div class="property-row">
+            <label>Glow Threshold</label>
+            <input
+              type="range" min="0" max="1" step="0.01"
+              value={sc.bloomThreshold ?? 0.5}
+              oninput={(e) => doUpdate({ bloomThreshold: parseFloat((e.target as HTMLInputElement).value) })}
+              data-midi-path="map:splat:bloomThreshold"
+              data-midi-label="Glow Threshold"
+              data-midi-min="0" data-midi-max="1" data-midi-step="0.01"
+            />
+            {@render splatModButton('bloomThreshold')}
+            <span class="value">{(sc.bloomThreshold ?? 0.5).toFixed(2)}</span>
+          </div>
+
+          <div class="property-row">
+            <label>Glow Radius</label>
+            <input
+              type="range" min="1" max="4" step="0.05"
+              value={sc.bloomRadius ?? 2}
+              oninput={(e) => doUpdate({ bloomRadius: parseFloat((e.target as HTMLInputElement).value) })}
+              data-midi-path="map:splat:bloomRadius"
+              data-midi-label="Glow Radius"
+              data-midi-min="1" data-midi-max="4" data-midi-step="0.05"
+            />
+            {@render splatModButton('bloomRadius')}
+            <span class="value">{(sc.bloomRadius ?? 2).toFixed(2)}</span>
+          </div>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Volumetric Light Section -->
+    <div class="section collapsible" class:open={showVolumetrics}>
+      <button class="section-header" onclick={() => (showVolumetrics = !showVolumetrics)}>
+        <span>Volumetric Light</span>
+        <span class="chevron">{showVolumetrics ? '−' : '+'}</span>
+      </button>
+      {#if showVolumetrics}
+        <div class="section-content">
+          <div class="property-row checkbox">
+            <label>
+              <input
+                type="checkbox"
+                checked={sc.volumetricEnabled ?? false}
+                onchange={(e) => doUpdate({ volumetricEnabled: (e.target as HTMLInputElement).checked })}
+                data-midi-path="map:splat:volumetricEnabled"
+                data-midi-label="Volumetric Light"
+                data-midi-mode="toggle"
+              />
+              Enable Light Shafts
+            </label>
+          </div>
+          <p class="section-note">
+            Beams and cast shadows built from the cloud itself, lit by the Key Light above.
+          </p>
+
+          {#if sc.volumetricEnabled ?? false}
+            <div class="property-row">
+              <label>Haze Density</label>
+              <input
+                type="range"
+                min="0"
+                max="3"
+                step="0.01"
+                value={sc.volumetricDensity ?? 1.2}
+                oninput={(e) => doUpdate({ volumetricDensity: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricDensity"
+                data-midi-label="Haze Density"
+                data-midi-min="0"
+                data-midi-max="3"
+                data-midi-step="0.01"
+              />
+              {@render splatModButton('volumetricDensity')}
+              <span class="value">{(sc.volumetricDensity ?? 1.2).toFixed(2)}</span>
+            </div>
+
+            <div class="property-row">
+              <label>Haze Colour</label>
+              <input
+                type="color"
+                value={sc.volumetricColor ?? '#cfe0ff'}
+                oninput={(e) => doUpdate({ volumetricColor: (e.target as HTMLInputElement).value })}
+                data-midi-path="map:splat:volumetricColor"
+                data-midi-label="Haze Colour"
+              />
+            </div>
+
+            <div class="property-row">
+              <label>Shaft Power</label>
+              <input
+                type="range"
+                min="0"
+                max="3"
+                step="0.01"
+                value={sc.volumetricStrength ?? 1.4}
+                oninput={(e) => doUpdate({ volumetricStrength: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricStrength"
+                data-midi-label="Shaft Power"
+                data-midi-min="0"
+                data-midi-max="3"
+                data-midi-step="0.01"
+              />
+              {@render splatModButton('volumetricStrength')}
+              <span class="value">{(sc.volumetricStrength ?? 1.4).toFixed(2)}</span>
+            </div>
+
+            <div class="property-row">
+              <label>Shadow Density</label>
+              <input
+                type="range"
+                min="0"
+                max="6"
+                step="0.01"
+                value={sc.volumetricShadowDensity ?? 1.6}
+                oninput={(e) => doUpdate({ volumetricShadowDensity: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricShadowDensity"
+                data-midi-label="Shaft Shadow Density"
+                data-midi-min="0"
+                data-midi-max="6"
+                data-midi-step="0.01"
+              />
+              {@render splatModButton('volumetricShadowDensity')}
+              <span class="value">{(sc.volumetricShadowDensity ?? 1.6).toFixed(2)}</span>
+            </div>
+
+            <div class="property-row">
+              <label>Cloud Shadowing</label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={sc.volumetricShadowStrength ?? 0.5}
+                oninput={(e) => doUpdate({ volumetricShadowStrength: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricShadowStrength"
+                data-midi-label="Cloud Self Shadowing"
+                data-midi-min="0"
+                data-midi-max="1"
+                data-midi-step="0.01"
+              />
+              {@render splatModButton('volumetricShadowStrength')}
+              <span class="value">{(sc.volumetricShadowStrength ?? 0.5).toFixed(2)}</span>
+            </div>
+
+            <div class="property-row">
+              <label>Shadow Volume</label>
+              <select
+                value={String(sc.volumetricShadowRes ?? 0)}
+                onchange={(e) => doUpdate({ volumetricShadowRes: parseInt((e.target as HTMLSelectElement).value, 10) })}
+                data-midi-path="map:splat:volumetricShadowRes"
+                data-midi-label="Shadow Volume Resolution"
+                data-midi-discrete="0,32,48,64,80,96"
+              >
+                <option value="0">Auto (quality tier)</option>
+                <option value="32">32³ (fast)</option>
+                <option value="48">48³</option>
+                <option value="64">64³</option>
+                <option value="80">80³</option>
+                <option value="96">96³ (sharp)</option>
+              </select>
+            </div>
+
+            <div class="property-row">
+              <label>Spot Angle</label>
+              <input
+                type="range"
+                min="5"
+                max="180"
+                step="1"
+                value={sc.volumetricSpotAngle ?? 38}
+                oninput={(e) => doUpdate({ volumetricSpotAngle: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricSpotAngle"
+                data-midi-label="Spot Angle"
+                data-midi-min="5"
+                data-midi-max="180"
+                data-midi-step="1"
+              />
+              {@render splatModButton('volumetricSpotAngle')}
+              <span class="value">{Math.round(sc.volumetricSpotAngle ?? 38)}°</span>
+            </div>
+
+            <div class="property-row">
+              <label>Spot Softness</label>
+              <input
+                type="range"
+                min="0.01"
+                max="1"
+                step="0.01"
+                value={sc.volumetricSpotSoftness ?? 0.4}
+                oninput={(e) => doUpdate({ volumetricSpotSoftness: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricSpotSoftness"
+                data-midi-label="Spot Softness"
+                data-midi-min="0.01"
+                data-midi-max="1"
+                data-midi-step="0.01"
+              />
+              {@render splatModButton('volumetricSpotSoftness')}
+              <span class="value">{(sc.volumetricSpotSoftness ?? 0.4).toFixed(2)}</span>
+            </div>
+
+            <div class="property-row">
+              <label>Light Distance</label>
+              <input
+                type="range"
+                min="1"
+                max="20"
+                step="0.05"
+                value={sc.volumetricLightDistance ?? 6.5}
+                oninput={(e) => doUpdate({ volumetricLightDistance: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricLightDistance"
+                data-midi-label="Shaft Light Distance"
+                data-midi-min="1"
+                data-midi-max="20"
+                data-midi-step="0.05"
+              />
+              {@render splatModButton('volumetricLightDistance')}
+              <span class="value">{(sc.volumetricLightDistance ?? 6.5).toFixed(2)}</span>
+            </div>
+
+            <div class="property-row">
+              <label>Scatter Bias</label>
+              <input
+                type="range"
+                min="-0.95"
+                max="0.95"
+                step="0.01"
+                value={sc.volumetricAnisotropy ?? 0.6}
+                oninput={(e) => doUpdate({ volumetricAnisotropy: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:volumetricAnisotropy"
+                data-midi-label="Shaft Scatter Bias"
+                data-midi-min="-0.95"
+                data-midi-max="0.95"
+                data-midi-step="0.01"
+              />
+              {@render splatModButton('volumetricAnisotropy')}
+              <span class="value">{(sc.volumetricAnisotropy ?? 0.6).toFixed(2)}</span>
+            </div>
+
+            <p class="section-note">
+              Beam direction follows Key Orbit / Key Pitch in the Lighting section.
+            </p>
+          {/if}
+        </div>
+      {/if}
+    </div>
+
     <!-- Atmosphere Section -->
     <div class="section collapsible" class:open={showAtmosphere}>
       <button class="section-header" onclick={() => (showAtmosphere = !showAtmosphere)}>
@@ -1864,6 +2230,108 @@
               <span class="value">{(sc.creativeEffectIntensity * 100).toFixed(0)}%</span>
             </div>
           {/if}
+
+          <!-- Datamosh: flicker rate was hardcoded at 10Hz with no control. -->
+          {#if sc.creativeEffect === 'datamosh'}
+            <div class="property-row">
+              <label>Flicker Speed</label>
+              <input
+                type="range" min="0" max="4" step="0.01"
+                value={sc.datamoshSpeed ?? 1}
+                oninput={(e) => doUpdate({ datamoshSpeed: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:datamoshSpeed"
+                data-midi-label="Datamosh Speed"
+                data-midi-min="0" data-midi-max="4" data-midi-step="0.01"
+              />
+              {@render splatModButton('datamoshSpeed')}
+              <span class="value">{(sc.datamoshSpeed ?? 1).toFixed(2)}×</span>
+            </div>
+            <p class="hint">0 freezes the glitch; 1 is the original rate.</p>
+          {/if}
+
+          <!-- Constellation: a per-point sparkle (it does not draw lines). -->
+          {#if sc.creativeEffect === 'constellation'}
+            <div class="property-row">
+              <label>Sparkle Speed</label>
+              <input
+                type="range" min="0" max="8" step="0.01"
+                value={sc.constellationSpeed ?? 1}
+                oninput={(e) => doUpdate({ constellationSpeed: parseFloat((e.target as HTMLInputElement).value) })}
+                data-midi-path="map:splat:constellationSpeed"
+                data-midi-label="Constellation Speed"
+                data-midi-min="0" data-midi-max="8" data-midi-step="0.01"
+              />
+              {@render splatModButton('constellationSpeed')}
+              <span class="value">{(sc.constellationSpeed ?? 1).toFixed(2)}×</span>
+            </div>
+
+            <div class="property-row">
+              <label>Blend</label>
+              <select
+                value={sc.constellationBlend ?? 'add'}
+                onchange={(e) =>
+                  doUpdate({ constellationBlend: (e.target as HTMLSelectElement).value as SplatEffectBlendMode })}
+              >
+                {#each constellationBlendModes as mode}
+                  <option value={mode.value}>{mode.label}</option>
+                {/each}
+              </select>
+            </div>
+
+            <div class="property-row">
+              <label>Wave Mode</label>
+              <input
+                type="checkbox"
+                checked={sc.constellationWave ?? false}
+                onchange={(e) => doUpdate({ constellationWave: (e.target as HTMLInputElement).checked })}
+              />
+            </div>
+
+            {#if sc.constellationWave}
+              <p class="hint">
+                Sparkle sweeps across the cloud as a travelling front instead
+                of firing uniformly.
+              </p>
+              <div class="property-row">
+                <label>Wave Axis</label>
+                <select
+                  value={sc.constellationWaveAxis ?? 'y'}
+                  onchange={(e) =>
+                    doUpdate({ constellationWaveAxis: (e.target as HTMLSelectElement).value as 'x' | 'y' | 'z' })}
+                >
+                  <option value="x">X</option>
+                  <option value="y">Y</option>
+                  <option value="z">Z</option>
+                </select>
+              </div>
+              <div class="property-row">
+                <label>Wave Frequency</label>
+                <input
+                  type="range" min="0.1" max="8" step="0.01"
+                  value={sc.constellationWaveFrequency ?? 1.5}
+                  oninput={(e) => doUpdate({ constellationWaveFrequency: parseFloat((e.target as HTMLInputElement).value) })}
+                  data-midi-path="map:splat:constellationWaveFrequency"
+                  data-midi-label="Constellation Wave Freq"
+                  data-midi-min="0.1" data-midi-max="8" data-midi-step="0.01"
+                />
+                {@render splatModButton('constellationWaveFrequency')}
+                <span class="value">{(sc.constellationWaveFrequency ?? 1.5).toFixed(2)}</span>
+              </div>
+              <div class="property-row">
+                <label>Wave Speed</label>
+                <input
+                  type="range" min="-4" max="4" step="0.01"
+                  value={sc.constellationWaveSpeed ?? 1}
+                  oninput={(e) => doUpdate({ constellationWaveSpeed: parseFloat((e.target as HTMLInputElement).value) })}
+                  data-midi-path="map:splat:constellationWaveSpeed"
+                  data-midi-label="Constellation Wave Speed"
+                  data-midi-min="-4" data-midi-max="4" data-midi-step="0.01"
+                />
+                {@render splatModButton('constellationWaveSpeed')}
+                <span class="value">{(sc.constellationWaveSpeed ?? 1).toFixed(2)}</span>
+              </div>
+            {/if}
+          {/if}
         </div>
       {/if}
     </div>
@@ -2219,7 +2687,7 @@
     </div>
   </div>
 {:else}
-  <div class="no-layer">
+  <div data-help-page="point-clouds" class="no-layer">
     <p>Select a splat layer to edit its properties</p>
   </div>
 {/if}
@@ -2366,7 +2834,7 @@
     text-align: right;
     color: var(--accent-primary, #bb86fc);
     font-size: 11px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
 
   .property-row.checkbox label {
@@ -2424,7 +2892,7 @@
     flex-wrap: wrap;
     gap: 6px 12px;
     color: var(--text-secondary, #98a0ad);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 11px;
   }
 

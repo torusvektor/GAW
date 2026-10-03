@@ -70,6 +70,10 @@
  * incremented by the edge-gen compute pass.
  */
 
+import { createAndWarmWgslShaderModule, resolveGhostWgsl } from './wgsl';
+import { GhostGpuFrameGraph, type GhostGpuFrameGraphRunStats } from './gpuFrameGraph';
+import { getGhostGpuRuntime } from './webgpuShared';
+
 const PARTICLE_BYTES = 64;
 const EDGE_BYTES = 16;
 const DEFAULT_PARTICLES = 80_000;
@@ -135,6 +139,9 @@ function translate(x: number, y: number, z: number): Float32Array {
 /* BEHAVIOR COMPUTE — updates particle pos/vel per mode           */
 /* ============================================================== */
 const BEHAVIOR_WGSL = /* wgsl */ `
+#include <noise>
+#include <color>
+
 struct Particle {
   pos:   vec3<f32>, alpha: f32,
   vel:   vec3<f32>, size:  f32,
@@ -187,58 +194,19 @@ struct U {
 
 // ── Helpers ─────────────────────────────────────────────────────
 fn hash3(p: vec3<f32>) -> f32 {
-  let q = vec3<f32>(
-    dot(p, vec3<f32>(127.1, 311.7,  74.7)),
-    dot(p, vec3<f32>(269.5, 183.3, 246.1)),
-    dot(p, vec3<f32>(113.5, 271.9, 124.6)),
-  );
-  return fract(sin(q.x + q.y + q.z) * 43758.5453);
+  return ghost_hash13(p);
 }
 fn noise3(p: vec3<f32>) -> f32 {
-  let i = floor(p);
-  let f = fract(p);
-  let s = f * f * (3.0 - 2.0 * f);
-  let n000 = hash3(i + vec3<f32>(0.0, 0.0, 0.0));
-  let n100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
-  let n010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0));
-  let n110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
-  let n001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0));
-  let n101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
-  let n011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0));
-  let n111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
-  let nx00 = mix(n000, n100, s.x);
-  let nx10 = mix(n010, n110, s.x);
-  let nx01 = mix(n001, n101, s.x);
-  let nx11 = mix(n011, n111, s.x);
-  let nxy0 = mix(nx00, nx10, s.y);
-  let nxy1 = mix(nx01, nx11, s.y);
-  return mix(nxy0, nxy1, s.z) * 2.0 - 1.0;
+  return ghost_value_noise3(p);
 }
 fn curl3(p: vec3<f32>) -> vec3<f32> {
-  let e = 0.05;
-  let ax1 = noise3(p + vec3<f32>(0.0,  e, 0.0));
-  let ax2 = noise3(p + vec3<f32>(0.0, -e, 0.0));
-  let ay1 = noise3(p + vec3<f32>(0.0, 0.0,  e) + vec3<f32>(31.0, 0.0, 0.0));
-  let ay2 = noise3(p + vec3<f32>(0.0, 0.0, -e) + vec3<f32>(31.0, 0.0, 0.0));
-  let az1 = noise3(p + vec3<f32>( e, 0.0, 0.0) + vec3<f32>(0.0, 47.0, 0.0));
-  let az2 = noise3(p + vec3<f32>(-e, 0.0, 0.0) + vec3<f32>(0.0, 47.0, 0.0));
-  return vec3<f32>(ay1 - ay2, az1 - az2, ax1 - ax2) / (2.0 * e);
+  return ghost_curl_noise3(p);
 }
 fn rgb2hsv(c: vec3<f32>) -> vec3<f32> {
-  let K = vec4<f32>(0.0, -1.0/3.0, 2.0/3.0, -1.0);
-  var p: vec4<f32>;
-  if (c.g < c.b) { p = vec4<f32>(c.b, c.g, K.w, K.z); }
-  else { p = vec4<f32>(c.g, c.b, K.x, K.y); }
-  var q: vec4<f32>;
-  if (c.r < p.x) { q = vec4<f32>(p.x, p.y, p.w, c.r); }
-  else { q = vec4<f32>(c.r, p.y, p.z, p.x); }
-  let d = q.x - min(q.w, q.y);
-  return vec3<f32>(abs(q.z + (q.w - q.y) / (6.0 * d + 1e-10)), d / (q.x + 1e-10), q.x);
+  return ghost_rgb2hsv(c);
 }
 fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
-  let K = vec4<f32>(1.0, 2.0/3.0, 1.0/3.0, 3.0);
-  let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-  return c.z * mix(K.xxx, clamp(p - K.xxx, vec3<f32>(0.0), vec3<f32>(1.0)), c.y);
+  return ghost_hsv2rgb(c);
 }
 
 // ── Behavior targets ───────────────────────────────────────────
@@ -847,27 +815,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 // particles vanish smoothly into the colored haze, lines fade into
 // the same haze, light beams (if added later) tint that haze.
 const FOG_WGSL = /* wgsl */ `
+#include <camera>
+#include <color>
+
 struct UFog { color: vec3<f32>, opacity: f32, };
 @group(0) @binding(0) var<uniform> u: UFog;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
-  // Fullscreen triangle (two triangles into one bigger one for
-  // discard efficiency).
-  var positions = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -3.0),
-    vec2<f32>(-1.0,  1.0),
-    vec2<f32>( 3.0,  1.0),
-  );
-  return vec4<f32>(positions[vid], 0.0, 1.0);
+  return ghost_fullscreen_triangle_pos(vid);
 }
 
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
   // Premultiplied-alpha output so this blends cleanly with the
   // existing premult pipeline used by particles + lines.
-  let a = u.opacity;
-  return vec4<f32>(u.color * a, a);
+  return ghost_premul(u.color, u.opacity);
 }
 `;
 
@@ -1122,6 +1085,705 @@ const DEFAULT_PARAMS: ParticleFieldParams = {
   autoRotateZ: 0,
 };
 
+export const PARTICLE_FIELD_NATIVE_SHADER_IDS = Object.freeze({
+  behavior: 'particle-field/behavior',
+  fog: 'particle-field/fog',
+  render: 'particle-field/render',
+  edges: 'particle-field/edges',
+  lines: 'particle-field/lines',
+});
+
+export type ParticleFieldNativeShaderStage = 'compute' | 'render';
+
+export interface ParticleFieldNativeShaderSource {
+  shaderId: string;
+  label: string;
+  stage: ParticleFieldNativeShaderStage;
+  entry: string;
+  source: string;
+}
+
+export interface ParticleFieldNativePrecompileCommand {
+  type: 'precompile_shader';
+  shader_id: string;
+  stage: ParticleFieldNativeShaderStage;
+  entry: string;
+  source: string;
+}
+
+type ParticleFieldNativeGraphBinding = {
+  binding: number;
+  resource?: string;
+  kind?: string;
+  source_id?: string;
+  allow_missing?: boolean;
+};
+
+type ParticleFieldNativeGraphBuffer = {
+  id: string;
+  kind: 'uniform' | 'storage' | 'read-only-storage';
+  byte_length: number;
+  persistent?: boolean;
+  clear?: boolean;
+  initial_b64?: string;
+  initial_buffer?: ArrayBuffer | Uint8Array;
+  initial_u32?: number[];
+  indirect?: boolean;
+};
+
+type ParticleFieldNativeGraphPass = {
+  name: string;
+  shader_id: string;
+  entry: string;
+  dispatch: [number, number, number];
+  bindings: ParticleFieldNativeGraphBinding[];
+};
+
+type ParticleFieldNativeGraphRenderPass = {
+  name: string;
+  shader_id: string;
+  vertex_entry: string;
+  fragment_entry: string;
+  target: 'source_frame';
+  source_id: string;
+  seq: number;
+  clear: boolean;
+  include_snapshot?: boolean;
+  blend: 'replace' | 'alpha' | 'add';
+  primitive?: 'triangle-list' | 'line-list';
+  vertex_count: number;
+  instance_count: number;
+  draw_indirect_buffer?: string;
+  draw_indirect_offset?: number;
+  depth?: boolean;
+  depth_write?: boolean;
+  depth_compare?: 'less' | 'less-equal' | 'always';
+  bindings: ParticleFieldNativeGraphBinding[];
+};
+
+export interface ParticleFieldNativeGraphState {
+  mode: BehaviorMode;
+  particleCount: number;
+  prevFrameTime: number;
+  burstImpulse: number;
+  prevBass: number;
+  hueShiftPhase: number;
+  colorCyclePhase: number;
+  autoRotXPhase: number;
+  autoRotYPhase: number;
+  autoRotZPhase: number;
+}
+
+export interface ParticleFieldNativeGraphOptions {
+  sourceId: string;
+  params?: Partial<ParticleFieldParams>;
+  width?: number;
+  height?: number;
+  time?: number;
+  frameDelta?: number;
+  frameIndex?: number;
+  state?: ParticleFieldNativeGraphState | null;
+  reset?: boolean;
+  includeSnapshot?: boolean;
+  mediaSourceId?: string | null;
+  audioBass?: number;
+  audioTreble?: number;
+}
+
+export interface ParticleFieldNativeGraphBuildResult {
+  config: {
+    buffers: ParticleFieldNativeGraphBuffer[];
+    passes: ParticleFieldNativeGraphPass[];
+    render_passes: ParticleFieldNativeGraphRenderPass[];
+    readbacks: string[];
+  };
+  sourceId: string;
+  state: ParticleFieldNativeGraphState;
+  particleCount: number;
+  topology: Topology;
+  passCount: number;
+}
+
+export function getParticleFieldNativeShaderSources(): ParticleFieldNativeShaderSource[] {
+  return [
+    {
+      shaderId: PARTICLE_FIELD_NATIVE_SHADER_IDS.behavior,
+      label: 'particle-field/behavior',
+      stage: 'compute',
+      entry: 'cs_main',
+      source: resolveGhostWgsl(BEHAVIOR_WGSL, 'particle-field/behavior'),
+    },
+    {
+      shaderId: PARTICLE_FIELD_NATIVE_SHADER_IDS.edges,
+      label: 'particle-field/edges',
+      stage: 'compute',
+      entry: 'cs_edges',
+      source: resolveGhostWgsl(EDGE_GEN_WGSL, 'particle-field/edges'),
+    },
+    {
+      shaderId: PARTICLE_FIELD_NATIVE_SHADER_IDS.fog,
+      label: 'particle-field/fog',
+      stage: 'render',
+      entry: 'fs_main',
+      source: resolveGhostWgsl(FOG_WGSL, 'particle-field/fog'),
+    },
+    {
+      shaderId: PARTICLE_FIELD_NATIVE_SHADER_IDS.render,
+      label: 'particle-field/render',
+      stage: 'render',
+      entry: 'fs_main',
+      source: resolveGhostWgsl(RENDER_WGSL, 'particle-field/render'),
+    },
+    {
+      shaderId: PARTICLE_FIELD_NATIVE_SHADER_IDS.lines,
+      label: 'particle-field/lines',
+      stage: 'render',
+      entry: 'fs_main',
+      source: resolveGhostWgsl(LINE_WGSL, 'particle-field/lines'),
+    },
+  ];
+}
+
+export function buildParticleFieldNativePrecompileCommands(): ParticleFieldNativePrecompileCommand[] {
+  return getParticleFieldNativeShaderSources().map((shader) => ({
+    type: 'precompile_shader',
+    shader_id: shader.shaderId,
+    stage: shader.stage,
+    entry: shader.entry,
+    source: shader.source,
+  }));
+}
+
+function clampFinite(value: unknown, min: number, max: number, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function boolParam(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function enumParam<T extends string>(value: unknown, allowed: Record<T, number>, fallback: T): T {
+  const key = String(value ?? '').trim() as T;
+  return Object.prototype.hasOwnProperty.call(allowed, key) ? key : fallback;
+}
+
+function colorParam(value: unknown, fallback: [number, number, number]): [number, number, number] {
+  if (!Array.isArray(value)) return [...fallback] as [number, number, number];
+  return [
+    clampFinite(value[0], 0, 8, fallback[0]),
+    clampFinite(value[1], 0, 8, fallback[1]),
+    clampFinite(value[2], 0, 8, fallback[2]),
+  ];
+}
+
+function normalizeParticleFieldParams(raw: Partial<ParticleFieldParams> | undefined): ParticleFieldParams {
+  const src = raw ?? {};
+  return {
+    mode: enumParam(src.mode, MODE_ID, DEFAULT_PARAMS.mode),
+    particleCount: Math.round(clampFinite(src.particleCount, 1024, MAX_PARTICLES, DEFAULT_PARAMS.particleCount)),
+    baseSize: clampFinite(src.baseSize, 0.0001, 0.2, DEFAULT_PARAMS.baseSize),
+    opacity: clampFinite(src.opacity, 0, 4, DEFAULT_PARAMS.opacity),
+    windStrength: clampFinite(src.windStrength, -8, 8, DEFAULT_PARAMS.windStrength),
+    windScale: clampFinite(src.windScale, 0.001, 64, DEFAULT_PARAMS.windScale),
+    anchorPull: clampFinite(src.anchorPull, -8, 8, DEFAULT_PARAMS.anchorPull),
+    damping: clampFinite(src.damping, 0, 16, DEFAULT_PARAMS.damping),
+    bass: clampFinite(src.bass, 0, 4, DEFAULT_PARAMS.bass),
+    treble: clampFinite(src.treble, 0, 4, DEFAULT_PARAMS.treble),
+    shimmerStrength: clampFinite(src.shimmerStrength, 0, 4, DEFAULT_PARAMS.shimmerStrength),
+    burstGain: clampFinite(src.burstGain, 0, 16, DEFAULT_PARAMS.burstGain),
+    burstDecay: clampFinite(src.burstDecay, 0, 24, DEFAULT_PARAMS.burstDecay),
+    galaxyArms: Math.round(clampFinite(src.galaxyArms, 1, 16, DEFAULT_PARAMS.galaxyArms)),
+    galaxyRotateInner: clampFinite(src.galaxyRotateInner, -16, 16, DEFAULT_PARAMS.galaxyRotateInner),
+    galaxyRotateOuter: clampFinite(src.galaxyRotateOuter, -16, 16, DEFAULT_PARAMS.galaxyRotateOuter),
+    galaxyTilt: clampFinite(src.galaxyTilt, -4, 4, DEFAULT_PARAMS.galaxyTilt),
+    atomicNuclei: Math.round(clampFinite(src.atomicNuclei, 1, 32, DEFAULT_PARAMS.atomicNuclei)),
+    atomicShells: Math.round(clampFinite(src.atomicShells, 1, 16, DEFAULT_PARAMS.atomicShells)),
+    atomicShellSpacing: clampFinite(src.atomicShellSpacing, 0.001, 4, DEFAULT_PARAMS.atomicShellSpacing),
+    atomicOrbitSpeed: clampFinite(src.atomicOrbitSpeed, -16, 16, DEFAULT_PARAMS.atomicOrbitSpeed),
+    swarmCohesion: clampFinite(src.swarmCohesion, -8, 8, DEFAULT_PARAMS.swarmCohesion),
+    swarmSeparation: clampFinite(src.swarmSeparation, -8, 8, DEFAULT_PARAMS.swarmSeparation),
+    swarmAlignment: clampFinite(src.swarmAlignment, -8, 8, DEFAULT_PARAMS.swarmAlignment),
+    swarmRange: clampFinite(src.swarmRange, 0.001, 32, DEFAULT_PARAMS.swarmRange),
+    latticeSize: Math.round(clampFinite(src.latticeSize, 2, 128, DEFAULT_PARAMS.latticeSize)),
+    latticeSpacing: clampFinite(src.latticeSpacing, 0.001, 8, DEFAULT_PARAMS.latticeSpacing),
+    latticeVibration: clampFinite(src.latticeVibration, 0, 4, DEFAULT_PARAMS.latticeVibration),
+    mediaDepthAmount: clampFinite(src.mediaDepthAmount, -8, 8, DEFAULT_PARAMS.mediaDepthAmount),
+    mediaSampleScale: clampFinite(src.mediaSampleScale, 0.001, 16, DEFAULT_PARAMS.mediaSampleScale),
+    gravityWells: Math.round(clampFinite(src.gravityWells, 1, 8, DEFAULT_PARAMS.gravityWells)),
+    gravityStrength: clampFinite(src.gravityStrength, -8, 8, DEFAULT_PARAMS.gravityStrength),
+    gravityOrbit: clampFinite(src.gravityOrbit, -16, 16, DEFAULT_PARAMS.gravityOrbit),
+    gravityCoreSize: clampFinite(src.gravityCoreSize, 0.001, 4, DEFAULT_PARAMS.gravityCoreSize),
+    gravityVortex: clampFinite(src.gravityVortex, -16, 16, DEFAULT_PARAMS.gravityVortex),
+    gravityMaxVelocity: clampFinite(src.gravityMaxVelocity, 0.001, 64, DEFAULT_PARAMS.gravityMaxVelocity),
+    gravityAudioDrive: clampFinite(src.gravityAudioDrive, 0, 16, DEFAULT_PARAMS.gravityAudioDrive),
+    gravityChaos: clampFinite(src.gravityChaos, 0, 16, DEFAULT_PARAMS.gravityChaos),
+    topology: enumParam(src.topology, TOPO_ID, DEFAULT_PARAMS.topology),
+    strokeLength: clampFinite(src.strokeLength, 0, 4, DEFAULT_PARAMS.strokeLength),
+    strokeWidth: clampFinite(src.strokeWidth, 0, 2, DEFAULT_PARAMS.strokeWidth),
+    colorMode: enumParam(src.colorMode, COLOR_MODE_ID, DEFAULT_PARAMS.colorMode),
+    colorMap: enumParam(src.colorMap, COLOR_MAP_ID, DEFAULT_PARAMS.colorMap),
+    colorMix: clampFinite(src.colorMix, 0, 1, DEFAULT_PARAMS.colorMix),
+    colorMapScale: clampFinite(src.colorMapScale, -16, 16, DEFAULT_PARAMS.colorMapScale),
+    colorMapOffset: clampFinite(src.colorMapOffset, -16, 16, DEFAULT_PARAMS.colorMapOffset),
+    colorCycleSpeed: clampFinite(src.colorCycleSpeed, -16, 16, DEFAULT_PARAMS.colorCycleSpeed),
+    randomSat: clampFinite(src.randomSat, 0, 2, DEFAULT_PARAMS.randomSat),
+    randomVal: clampFinite(src.randomVal, 0, 4, DEFAULT_PARAMS.randomVal),
+    hueShiftSpeed: clampFinite(src.hueShiftSpeed, -16, 16, DEFAULT_PARAMS.hueShiftSpeed),
+    saturation: clampFinite(src.saturation, 0, 4, DEFAULT_PARAMS.saturation),
+    brightness: clampFinite(src.brightness, 0, 8, DEFAULT_PARAMS.brightness),
+    colorA: colorParam(src.colorA, DEFAULT_PARAMS.colorA),
+    colorB: colorParam(src.colorB, DEFAULT_PARAMS.colorB),
+    colorC: colorParam(src.colorC, DEFAULT_PARAMS.colorC),
+    colorD: colorParam(src.colorD, DEFAULT_PARAMS.colorD),
+    connectEnabled: boolParam(src.connectEnabled, DEFAULT_PARAMS.connectEnabled),
+    partnerCount: Math.round(clampFinite(src.partnerCount, 1, 32, DEFAULT_PARAMS.partnerCount)),
+    localRadius: clampFinite(src.localRadius, 0, 8, DEFAULT_PARAMS.localRadius),
+    bridgeRadius: clampFinite(src.bridgeRadius, 0, 8, DEFAULT_PARAMS.bridgeRadius),
+    colorLocal: colorParam(src.colorLocal, DEFAULT_PARAMS.colorLocal),
+    colorBridge: colorParam(src.colorBridge, DEFAULT_PARAMS.colorBridge),
+    alphaLocal: clampFinite(src.alphaLocal, 0, 1, DEFAULT_PARAMS.alphaLocal),
+    alphaBridge: clampFinite(src.alphaBridge, 0, 1, DEFAULT_PARAMS.alphaBridge),
+    fogDensity: clampFinite(src.fogDensity, 0, 16, DEFAULT_PARAMS.fogDensity),
+    fogOpacity: clampFinite(src.fogOpacity, 0, 1, DEFAULT_PARAMS.fogOpacity),
+    fogColor: colorParam(src.fogColor, DEFAULT_PARAMS.fogColor),
+    lightX: clampFinite(src.lightX, -8, 8, DEFAULT_PARAMS.lightX),
+    lightY: clampFinite(src.lightY, -8, 8, DEFAULT_PARAMS.lightY),
+    lightZ: clampFinite(src.lightZ, -8, 8, DEFAULT_PARAMS.lightZ),
+    lightStrength: clampFinite(src.lightStrength, 0, 8, DEFAULT_PARAMS.lightStrength),
+    materialAmbient: clampFinite(src.materialAmbient, 0, 4, DEFAULT_PARAMS.materialAmbient),
+    materialDiffuse: clampFinite(src.materialDiffuse, 0, 4, DEFAULT_PARAMS.materialDiffuse),
+    materialSpecular: clampFinite(src.materialSpecular, 0, 4, DEFAULT_PARAMS.materialSpecular),
+    materialShininess: clampFinite(src.materialShininess, 1, 256, DEFAULT_PARAMS.materialShininess),
+    materialReflection: clampFinite(src.materialReflection, 0, 4, DEFAULT_PARAMS.materialReflection),
+    fovDeg: clampFinite(src.fovDeg, 1, 160, DEFAULT_PARAMS.fovDeg),
+    cameraZ: clampFinite(src.cameraZ, 0.05, 100, DEFAULT_PARAMS.cameraZ),
+    rotateX: clampFinite(src.rotateX, -3600, 3600, DEFAULT_PARAMS.rotateX),
+    rotateY: clampFinite(src.rotateY, -3600, 3600, DEFAULT_PARAMS.rotateY),
+    rotateZ: clampFinite(src.rotateZ, -3600, 3600, DEFAULT_PARAMS.rotateZ),
+    autoRotateX: clampFinite(src.autoRotateX, -3600, 3600, DEFAULT_PARAMS.autoRotateX),
+    autoRotateY: clampFinite(src.autoRotateY, -3600, 3600, DEFAULT_PARAMS.autoRotateY),
+    autoRotateZ: clampFinite(src.autoRotateZ, -3600, 3600, DEFAULT_PARAMS.autoRotateZ),
+  };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function bufferToBase64(buffer: ArrayBuffer): string {
+  return bytesToBase64(new Uint8Array(buffer));
+}
+
+function particleRand(seed: number): number {
+  let x = seed >>> 0;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  return ((x >>> 0) / 4294967296);
+}
+
+function particleInitialBuffer(params: ParticleFieldParams, count: number): ArrayBuffer {
+  const n = Math.max(1024, Math.min(MAX_PARTICLES, Math.floor(count)));
+  const buffer = new ArrayBuffer(n * PARTICLE_BYTES);
+  const f = new Float32Array(buffer);
+  const u = new Uint32Array(buffer);
+
+  for (let i = 0; i < n; i++) {
+    const off = i * 16;
+    const r0 = particleRand(i * 747796405 + 2891336453);
+    const r1 = particleRand(i * 2891336453 + 747796405);
+    const r2 = particleRand(i * 1597334677 + 3812015801);
+    const r3 = particleRand(i * 3812015801 + 1597334677);
+    let x = 0;
+    let y = 0;
+    let z = 0;
+    let group = 0;
+    let radiusVar = 1;
+
+    if (params.mode === 'galaxy') {
+      group = i % Math.max(1, params.galaxyArms | 0);
+      const armPhase = group / Math.max(1, params.galaxyArms);
+      const r = Math.sqrt(r0) * 0.95;
+      const theta = armPhase * Math.PI * 2 + r * 3.0 + (r1 - 0.5) * 0.4;
+      x = Math.cos(theta) * r;
+      z = Math.sin(theta) * r;
+      y = (r2 - 0.5) * 0.04 * (1 - r);
+    } else if (params.mode === 'atomic') {
+      const nuc = Math.max(1, params.atomicNuclei | 0);
+      const sh = Math.max(1, params.atomicShells | 0);
+      const nIdx = i % nuc;
+      const shIdx = Math.floor(i / nuc) % sh;
+      group = nIdx + shIdx * nuc;
+      const nT = (nIdx / nuc) * Math.PI * 2;
+      const r = (shIdx + 1) * params.atomicShellSpacing;
+      const phase = r0 * Math.PI * 2;
+      x = Math.cos(nT) * 0.5 + Math.cos(phase) * r;
+      y = (r1 - 0.5) * r * 0.5;
+      z = Math.sin(nT) * 0.5 + Math.sin(phase) * r * 0.6;
+    } else if (params.mode === 'lattice') {
+      const sz = Math.max(2, params.latticeSize | 0);
+      const ix = i % sz;
+      const iy = Math.floor(i / sz) % sz;
+      const iz = Math.floor(i / (sz * sz)) % sz;
+      x = (ix / sz - 0.5) * params.latticeSpacing;
+      y = (iy / sz - 0.5) * params.latticeSpacing;
+      z = (iz / sz - 0.5) * params.latticeSpacing;
+      group = i;
+    } else if (params.mode === 'gravity') {
+      const wells = Math.max(1, Math.min(8, params.gravityWells | 0));
+      group = i % wells;
+      const phase = (group / wells) * Math.PI * 2;
+      const shell = Math.pow(r0, 0.55) * 0.9 + 0.08;
+      const theta = r1 * Math.PI * 2;
+      const phi = Math.acos(r2 * 2 - 1);
+      const cx = Math.cos(phase) * 0.45;
+      const cz = Math.sin(phase) * 0.45;
+      x = cx + Math.sin(phi) * Math.cos(theta) * shell;
+      y = (r3 - 0.5) * 0.75 + Math.cos(phi) * shell * 0.35;
+      z = cz + Math.sin(phi) * Math.sin(theta) * shell;
+      radiusVar = i % 233 === 0 ? 4.2 + r3 * 2.4 : 0.36 + Math.pow(r3, 2.35) * 2.8;
+    } else {
+      const theta = r0 * Math.PI * 2;
+      const phi = Math.acos(r1 * 2 - 1);
+      const radius = Math.cbrt(r2);
+      x = Math.sin(phi) * Math.cos(theta) * radius;
+      y = Math.cos(phi) * radius;
+      z = Math.sin(phi) * Math.sin(theta) * radius;
+      group = i & 15;
+    }
+
+    if (params.mode !== 'gravity') {
+      radiusVar = 0.72 + Math.pow(r3, 1.8) * 1.35;
+    }
+
+    f[off + 0] = x; f[off + 1] = y; f[off + 2] = z; f[off + 3] = 1;
+    f[off + 4] = 0; f[off + 5] = 0; f[off + 6] = 0; f[off + 7] = params.baseSize;
+    f[off + 8] = 0.6; f[off + 9] = 0.7; f[off + 10] = 0.95; f[off + 11] = radiusVar;
+    u[off + 12] = group >>> 0;
+    f[off + 13] = 0;
+    f[off + 14] = 0;
+    f[off + 15] = 0;
+  }
+  return buffer;
+}
+
+function particleNativeInitialState(params: ParticleFieldParams, time: number): ParticleFieldNativeGraphState {
+  return {
+    mode: params.mode,
+    particleCount: params.particleCount,
+    prevFrameTime: time,
+    burstImpulse: 0,
+    prevBass: 0,
+    hueShiftPhase: 0,
+    colorCyclePhase: 0,
+    autoRotXPhase: 0,
+    autoRotYPhase: 0,
+    autoRotZPhase: 0,
+  };
+}
+
+function particleSourcePrefix(sourceId: string, params: ParticleFieldParams): string {
+  return `particle-field:${String(sourceId || 'source').replace(/[^a-zA-Z0-9:_-]+/g, '_').slice(0, 160)}:${params.mode}:${params.particleCount}`;
+}
+
+function buildParticleBehaviorUniform(params: ParticleFieldParams, state: ParticleFieldNativeGraphState, dt: number, time: number): string {
+  const buffer = new ArrayBuffer(384);
+  const f = new Float32Array(buffer);
+  const u = new Uint32Array(buffer);
+  f[0] = dt; f[1] = time; u[2] = params.particleCount >>> 0; f[3] = params.baseSize;
+  u[4] = MODE_ID[params.mode] >>> 0;
+  u[5] = TOPO_ID[params.topology] >>> 0;
+  u[6] = params.connectEnabled ? 1 : 0;
+  f[8] = params.windStrength; f[9] = params.windScale; f[10] = params.anchorPull; f[11] = params.damping;
+  f[12] = params.bass; f[13] = params.treble; f[14] = state.burstImpulse; f[15] = params.shimmerStrength;
+  f[16] = params.galaxyArms; f[17] = params.galaxyRotateInner; f[18] = params.galaxyRotateOuter; f[19] = params.galaxyTilt;
+  f[20] = params.atomicNuclei; f[21] = params.atomicShells; f[22] = params.atomicShellSpacing; f[23] = params.atomicOrbitSpeed;
+  f[24] = params.swarmCohesion; f[25] = params.swarmSeparation; f[26] = params.swarmAlignment; f[27] = params.swarmRange;
+  f[28] = params.latticeSize; f[29] = params.latticeSpacing; f[30] = params.latticeVibration;
+  f[32] = params.mediaDepthAmount; f[33] = params.mediaSampleScale;
+  f[36] = params.fogDensity; f[37] = params.lightX; f[38] = params.lightY; f[39] = params.lightZ;
+  f[40] = params.saturation; f[41] = params.brightness; u[42] = COLOR_MODE_ID[params.colorMode] >>> 0; u[43] = COLOR_MAP_ID[params.colorMap] >>> 0;
+  f[44] = params.colorMix; f[45] = params.colorMapScale; f[46] = params.colorMapOffset; f[47] = state.colorCyclePhase;
+  f[48] = params.randomSat; f[49] = params.randomVal; f[50] = state.hueShiftPhase;
+  f[52] = params.colorA[0]; f[53] = params.colorA[1]; f[54] = params.colorA[2];
+  f[56] = params.colorB[0]; f[57] = params.colorB[1]; f[58] = params.colorB[2];
+  f[60] = params.colorC[0]; f[61] = params.colorC[1]; f[62] = params.colorC[2];
+  f[64] = params.colorD[0]; f[65] = params.colorD[1]; f[66] = params.colorD[2];
+  f[68] = params.gravityWells; f[69] = params.gravityStrength; f[70] = params.gravityOrbit; f[71] = params.gravityCoreSize;
+  f[72] = params.gravityVortex; f[73] = params.gravityMaxVelocity; f[74] = params.gravityAudioDrive; f[75] = params.gravityChaos;
+  return bufferToBase64(buffer);
+}
+
+function buildParticleRenderUniform(params: ParticleFieldParams, state: ParticleFieldNativeGraphState, width: number, height: number): string {
+  const aspect = Math.max(1, width) / Math.max(1, height);
+  const proj = perspective(params.fovDeg, aspect, 0.05, 100);
+  const view = translate(0, 0, -params.cameraZ);
+  const d2r = Math.PI / 180;
+  const rxRad = (params.rotateX + state.autoRotXPhase) * d2r;
+  const ryRad = (params.rotateY + state.autoRotYPhase) * d2r;
+  const rzRad = (params.rotateZ + state.autoRotZPhase) * d2r;
+  const cx = Math.cos(rxRad), sx = Math.sin(rxRad);
+  const cy = Math.cos(ryRad), sy = Math.sin(ryRad);
+  const cz = Math.cos(rzRad), sz = Math.sin(rzRad);
+  const rxM = new Float32Array([1, 0, 0, 0, 0, cx, sx, 0, 0, -sx, cx, 0, 0, 0, 0, 1]);
+  const ryM = new Float32Array([cy, 0, -sy, 0, 0, 1, 0, 0, sy, 0, cy, 0, 0, 0, 0, 1]);
+  const rzM = new Float32Array([cz, sz, 0, 0, -sz, cz, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const viewProj = mat4Mul(proj, mat4Mul(view, mat4Mul(rzM, mat4Mul(ryM, rxM))));
+  const lx = params.lightX, ly = params.lightY, lz = params.lightZ;
+  const llen = Math.sqrt(lx * lx + ly * ly + lz * lz) || 1;
+  const buffer = new ArrayBuffer(192);
+  const f = new Float32Array(buffer);
+  const u = new Uint32Array(buffer);
+  f.set(viewProj, 0);
+  f[16] = 1; f[17] = 0; f[18] = 0;
+  f[20] = 0; f[21] = 1; f[22] = 0;
+  f[24] = 0; f[25] = 0; f[26] = params.cameraZ;
+  u[27] = TOPO_ID[params.topology] >>> 0;
+  f[28] = params.strokeLength; f[29] = params.strokeWidth; f[30] = params.opacity;
+  f[32] = params.fogColor[0]; f[33] = params.fogColor[1]; f[34] = params.fogColor[2]; f[35] = params.fogDensity;
+  f[36] = lx / llen; f[37] = ly / llen; f[38] = lz / llen; f[39] = params.lightStrength;
+  f[40] = params.materialAmbient; f[41] = params.materialDiffuse; f[42] = params.materialSpecular; f[43] = params.materialShininess; f[44] = params.materialReflection;
+  return bufferToBase64(buffer);
+}
+
+function buildParticleFogUniform(params: ParticleFieldParams): string {
+  const buffer = new ArrayBuffer(16);
+  const f = new Float32Array(buffer);
+  f[0] = params.fogColor[0];
+  f[1] = params.fogColor[1];
+  f[2] = params.fogColor[2];
+  f[3] = params.fogOpacity;
+  return bufferToBase64(buffer);
+}
+
+function buildParticleLineUniform(params: ParticleFieldParams, state: ParticleFieldNativeGraphState, width: number, height: number): string {
+  const aspect = Math.max(1, width) / Math.max(1, height);
+  const proj = perspective(params.fovDeg, aspect, 0.05, 100);
+  const view = translate(0, 0, -params.cameraZ);
+  const d2r = Math.PI / 180;
+  const rxRad = (params.rotateX + state.autoRotXPhase) * d2r;
+  const ryRad = (params.rotateY + state.autoRotYPhase) * d2r;
+  const rzRad = (params.rotateZ + state.autoRotZPhase) * d2r;
+  const cx = Math.cos(rxRad), sx = Math.sin(rxRad);
+  const cy = Math.cos(ryRad), sy = Math.sin(ryRad);
+  const cz = Math.cos(rzRad), sz = Math.sin(rzRad);
+  const rxM = new Float32Array([1, 0, 0, 0, 0, cx, sx, 0, 0, -sx, cx, 0, 0, 0, 0, 1]);
+  const ryM = new Float32Array([cy, 0, -sy, 0, 0, 1, 0, 0, sy, 0, cy, 0, 0, 0, 0, 1]);
+  const rzM = new Float32Array([cz, sz, 0, 0, -sz, cz, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const viewProj = mat4Mul(proj, mat4Mul(view, mat4Mul(rzM, mat4Mul(ryM, rxM))));
+  const buffer = new ArrayBuffer(160);
+  const f = new Float32Array(buffer);
+  f.set(viewProj, 0);
+  f[16] = 0; f[17] = 0; f[18] = params.cameraZ;
+  f[20] = params.colorLocal[0]; f[21] = params.colorLocal[1]; f[22] = params.colorLocal[2]; f[23] = params.alphaLocal;
+  f[24] = params.colorBridge[0]; f[25] = params.colorBridge[1]; f[26] = params.colorBridge[2]; f[27] = params.alphaBridge;
+  f[28] = params.fogColor[0]; f[29] = params.fogColor[1]; f[30] = params.fogColor[2]; f[31] = params.fogDensity;
+  return bufferToBase64(buffer);
+}
+
+export function buildParticleFieldNativeComputeGraph(options: ParticleFieldNativeGraphOptions): ParticleFieldNativeGraphBuildResult {
+  const params = normalizeParticleFieldParams(options.params);
+  if (typeof options.audioBass === 'number') params.bass = clampFinite(options.audioBass, 0, 4, params.bass);
+  if (typeof options.audioTreble === 'number') params.treble = clampFinite(options.audioTreble, 0, 4, params.treble);
+  const sourceId = String(options.sourceId || 'particle-field-native-source');
+  const time = Math.max(0, Number.isFinite(options.time) ? Number(options.time) : 0);
+  const mustReset = !!options.reset
+    || !options.state
+    || options.state.mode !== params.mode
+    || options.state.particleCount !== params.particleCount;
+  const state = mustReset ? particleNativeInitialState(params, time) : { ...options.state! };
+  let dt = typeof options.frameDelta === 'number' && Number.isFinite(options.frameDelta)
+    ? options.frameDelta
+    : (state.prevFrameTime === 0 ? 1 / 60 : time - state.prevFrameTime);
+  dt = Math.min(Math.max(dt, 0), 1 / 15);
+  state.prevFrameTime = time;
+  const bassDelta = Math.max(0, params.bass - state.prevBass);
+  if (bassDelta > 0.04) state.burstImpulse += bassDelta * params.burstGain * 8;
+  state.burstImpulse = Math.max(0, state.burstImpulse - state.burstImpulse * params.burstDecay * dt);
+  state.prevBass = params.bass;
+  state.hueShiftPhase = (state.hueShiftPhase + params.hueShiftSpeed * dt) % 1;
+  state.colorCyclePhase = (state.colorCyclePhase + params.colorCycleSpeed * dt) % 1;
+  state.autoRotXPhase += params.autoRotateX * dt;
+  state.autoRotYPhase += params.autoRotateY * dt;
+  state.autoRotZPhase += params.autoRotateZ * dt;
+
+  const prefix = particleSourcePrefix(sourceId, params);
+  const id = (name: string) => `${prefix}:${name}`;
+  const width = Math.round(options.width || 1920);
+  const height = Math.round(options.height || 1080);
+  const buffers: ParticleFieldNativeGraphBuffer[] = [
+    { id: id('behavior-uniform'), kind: 'uniform', byte_length: 384, initial_b64: buildParticleBehaviorUniform(params, state, dt, time) },
+    { id: id('render-uniform'), kind: 'uniform', byte_length: 192, initial_b64: buildParticleRenderUniform(params, state, width, height) },
+    { id: id('fog-uniform'), kind: 'uniform', byte_length: 16, initial_b64: buildParticleFogUniform(params) },
+    {
+      id: id('particles'),
+      kind: 'storage',
+      byte_length: params.particleCount * PARTICLE_BYTES,
+      persistent: true,
+      clear: mustReset,
+      initial_buffer: mustReset ? particleInitialBuffer(params, params.particleCount) : undefined,
+    },
+  ];
+  if (params.connectEnabled) {
+    buffers.push(
+      {
+        id: id('edge-uniform'),
+        kind: 'uniform',
+        byte_length: 64,
+        initial_b64: (() => {
+          const buffer = new ArrayBuffer(64);
+          const f = new Float32Array(buffer);
+          const u = new Uint32Array(buffer);
+          u[0] = params.particleCount >>> 0;
+          u[1] = Math.max(1, Math.min(32, params.partnerCount | 0)) >>> 0;
+          u[2] = MAX_EDGES >>> 0;
+          f[4] = params.localRadius;
+          f[5] = params.bridgeRadius;
+          return bufferToBase64(buffer);
+        })(),
+      },
+      { id: id('line-uniform'), kind: 'uniform', byte_length: 160, initial_b64: buildParticleLineUniform(params, state, width, height) },
+      {
+        id: id('indirect'),
+        kind: 'storage',
+        byte_length: 16,
+        persistent: true,
+        initial_u32: [2, 0, 0, 0],
+        indirect: true,
+      },
+      {
+        id: id('edges'),
+        kind: 'storage',
+        byte_length: MAX_EDGES * EDGE_BYTES,
+        persistent: true,
+        clear: mustReset,
+      },
+    );
+  }
+
+  const workgroups = Math.ceil(params.particleCount / 64);
+  const mediaSourceId = String(options.mediaSourceId || '');
+  const passes: ParticleFieldNativeGraphPass[] = [
+    {
+      name: 'particle-behavior',
+      shader_id: PARTICLE_FIELD_NATIVE_SHADER_IDS.behavior,
+      entry: 'cs_main',
+      dispatch: [workgroups, 1, 1],
+      bindings: [
+        { binding: 0, resource: id('particles'), kind: 'storage' },
+        { binding: 1, resource: id('behavior-uniform'), kind: 'uniform' },
+        mediaSourceId
+          ? { binding: 2, kind: 'source-frame-texture', source_id: mediaSourceId }
+          : { binding: 2, kind: 'source-frame-texture', allow_missing: true },
+        { binding: 3, kind: 'source-frame-sampler' },
+      ],
+    },
+  ];
+  if (params.connectEnabled) {
+    passes.push({
+      name: 'particle-edges',
+      shader_id: PARTICLE_FIELD_NATIVE_SHADER_IDS.edges,
+      entry: 'cs_edges',
+      dispatch: [workgroups, 1, 1],
+      bindings: [
+        { binding: 0, resource: id('particles'), kind: 'read-only-storage' },
+        { binding: 1, resource: id('edge-uniform'), kind: 'uniform' },
+        { binding: 2, resource: id('indirect'), kind: 'storage' },
+        { binding: 3, resource: id('edges'), kind: 'storage' },
+      ],
+    });
+  }
+
+  const renderPasses: ParticleFieldNativeGraphRenderPass[] = [];
+  if (params.fogOpacity > 0.001) {
+    renderPasses.push({
+      name: 'particle-fog',
+      shader_id: PARTICLE_FIELD_NATIVE_SHADER_IDS.fog,
+      vertex_entry: 'vs_main',
+      fragment_entry: 'fs_main',
+      target: 'source_frame',
+      source_id: sourceId,
+      seq: Math.max(0, Math.round(options.frameIndex ?? 0)),
+      clear: true,
+      include_snapshot: false,
+      blend: 'alpha',
+      vertex_count: 3,
+      instance_count: 1,
+      bindings: [
+        { binding: 0, resource: id('fog-uniform'), kind: 'uniform' },
+      ],
+    });
+  }
+
+  const useSphereDepth = params.topology === 'sphere' || params.topology === 'softSphere';
+  renderPasses.push({
+    name: 'particle-render',
+    shader_id: PARTICLE_FIELD_NATIVE_SHADER_IDS.render,
+    vertex_entry: 'vs_main',
+    fragment_entry: 'fs_main',
+    target: 'source_frame',
+    source_id: sourceId,
+    seq: Math.max(0, Math.round(options.frameIndex ?? 0)),
+    clear: renderPasses.length === 0,
+    include_snapshot: !!options.includeSnapshot,
+    blend: useSphereDepth ? 'alpha' : 'add',
+    vertex_count: 6,
+    instance_count: params.particleCount,
+    depth: useSphereDepth,
+    depth_write: useSphereDepth,
+    depth_compare: 'less',
+    bindings: [
+      { binding: 0, resource: id('particles'), kind: 'read-only-storage' },
+      { binding: 1, resource: id('render-uniform'), kind: 'uniform' },
+    ],
+  });
+  if (params.connectEnabled) {
+    renderPasses.push({
+      name: 'particle-lines',
+      shader_id: PARTICLE_FIELD_NATIVE_SHADER_IDS.lines,
+      vertex_entry: 'vs_main',
+      fragment_entry: 'fs_main',
+      target: 'source_frame',
+      source_id: sourceId,
+      seq: Math.max(0, Math.round(options.frameIndex ?? 0)),
+      clear: false,
+      include_snapshot: false,
+      blend: 'alpha',
+      primitive: 'line-list',
+      vertex_count: 2,
+      instance_count: 0,
+      draw_indirect_buffer: id('indirect'),
+      draw_indirect_offset: 0,
+      bindings: [
+        { binding: 0, resource: id('particles'), kind: 'read-only-storage' },
+        { binding: 1, resource: id('edges'), kind: 'read-only-storage' },
+        { binding: 2, resource: id('line-uniform'), kind: 'uniform' },
+      ],
+    });
+  }
+
+  return {
+    config: {
+      buffers,
+      passes,
+      render_passes: renderPasses,
+      readbacks: [],
+    },
+    sourceId,
+    state,
+    particleCount: params.particleCount,
+    topology: params.topology,
+    passCount: passes.length + renderPasses.length,
+  };
+}
+
 const BLEND_ADD: any = {
   color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
   alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
@@ -1197,6 +1859,7 @@ export class WebGPUParticleField {
   private autoRotYPhase = 0;
   private autoRotZPhase = 0;
   private currentMode: BehaviorMode = 'galaxy';
+  private lastGraphStats: GhostGpuFrameGraphRunStats | null = null;
 
   constructor(device: any, presentFormat: any) {
     this.device = device;
@@ -1386,11 +2049,12 @@ export class WebGPUParticleField {
   }
 
   private buildPipelines(): void {
+    const shaderRuntime = getGhostGpuRuntime() ?? this.device;
     // ── Fog fullscreen pipeline ─────────────────────────────────
     // Runs first each frame, paints the canvas with fog color so
     // the rest of the scene composites against an atmospheric
     // background rather than transparent black.
-    const fogMod = this.device.createShaderModule({ code: FOG_WGSL });
+    const fogMod = createAndWarmWgslShaderModule(shaderRuntime, FOG_WGSL, 'particle-field/fog');
     this.fogLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
@@ -1414,7 +2078,7 @@ export class WebGPUParticleField {
     });
 
     // ── Behavior compute pipeline ───────────────────────────────
-    const behaviorMod = this.device.createShaderModule({ code: BEHAVIOR_WGSL });
+    const behaviorMod = createAndWarmWgslShaderModule(shaderRuntime, BEHAVIOR_WGSL, 'particle-field/behavior');
     this.behaviorLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -1429,7 +2093,7 @@ export class WebGPUParticleField {
     });
 
     // ── Edge-gen compute pipeline ───────────────────────────────
-    const edgeMod = this.device.createShaderModule({ code: EDGE_GEN_WGSL });
+    const edgeMod = createAndWarmWgslShaderModule(shaderRuntime, EDGE_GEN_WGSL, 'particle-field/edges');
     this.edgeLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -1444,7 +2108,7 @@ export class WebGPUParticleField {
     });
 
     // ── Particle render pipeline ───────────────────────────────
-    const renderMod = this.device.createShaderModule({ code: RENDER_WGSL });
+    const renderMod = createAndWarmWgslShaderModule(shaderRuntime, RENDER_WGSL, 'particle-field/render');
     this.renderLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
@@ -1478,7 +2142,7 @@ export class WebGPUParticleField {
     });
 
     // ── Line render pipeline ───────────────────────────────────
-    const lineMod = this.device.createShaderModule({ code: LINE_WGSL });
+    const lineMod = createAndWarmWgslShaderModule(shaderRuntime, LINE_WGSL, 'particle-field/lines');
     this.lineLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
@@ -1720,24 +2384,6 @@ export class WebGPUParticleField {
       this.device.queue.writeBuffer(this.edgeUniform, 0, eBuf);
     }
 
-    // ── Behavior pass ──────────────────────────────────────────
-    {
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(this.behaviorPipeline);
-      pass.setBindGroup(0, this.behaviorBindGroup);
-      pass.dispatchWorkgroups(Math.ceil(this.particleCount / 64));
-      pass.end();
-    }
-
-    // ── Edge-gen pass ──────────────────────────────────────────
-    if (this.params.connectEnabled) {
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(this.edgePipeline);
-      pass.setBindGroup(0, this.edgeBindGroup);
-      pass.dispatchWorkgroups(Math.ceil(this.particleCount / 64));
-      pass.end();
-    }
-
     // ── Camera + object rotation matrices ──────────────────────
     const aspect = this.viewportW / Math.max(1, this.viewportH);
     const proj = perspective(this.params.fovDeg, aspect, 0.05, 100);
@@ -1824,63 +2470,142 @@ export class WebGPUParticleField {
     const useSphereDepth = this.params.topology === 'sphere' || this.params.topology === 'softSphere';
     if (useSphereDepth) this.ensureDepthTexture(this.viewportW, this.viewportH);
 
-    // (1) Fog fill — only if opacity > epsilon (skip the no-op).
-    if (this.params.fogOpacity > 0.001) {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: targetView,
-          loadOp: 'load',
-          storeOp: 'store',
-        }],
-      });
-      pass.setPipeline(this.fogPipeline);
-      pass.setBindGroup(0, this.fogBindGroup);
-      pass.draw(3, 1, 0, 0);  // 3-vertex fullscreen triangle
-      pass.end();
-    }
+    this.lastGraphStats = this.buildFrameGraph(encoder, targetView, useSphereDepth).execute();
+  }
 
-    // (2) Particles. Sphere impostors use a depth attachment so they
-    // occlude like objects; point/glow/streak modes stay additive.
-    {
-      const renderPassDesc: any = {
-        colorAttachments: [{
-          view: targetView,
-          loadOp: 'load',
-          storeOp: 'store',
-        }],
-      };
-      if (useSphereDepth && this.depthTextureView) {
-        renderPassDesc.depthStencilAttachment = {
-          view: this.depthTextureView,
-          depthClearValue: 1.0,
-          depthLoadOp: 'clear',
-          depthStoreOp: 'discard',
-        };
-      }
-      const pass = encoder.beginRenderPass(renderPassDesc);
-      pass.setPipeline(useSphereDepth ? this.renderAlphaPipeline : this.renderPipeline);
-      pass.setBindGroup(0, this.renderBindGroup);
-      pass.draw(6, this.particleCount, 0, 0);
-      pass.end();
-    }
+  private buildFrameGraph(encoder: any, targetView: any, useSphereDepth: boolean): { execute: () => GhostGpuFrameGraphRunStats } {
+    const graph = new GhostGpuFrameGraph(getGhostGpuRuntime() ?? { device: this.device });
+    this.importParticleGraphResources(graph);
+    const workgroups = Math.ceil(this.particleCount / 64);
 
-    // (3) Lines
+    graph.addPass({
+      name: 'particle-behavior',
+      kind: 'compute',
+      reads: ['particles', 'behavior-uniform'],
+      writes: ['particles'],
+      execute: (ctx) => {
+        const pass = ctx.encoder.beginComputePass();
+        pass.setPipeline(this.behaviorPipeline);
+        pass.setBindGroup(0, this.behaviorBindGroup);
+        pass.dispatchWorkgroups(workgroups);
+        pass.end();
+      },
+    });
+
     if (this.params.connectEnabled) {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: targetView,
-          loadOp: 'load',
-          storeOp: 'store',
-        }],
+      graph.addPass({
+        name: 'particle-edges',
+        kind: 'compute',
+        reads: ['particles', 'edge-uniform'],
+        writes: ['edge-buffer', 'indirect-args'],
+        execute: (ctx) => {
+          const pass = ctx.encoder.beginComputePass();
+          pass.setPipeline(this.edgePipeline);
+          pass.setBindGroup(0, this.edgeBindGroup);
+          pass.dispatchWorkgroups(workgroups);
+          pass.end();
+        },
       });
-      pass.setPipeline(this.linePipeline);
-      pass.setBindGroup(0, this.lineBindGroup);
-      // drawIndirect reads (vertex_count, instance_count, first_vertex,
-      // first_instance) from the indirect buffer at offset 0. Edge-gen
-      // has atomically populated instance_count this frame.
-      pass.drawIndirect(this.indirectBuffer, 0);
-      pass.end();
     }
+
+    if (this.params.fogOpacity > 0.001) {
+      graph.addPass({
+        name: 'particle-fog',
+        kind: 'render',
+        reads: ['fog-uniform'],
+        execute: (ctx) => {
+          const pass = ctx.encoder.beginRenderPass({
+            colorAttachments: [{
+              view: targetView,
+              loadOp: 'load',
+              storeOp: 'store',
+            }],
+          });
+          pass.setPipeline(this.fogPipeline);
+          pass.setBindGroup(0, this.fogBindGroup);
+          pass.draw(3, 1, 0, 0);
+          pass.end();
+        },
+      });
+    }
+
+    graph.addPass({
+      name: 'particle-render',
+      kind: 'render',
+      reads: ['particles', 'render-uniform'],
+      execute: (ctx) => {
+        const renderPassDesc: any = {
+          colorAttachments: [{
+            view: targetView,
+            loadOp: 'load',
+            storeOp: 'store',
+          }],
+        };
+        if (useSphereDepth && this.depthTextureView) {
+          renderPassDesc.depthStencilAttachment = {
+            view: this.depthTextureView,
+            depthClearValue: 1.0,
+            depthLoadOp: 'clear',
+            depthStoreOp: 'discard',
+          };
+        }
+        const pass = ctx.encoder.beginRenderPass(renderPassDesc);
+        pass.setPipeline(useSphereDepth ? this.renderAlphaPipeline : this.renderPipeline);
+        pass.setBindGroup(0, this.renderBindGroup);
+        pass.draw(6, this.particleCount, 0, 0);
+        pass.end();
+      },
+    });
+
+    if (this.params.connectEnabled) {
+      graph.addPass({
+        name: 'particle-lines',
+        kind: 'render',
+        reads: ['particles', 'edge-buffer', 'indirect-args', 'line-uniform'],
+        execute: (ctx) => {
+          const pass = ctx.encoder.beginRenderPass({
+            colorAttachments: [{
+              view: targetView,
+              loadOp: 'load',
+              storeOp: 'store',
+            }],
+          });
+          pass.setPipeline(this.linePipeline);
+          pass.setBindGroup(0, this.lineBindGroup);
+          pass.drawIndirect(this.indirectBuffer, 0);
+          pass.end();
+        },
+      });
+    }
+
+    return {
+      execute: () => graph.execute(encoder),
+    };
+  }
+
+  getDebugStats(): Record<string, any> {
+    return {
+      instrument: 'particle-field',
+      mode: this.params.mode,
+      topology: this.params.topology,
+      particleCount: this.particleCount,
+      connectEnabled: this.params.connectEnabled,
+      partnerCount: this.params.partnerCount,
+      passes: this.lastGraphStats?.passes ?? [],
+      graphCpuMs: this.lastGraphStats?.totalCpuMs ?? 0,
+    };
+  }
+
+  private importParticleGraphResources(graph: GhostGpuFrameGraph): void {
+    graph
+      .importBuffer('particles', this.particleBuffer)
+      .importBuffer('indirect-args', this.indirectBuffer)
+      .importBuffer('edge-buffer', this.edgeBuffer)
+      .importBuffer('behavior-uniform', this.behaviorUniform)
+      .importBuffer('edge-uniform', this.edgeUniform)
+      .importBuffer('render-uniform', this.renderUniform)
+      .importBuffer('line-uniform', this.lineUniform)
+      .importBuffer('fog-uniform', this.fogUniform);
   }
 
   dispose(): void {

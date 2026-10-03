@@ -16,11 +16,13 @@
  */
 
 import { WebGPUPointCloudFX, type PointCloudFXParams, type ColorMode, type ColorMap, type PointCloudFilterMode, type PointCloudFilterAxis } from '../webgpuPointCloudFX';
-import { parsePLYBuffer } from '../../splat/plyLoader';
+import { parsePLYPointBuffers, pointCloudBuffersFromPLYData } from '../../splat/plyLoader';
 import { parseSplatBuffer } from '../../splat/splatLoader';
-import type { PLYData } from '../../splat/plyLoader';
 import type { GpuShaderImpl, ParamControl } from '../gpuShaderTypes';
 import { deriveDefaults } from '../gpuShaderTypes';
+
+const POINT_CLOUD_FX_INTERACTIVE_MAX_POINTS = 500_000;
+const POINT_CLOUD_FX_INTERACTIVE_GAUSSIAN_MAX_POINTS = 300_000;
 
 export const pointCloudFXParamSchema: ParamControl[] = [
   // ── Source ─────────────────────────────────────────────────────
@@ -357,32 +359,42 @@ export class WebGPUPointCloudFXShader implements GpuShaderImpl {
    *  file when only unrelated params changed. */
   setSourceBuffer(buf: ArrayBuffer, kind: 'ply' | 'splat', key: string): void {
     if (key === this.loadedBufferKey) return;
-    let data: PLYData;
+    let pointData: ReturnType<typeof parsePLYPointBuffers>;
     try {
-      data = kind === 'splat' ? parseSplatBuffer(buf) : parsePLYBuffer(buf);
+      pointData = kind === 'splat'
+        ? pointCloudBuffersFromPLYData(parseSplatBuffer(buf), {
+            maxPoints: POINT_CLOUD_FX_INTERACTIVE_MAX_POINTS,
+            maxGaussianPoints: POINT_CLOUD_FX_INTERACTIVE_GAUSSIAN_MAX_POINTS,
+          })
+        : parsePLYPointBuffers(buf, {
+            maxPoints: POINT_CLOUD_FX_INTERACTIVE_MAX_POINTS,
+            maxGaussianPoints: POINT_CLOUD_FX_INTERACTIVE_GAUSSIAN_MAX_POINTS,
+          });
     } catch (e: any) {
       console.warn('[pointcloud-fx] parse failed:', e?.message || e);
       return;
     }
-    if (!data.vertices || data.vertices.length === 0) {
+    if (!pointData.sampleCount) {
       console.warn('[pointcloud-fx] empty point cloud — nothing to render');
       return;
     }
-    // Convert into the Float32Array views the renderer wants. PLY
-    // colors are 0..255; normalize to 0..1.
-    const n = data.vertices.length;
-    const positions = new Float32Array(n * 3);
-    const colors    = new Float32Array(n * 3);
-    for (let i = 0; i < n; i++) {
-      const v = data.vertices[i];
-      positions[i * 3 + 0] = v.x;
-      positions[i * 3 + 1] = v.y;
-      positions[i * 3 + 2] = v.z;
-      colors[i * 3 + 0] = v.r / 255;
-      colors[i * 3 + 1] = v.g / 255;
-      colors[i * 3 + 2] = v.b / 255;
-    }
-    this.inner.setPointCloudData(positions, colors);
+    this.inner.setPointCloudData(pointData.positions, pointData.colors, {
+      alpha: pointData.alpha,
+      splatScale: pointData.gaussian ? pointData.splatScale : undefined,
+      splatRotation: pointData.gaussian ? pointData.splatRotation : undefined,
+      sphericalHarmonicsRest: pointData.sphericalHarmonicsRest,
+      sphericalHarmonicsRestStride: pointData.sphericalHarmonicsRestStride,
+      sphericalHarmonicsDegree: pointData.sphericalHarmonicsDegree,
+      sphericalHarmonicsCoefficientCount: pointData.sphericalHarmonicsCoefficientCount,
+      gaussian: pointData.gaussian,
+    });
+    console.log(
+      '[pointcloud-fx] source prepared',
+      pointData.sampleCount,
+      'samples from',
+      pointData.sourceVertexCount,
+      pointData.gaussian ? 'gaussian splats' : 'points',
+    );
     this.loadedBufferKey = key;
   }
 

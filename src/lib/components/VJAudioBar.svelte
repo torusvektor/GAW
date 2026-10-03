@@ -16,6 +16,7 @@
 <script lang="ts">
   import { audioStore } from '../stores/audio';
   import AudioInputPicker from './AudioInputPicker.svelte';
+  import ClipAudioMasterControl from './ClipAudioMasterControl.svelte';
   import BpmTapWidget from './BpmTapWidget.svelte';
 
   // Props kept for backward compatibility with existing callers, but the
@@ -47,13 +48,16 @@
   void sigGlow;
 </script>
 
-<div class="audio-bar">
+<div data-help-page="midi-audio" class="audio-bar">
   <!-- Audio Source Selector — uses the shared AudioInputPicker so VJ mode
        sees the same mic + device-picker + system audio UI as mapping mode.
        State flows through the global audioStore so toggling here updates
        mapping/Performer too. -->
   <div class="audio-section">
     <AudioInputPicker />
+    <!-- Master output level for opt-in clip audio. Self-hides until at least
+         one clip has audio playback turned on. -->
+    <ClipAudioMasterControl />
     {#if $audioStore.error}
       <span class="audio-error">{$audioStore.error}</span>
     {/if}

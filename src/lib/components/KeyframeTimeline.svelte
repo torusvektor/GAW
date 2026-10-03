@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { KEYFRAME_EASINGS } from '../keyframes/easing';
   import { keyframeTimeline } from '../stores/keyframeTimeline';
   import { project, selectedLayer } from '../stores/layers';
   import { vjClipLauncher, vjOutputLayers } from '../stores/vjClipLauncher';
@@ -200,6 +201,9 @@
       if (!edge) return param.defaultValue;
       if (parts[2] === 'enabled') return edge.enabled;
       if (parts[2] === 'opacity') return edge.opacity ?? 1;
+      const [top, nested] = (parts[2] ?? '').split('.');
+      const v = nested ? (edge as any)[top]?.[nested] : (edge as any)[top];
+      return typeof v === 'number' ? v : param.defaultValue;
     }
     if (param.key.startsWith('model3d:') && l.model3dContent) {
       // Walk the dot path: model3d:echo.count → l.model3dContent.echo?.count
@@ -225,7 +229,7 @@
 <!-- Toggle button + tray are hidden in VJ mode (content-creation tool,
      not a live-performance one). See `hiddenInVJ` reactive above. -->
 {#if !hiddenInVJ}
-  <button
+  <button data-help-page="show-timeline"
     class="kf-toggle"
     class:active={isOpen}
     onclick={() => keyframeTimeline.toggleOpen()}
@@ -245,7 +249,7 @@
 
 <!-- Slide-up panel -->
 {#if isOpen && !hiddenInVJ}
-  <div class="kf-tray">
+  <div data-help-page="show-timeline" class="kf-tray">
     <div class="kf-header-btns">
       <button class="kf-clear" onclick={() => { console.log('[KF Timeline] Clear All clicked'); showClearConfirm = true; }} title="Clear all keyframes">
         Clear All
@@ -304,11 +308,9 @@
               value={selectedKf.easing || 'linear'}
               onchange={(e) => keyframeTimeline.updateKeyframeEasing(selectedKf!.layerId, selectedKf!.trackKey, selectedKf!.time, (e.target as HTMLSelectElement).value as any)}
             >
-              <option value="linear">Linear</option>
-              <option value="ease-in">Ease In</option>
-              <option value="ease-out">Ease Out</option>
-              <option value="ease-in-out">Ease In-Out</option>
-              <option value="step">Step</option>
+              {#each KEYFRAME_EASINGS as easing}
+                <option value={easing.value} title={easing.hint}>{easing.label}</option>
+              {/each}
             </select>
           </label>
         {/if}
@@ -361,11 +363,11 @@
     font-family: inherit;
   }
   .kf-toggle:hover {
-    border-color: #FF6B6B;
-    box-shadow: 0 4px 30px rgba(255,107,107,0.2);
+    border-color: var(--ga-coral, #ff6f5e);
+    box-shadow: 0 4px 30px color-mix(in srgb, var(--ga-coral, #ff6f5e) 20%, transparent);
   }
   .kf-toggle.active {
-    border-color: #FF6B6B;
+    border-color: var(--ga-coral, #ff6f5e);
     background: linear-gradient(135deg, #1a2020, #201515);
   }
 
@@ -377,7 +379,7 @@
     height: 300px;
     z-index: 90;
     background: rgba(10, 10, 14, 0.98);
-    border-top: 1px solid rgba(255, 107, 107, 0.15);
+    border-top: 1px solid color-mix(in srgb, var(--ga-coral, #ff6f5e) 15%, transparent);
     display: flex;
     flex-direction: column;
     animation: slideUp 0.2s ease-out;
@@ -394,9 +396,9 @@
     align-items: center;
   }
   .kf-clear {
-    background: rgba(255, 107, 107, 0.15);
-    border: 1px solid rgba(255, 107, 107, 0.35);
-    color: #FF8585;
+    background: color-mix(in srgb, var(--ga-coral, #ff6f5e) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ga-coral, #ff6f5e) 35%, transparent);
+    color: color-mix(in srgb, var(--ga-coral, #ff6f5e) 78%, #ffffff);
     font-size: 11px;
     font-weight: 600;
     padding: 5px 10px;
@@ -408,7 +410,7 @@
     font-family: inherit;
   }
   .kf-clear:hover {
-    background: rgba(255, 107, 107, 0.25);
+    background: color-mix(in srgb, var(--ga-coral, #ff6f5e) 25%, transparent);
     color: #fff;
   }
   .kf-close {
@@ -417,17 +419,17 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: linear-gradient(135deg, #FF6B6B, #FF4757);
+    background: linear-gradient(135deg, var(--ga-coral, #ff6f5e), color-mix(in srgb, var(--ga-coral, #ff6f5e) 70%, #000000));
     border: 1px solid rgba(255, 255, 255, 0.2);
     color: #fff;
     border-radius: 4px;
     cursor: pointer;
-    box-shadow: 0 2px 8px rgba(255, 107, 107, 0.4);
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--ga-coral, #ff6f5e) 40%, transparent);
     transition: all 0.15s;
   }
   .kf-close:hover {
-    background: linear-gradient(135deg, #FF8585, #FF6B6B);
-    box-shadow: 0 2px 12px rgba(255, 107, 107, 0.6);
+    background: linear-gradient(135deg, color-mix(in srgb, var(--ga-coral, #ff6f5e) 78%, #ffffff), var(--ga-coral, #ff6f5e));
+    box-shadow: 0 2px 12px color-mix(in srgb, var(--ga-coral, #ff6f5e) 60%, transparent);
     transform: scale(1.05);
   }
 
@@ -526,7 +528,7 @@
   }
   .kf-modal {
     background: var(--bg-tertiary, #14141a);
-    border: 1px solid rgba(255, 107, 107, 0.4);
+    border: 1px solid color-mix(in srgb, var(--ga-coral, #ff6f5e) 40%, transparent);
     border-radius: 8px;
     padding: 20px 24px;
     max-width: 380px;
@@ -534,7 +536,7 @@
   }
   .kf-modal h3 {
     margin: 0 0 10px 0;
-    color: #FF6B6B;
+    color: var(--ga-coral, #ff6f5e);
     font-size: 15px;
     font-weight: 700;
     text-transform: uppercase;
@@ -564,6 +566,7 @@
   }
   .kf-modal-cancel:hover { background: rgba(255, 255, 255, 0.1); }
   .kf-modal-confirm {
+    /* Destructive "Clear All" — stays danger red on purpose. */
     background: linear-gradient(135deg, #FF6B6B, #FF4757);
     border: 1px solid rgba(255, 107, 107, 0.6);
     color: #fff;

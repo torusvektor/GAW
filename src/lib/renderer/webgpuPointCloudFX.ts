@@ -1,3 +1,7 @@
+import type { GhostGpuBufferHandle } from './gpuRuntime';
+import { getGhostGpuRuntime } from './webgpuShared';
+import { createAndWarmWgslShaderModule, resolveGhostWgsl } from './wgsl';
+
 /**
  * WebGPUPointCloudFX — turn a static point cloud into a living
  * TouchDesigner-style instrument.
@@ -29,11 +33,20 @@
  *
  * Storage layout (per-point), two buffers:
  *
- *   HOME (32 bytes, immutable after load):
+ *   HOME (112 bytes, immutable after load):
  *     homePos:   vec3<f32>  (12)
- *     _pad0:     f32        (4)
+ *     alpha:     f32        (4)
  *     homeColor: vec3<f32>  (12)
- *     _pad1:     f32        (4)
+ *     sizeMul:   f32        (4)
+ *     splatScale: vec3<f32> (12)
+ *     gaussian:  f32        (4)
+ *     splatRot:  vec4<f32>  (16)
+ *     sh1Y:      vec3<f32>  (12)
+ *     shDegree:  f32        (4)
+ *     sh1Z:      vec3<f32>  (12)
+ *     shCount:   f32        (4)
+ *     sh1X:      vec3<f32>  (12)
+ *     _padSh:    f32        (4)
  *
  *   LIVE (48 bytes, compute-shader write-target):
  *     pos:   vec3<f32>  (12)
@@ -43,22 +56,204 @@
  *     color: vec3<f32>  (12)
  *     _pad:  f32        (4)
  *
- * Total: 80 bytes per point. 250K points (default) = 20MB; 1M points
- * = 80MB. Within budget on any modern GPU.
+ * Total: 160 bytes per point. 250K points = 40MB; 1M points =
+ * 160MB. The extra packed home lane keeps scale/rotation/opacity
+ * and first-order SH color available for the native covariance
+ * renderer instead of flattening .ply/.splat files into uniform dots.
  *
- * Loading: the host calls `setPointCloudData(positions, colors)` with
- * Float32Array (XYZ × N) + Float32Array (RGB × N, in 0..1). The
- * renderer (re)allocates buffers, normalizes positions into a unit
- * cube around the cloud's centroid, and writeBuffer's the data. After
- * that the first frame renders immediately.
+ * Loading: the host calls `setPointCloudData(positions, colors, opts)`
+ * with Float32Array (XYZ × N) + Float32Array (RGB × N, in 0..1).
+ * `opts` can carry Gaussian alpha/scale/rotation/SH parsed from
+ * .ply / .splat sources. The renderer (re)allocates buffers,
+ * normalizes positions into a unit cube around a robust median
+ * center, and writeBuffer's the data. After that the first frame
+ * renders immediately.
  */
 
-const HOME_BYTES = 32;
+const HOME_BYTES = 112;
+const HOME_FLOATS = HOME_BYTES / Float32Array.BYTES_PER_ELEMENT;
 const LIVE_BYTES = 48;
+const SORT_PAIR_BYTES = 8;
 const MAX_POINTS = 4_000_000;
+export const POINT_CLOUD_FX_NATIVE_DEPTH_SORT_MAX_POINTS = 262_144;
+const MAX_NATIVE_DEPTH_SORT_POINTS = POINT_CLOUD_FX_NATIVE_DEPTH_SORT_MAX_POINTS;
 const DEFAULT_POINT_SIZE = 0.006;
+const NORMALIZATION_SAMPLE_LIMIT = 65_536;
+const NORMALIZATION_RADIUS_PERCENTILE = 0.985;
+const MIN_GAUSSIAN_SIZE_MULTIPLIER = 0.45;
+const MAX_GAUSSIAN_SIZE_MULTIPLIER = 10;
+const GAUSSIAN_AA_PIXELS = 0.75;
 
 type Topology = 'points' | 'billboards' | 'strokes';
+
+type PointCloudNormalization = {
+  cx: number;
+  cy: number;
+  cz: number;
+  scale: number;
+  radius: number;
+};
+
+export interface PointCloudFXDataOptions {
+  alpha?: Float32Array;
+  splatScale?: Float32Array;
+  splatRotation?: Float32Array;
+  sphericalHarmonicsRest?: Float32Array;
+  sphericalHarmonicsRestStride?: number;
+  sphericalHarmonicsDegree?: number;
+  sphericalHarmonicsCoefficientCount?: number;
+  gaussian?: boolean;
+  maxPoints?: number;
+}
+
+export function pointCloudSourceIndexForSample(
+  sampleIndex: number,
+  sampleCount: number,
+  sourceCount: number,
+): number {
+  if (sourceCount <= 0) return 0;
+  if (sourceCount <= sampleCount || sampleCount <= 1) {
+    return Math.min(sourceCount - 1, Math.max(0, Math.floor(sampleIndex)));
+  }
+  return Math.min(
+    sourceCount - 1,
+    Math.floor(sampleIndex * (sourceCount - 1) / (sampleCount - 1)),
+  );
+}
+
+function gaussianSizeMultiplier(
+  scale0: number,
+  scale1: number,
+  scale2: number,
+  normalizationScale: number,
+): number {
+  if (!Number.isFinite(scale0) || !Number.isFinite(scale1) || !Number.isFinite(scale2)) return 1;
+  const averageLogScale = (scale0 + scale1 + scale2) / 3;
+  const rawRadius = Math.exp(clampNumber(averageLogScale, -12, 8));
+  const normalizedRadius = rawRadius * Math.max(normalizationScale, 1e-8);
+  return clampNumber(
+    0.65 + normalizedRadius * 160,
+    MIN_GAUSSIAN_SIZE_MULTIPLIER,
+    MAX_GAUSSIAN_SIZE_MULTIPLIER,
+  );
+}
+
+function normalizedGaussianScale(value: number, normalizationScale: number): number {
+  if (!Number.isFinite(value)) return 1;
+  return Math.exp(clampNumber(value, -12, 8)) * Math.max(normalizationScale, 1e-8);
+}
+
+function normalizedQuaternion(
+  x: number,
+  y: number,
+  z: number,
+  w: number,
+): [number, number, number, number] {
+  const qx = Number.isFinite(x) ? x : 1;
+  const qy = Number.isFinite(y) ? y : 0;
+  const qz = Number.isFinite(z) ? z : 0;
+  const qw = Number.isFinite(w) ? w : 0;
+  const len = Math.hypot(qx, qy, qz, qw);
+  if (len <= 1e-8) return [1, 0, 0, 0];
+  return [qx / len, qy / len, qz / len, qw / len];
+}
+
+function firstOrderShColor(
+  rest: Float32Array | undefined,
+  coefficientStride: number,
+  sourceIndex: number,
+  basisIndex: 0 | 1 | 2,
+): [number, number, number] {
+  if (!rest || coefficientStride < 9) return [0, 0, 0];
+  const off = sourceIndex * coefficientStride;
+  const r = rest[off + basisIndex];
+  const g = rest[off + 3 + basisIndex];
+  const b = rest[off + 6 + basisIndex];
+  return [
+    Number.isFinite(r) ? r : 0,
+    Number.isFinite(g) ? g : 0,
+    Number.isFinite(b) ? b : 0,
+  ];
+}
+
+function medianSorted(values: number[]): number {
+  if (values.length === 0) return 0;
+  const mid = Math.floor(values.length / 2);
+  if (values.length % 2 === 1) return values[mid];
+  return (values[mid - 1] + values[mid]) * 0.5;
+}
+
+function nextPowerOfTwo(value: number): number {
+  if (value <= 1) return 1;
+  return 2 ** Math.ceil(Math.log2(value));
+}
+
+function buildIdentitySortBuffer(pointCount: number, sortCount = pointCount): ArrayBuffer {
+  const safePointCount = Math.max(1, Math.floor(pointCount));
+  const safeSortCount = Math.max(safePointCount, Math.floor(sortCount));
+  const bytes = new ArrayBuffer(safeSortCount * SORT_PAIR_BYTES);
+  const u = new Uint32Array(bytes);
+  for (let i = 0; i < safeSortCount; i++) {
+    u[i * 2 + 0] = i < safePointCount ? 0 : 0xffffffff;
+    u[i * 2 + 1] = i < safePointCount ? i >>> 0 : 0;
+  }
+  return bytes;
+}
+
+function computePointCloudNormalization(
+  pointCount: number,
+  coordinateAt: (pointIndex: number, axis: 0 | 1 | 2) => number,
+): PointCloudNormalization {
+  if (pointCount <= 0) {
+    return { cx: 0, cy: 0, cz: 0, scale: 1, radius: 1 };
+  }
+  const sampleCount = Math.min(pointCount, NORMALIZATION_SAMPLE_LIMIT);
+  const indexForSample = (sampleIndex: number) => {
+    if (sampleCount <= 1 || pointCount <= 1) return 0;
+    return Math.min(pointCount - 1, Math.floor(sampleIndex * (pointCount - 1) / (sampleCount - 1)));
+  };
+  const xs: number[] = [];
+  const ys: number[] = [];
+  const zs: number[] = [];
+  for (let i = 0; i < sampleCount; i++) {
+    const pointIndex = indexForSample(i);
+    const x = coordinateAt(pointIndex, 0);
+    const y = coordinateAt(pointIndex, 1);
+    const z = coordinateAt(pointIndex, 2);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    xs.push(x);
+    ys.push(y);
+    zs.push(z);
+  }
+  if (xs.length === 0) {
+    return { cx: 0, cy: 0, cz: 0, scale: 1, radius: 1 };
+  }
+  xs.sort((a, b) => a - b);
+  ys.sort((a, b) => a - b);
+  zs.sort((a, b) => a - b);
+  const cx = medianSorted(xs);
+  const cy = medianSorted(ys);
+  const cz = medianSorted(zs);
+  const radii: number[] = [];
+  for (let i = 0; i < sampleCount; i++) {
+    const pointIndex = indexForSample(i);
+    const x = coordinateAt(pointIndex, 0);
+    const y = coordinateAt(pointIndex, 1);
+    const z = coordinateAt(pointIndex, 2);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    const dx = x - cx;
+    const dy = y - cy;
+    const dz = z - cz;
+    radii.push(Math.sqrt(dx * dx + dy * dy + dz * dz));
+  }
+  radii.sort((a, b) => a - b);
+  const radiusIndex = Math.min(
+    radii.length - 1,
+    Math.max(0, Math.floor((radii.length - 1) * NORMALIZATION_RADIUS_PERCENTILE)),
+  );
+  const radius = Math.max(radii[radiusIndex] || radii[radii.length - 1] || 0, 1e-6);
+  return { cx, cy, cz, scale: 0.9 / radius, radius };
+}
 
 function mat4Mul(a: Float32Array, b: Float32Array): Float32Array {
   const out = new Float32Array(16);
@@ -100,10 +295,19 @@ function translate(x: number, y: number, z: number): Float32Array {
 /* ============================================================== */
 const COMPUTE_WGSL = /* wgsl */ `
 struct Home {
-  homePos:   vec3<f32>,
-  _pad0:     f32,
-  homeColor: vec3<f32>,
-  _pad1:     f32,
+  homePos:       vec3<f32>,
+  alpha:         f32,
+  homeColor:     vec3<f32>,
+  sizeMultiplier: f32,
+  splatScale:    vec3<f32>,
+  gaussian:      f32,
+  splatRotation: vec4<f32>,
+  sh1Y:          vec3<f32>,
+  shDegree:      f32,
+  sh1Z:          vec3<f32>,
+  shCoeffCount:  f32,
+  sh1X:          vec3<f32>,
+  _padSh:        f32,
 };
 
 struct Live {
@@ -483,7 +687,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let stripe = abs(fract((axisValue(effHome, u.filterAxis) * 0.5 + 0.5) * bands + gesturePhase) - 0.5) * 2.0;
     sizeBoost = sizeBoost * mix(1.8, 0.55, smoothstep(0.0, 0.28, stripe));
   }
-  l.size = u.baseSize * sizeBoost;
+  l.size = max(0.0001, u.baseSize * h.sizeMultiplier) * sizeBoost;
 
   // ── Dissolve ───────────────────────────────────────────────────
   let distFromCenter = length(h.homePos);
@@ -498,7 +702,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let stripe = abs(fract((axisValue(effHome, u.filterAxis) * 0.5 + 0.5) * bands + gesturePhase) - 0.5) * 2.0;
     gestureAlpha = mix(0.3, 1.0, 1.0 - smoothstep(0.0, max(u.filterSoftness, 0.02), stripe));
   }
-  l.alpha = clamp(dissolveAlpha * gestureAlpha, 0.0, 1.0);
+  l.alpha = clamp(h.alpha * dissolveAlpha * gestureAlpha, 0.0, 1.0);
 
   live[i] = l;
 }
@@ -508,6 +712,30 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /* RENDER — instanced quads, three topologies                     */
 /* ============================================================== */
 const RENDER_WGSL = /* wgsl */ `
+#include <sort>
+
+const GHOST_GAUSSIAN_SIGMA_EXTENT: f32 = 3.0;
+const GHOST_GAUSSIAN_MIN_SIGMA_NDC: f32 = 0.00035;
+const GHOST_GAUSSIAN_MAX_SIGMA_NDC: f32 = 0.18;
+const GHOST_GAUSSIAN_SCREEN_BASIS_STEP: f32 = 0.01;
+const GHOST_SH_C1: f32 = 0.4886025119029199;
+
+struct Home {
+  homePos:       vec3<f32>,
+  alpha:         f32,
+  homeColor:     vec3<f32>,
+  sizeMultiplier: f32,
+  splatScale:    vec3<f32>,
+  gaussian:      f32,
+  splatRotation: vec4<f32>,
+  sh1Y:          vec3<f32>,
+  shDegree:      f32,
+  sh1Z:          vec3<f32>,
+  shCoeffCount:  f32,
+  sh1X:          vec3<f32>,
+  _padSh:        f32,
+};
+
 struct Live {
   pos:   vec3<f32>,
   alpha: f32,
@@ -520,7 +748,7 @@ struct Live {
 struct U {
   viewProj:     mat4x4<f32>,
   camRight:     vec3<f32>,
-  _pad0:        f32,
+  cameraDistance: f32,
   camUp:        vec3<f32>,
   _pad1:        f32,
   topology:     u32,        // 0=points, 1=billboards, 2=strokes
@@ -528,9 +756,9 @@ struct U {
   strokeWidth:  f32,
   opacity:      f32,
   pointCount:   u32,
-  _pad2:        f32,
-  _pad3:        f32,
-  _pad4:        f32,
+  viewportWidth: f32,
+  viewportHeight: f32,
+  gaussianAaPixels: f32,
   fogColor:     vec3<f32>,
   fogOpacity:   f32,
   fogDensity:   f32,
@@ -539,8 +767,124 @@ struct U {
   _pad7:        f32,
 };
 
-@group(0) @binding(0) var<storage, read> live: array<Live>;
-@group(0) @binding(1) var<uniform>       u:    U;
+@group(0) @binding(0) var<storage, read> home: array<Home>;
+@group(0) @binding(1) var<storage, read> live: array<Live>;
+@group(0) @binding(2) var<uniform>       u:    U;
+@group(0) @binding(3) var<storage, read> sortPairs: array<GhostSortPair>;
+
+fn rotateByQuatWxyz(qIn: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+  let q = normalize(qIn + vec4<f32>(1e-8, 0.0, 0.0, 0.0));
+  let qv = q.yzw;
+  let t = 2.0 * cross(qv, v);
+  return v + q.x * t + cross(qv, t);
+}
+
+fn firstOrderShTint(h: Home, p: Live) -> vec3<f32> {
+  if (h.gaussian <= 0.5 || h.shDegree < 0.5 || h.shCoeffCount < 9.0) {
+    return vec3<f32>(1.0);
+  }
+  let viewDir = normalize(vec3<f32>(0.0, 0.0, max(u.cameraDistance, 1e-4)) - p.pos);
+  let shColor = clamp(
+    h.homeColor +
+      GHOST_SH_C1 * (
+        h.sh1Z * viewDir.z -
+        h.sh1Y * viewDir.y -
+        h.sh1X * viewDir.x
+      ),
+    vec3<f32>(0.0),
+    vec3<f32>(1.0),
+  );
+  return clamp(shColor / max(h.homeColor, vec3<f32>(0.025)), vec3<f32>(0.0), vec3<f32>(4.0));
+}
+
+fn projectToNdc(pos: vec3<f32>) -> vec2<f32> {
+  let clip = u.viewProj * vec4<f32>(pos, 1.0);
+  return clip.xy / max(abs(clip.w), 1e-5);
+}
+
+fn projectSplatAxisNdc(center: vec3<f32>, axis: vec3<f32>, radius: f32) -> vec2<f32> {
+  let offset = axis * max(radius, 1e-7);
+  let plus = projectToNdc(center + offset);
+  let minus = projectToNdc(center - offset);
+  return (plus - minus) * 0.5;
+}
+
+fn solveScreenToWorldOffset(center: vec3<f32>, ndcOffset: vec2<f32>) -> vec3<f32> {
+  let c = projectToNdc(center);
+  let screenRight = projectToNdc(center + u.camRight * GHOST_GAUSSIAN_SCREEN_BASIS_STEP) - c;
+  let screenUp = projectToNdc(center + u.camUp * GHOST_GAUSSIAN_SCREEN_BASIS_STEP) - c;
+  let det = screenRight.x * screenUp.y - screenRight.y * screenUp.x;
+  if (abs(det) < 1e-7) {
+    let fallback = max(length(ndcOffset), 1e-7);
+    return (u.camRight * ndcOffset.x + u.camUp * ndcOffset.y) / fallback * 1e-4;
+  }
+  let worldX = (ndcOffset.x * screenUp.y - ndcOffset.y * screenUp.x) / det;
+  let worldY = (screenRight.x * ndcOffset.y - screenRight.y * ndcOffset.x) / det;
+  return (u.camRight * worldX + u.camUp * worldY) * GHOST_GAUSSIAN_SCREEN_BASIS_STEP;
+}
+
+struct GaussianScreenAxes {
+  majorOffset: vec3<f32>,
+  minorOffset: vec3<f32>,
+  opacityScale: f32,
+};
+
+fn gaussianScreenAxes(center: vec3<f32>, h: Home, p: Live) -> GaussianScreenAxes {
+  let sx = max(h.splatScale.x, 1e-6);
+  let sy = max(h.splatScale.y, 1e-6);
+  let sz = max(h.splatScale.z, 1e-6);
+  let meanScale = max((sx + sy + sz) / 3.0, 1e-6);
+
+  let visualScale = max(p.size, 1e-6);
+  let ax = projectSplatAxisNdc(center, rotateByQuatWxyz(h.splatRotation, vec3<f32>(1.0, 0.0, 0.0)), visualScale * sx / meanScale);
+  let ay = projectSplatAxisNdc(center, rotateByQuatWxyz(h.splatRotation, vec3<f32>(0.0, 1.0, 0.0)), visualScale * sy / meanScale);
+  let az = projectSplatAxisNdc(center, rotateByQuatWxyz(h.splatRotation, vec3<f32>(0.0, 0.0, 1.0)), visualScale * sz / meanScale);
+
+  // Project the full 3D gaussian covariance through viewProj with a
+  // finite-difference Jacobian. This preserves anisotropy, perspective,
+  // and the view-dependent contribution of splat axes that point toward
+  // the camera without needing a separate covariance compute pass yet.
+  let cxx = ax.x * ax.x + ay.x * ay.x + az.x * az.x;
+  let cxy = ax.x * ax.y + ay.x * ay.y + az.x * az.y;
+  let cyy = ax.y * ax.y + ay.y * ay.y + az.y * az.y;
+  let halfDiff = (cxx - cyy) * 0.5;
+  let root = sqrt(max(halfDiff * halfDiff + cxy * cxy, 0.0));
+  let minLambda = GHOST_GAUSSIAN_MIN_SIGMA_NDC * GHOST_GAUSSIAN_MIN_SIGMA_NDC;
+  let maxLambda = GHOST_GAUSSIAN_MAX_SIGMA_NDC * GHOST_GAUSSIAN_MAX_SIGMA_NDC;
+  let lambdaMajorRaw = max((cxx + cyy) * 0.5 + root, minLambda);
+  let lambdaMinorRaw = max((cxx + cyy) * 0.5 - root, minLambda);
+
+  var major2 = vec2<f32>(cxy, lambdaMajorRaw - cxx);
+  if (dot(major2, major2) < 1e-6) {
+    if (cxx >= cyy) {
+      major2 = vec2<f32>(1.0, 0.0);
+    } else {
+      major2 = vec2<f32>(0.0, 1.0);
+    }
+  } else {
+    major2 = normalize(major2);
+  }
+  let minor2 = vec2<f32>(-major2.y, major2.x);
+  let pixelSigmaNdc = max(
+    2.0 / max(u.viewportWidth, 1.0),
+    2.0 / max(u.viewportHeight, 1.0),
+  ) * max(u.gaussianAaPixels, 0.0);
+  let aaLambda = pixelSigmaNdc * pixelSigmaNdc;
+  let lambdaMajor = clamp(lambdaMajorRaw + aaLambda, minLambda, maxLambda);
+  let lambdaMinor = clamp(lambdaMinorRaw + aaLambda, minLambda, lambdaMajor);
+  let opacityScale = sqrt(clamp(
+    (lambdaMajorRaw * lambdaMinorRaw) / max(lambdaMajor * lambdaMinor, 1e-12),
+    0.08,
+    1.0,
+  ));
+  let majorSigmaNdc = major2 * sqrt(lambdaMajor);
+  let minorSigmaNdc = minor2 * sqrt(lambdaMinor);
+  return GaussianScreenAxes(
+    solveScreenToWorldOffset(center, majorSigmaNdc) * GHOST_GAUSSIAN_SIGMA_EXTENT,
+    solveScreenToWorldOffset(center, minorSigmaNdc) * GHOST_GAUSSIAN_SIGMA_EXTENT,
+    opacityScale,
+  );
+}
 
 struct VSOut {
   @builtin(position) pos: vec4<f32>,
@@ -548,6 +892,9 @@ struct VSOut {
   @location(1) color:     vec3<f32>,
   @location(2) alpha:     f32,
   @location(3) depth01:   f32,
+  @location(4) gaussian:  f32,
+  @location(5) gaussianSigma: vec2<f32>,
+  @location(6) gaussianOpacityScale: f32,
 };
 
 @vertex
@@ -555,9 +902,14 @@ fn vs_main(
   @builtin(vertex_index)   vid: u32,
   @builtin(instance_index) iid: u32,
 ) -> VSOut {
-  let p = live[iid];
+  let sorted = sortPairs[iid];
+  let pointIndex = min(sorted.value, max(u.pointCount, 1u) - 1u);
+  let h = home[pointIndex];
+  let p = live[pointIndex];
 
   var cornerUV: vec2<f32> = vec2<f32>(0.0, 0.0);
+  var gaussianSigma: vec2<f32> = vec2<f32>(0.0, 0.0);
+  var gaussianOpacityScale: f32 = 1.0;
   var offset:   vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
 
   if (u.topology == 2u) {
@@ -587,15 +939,31 @@ fn vs_main(
     cornerUV = vec2<f32>(q.x * 0.5 + 0.5, q.y * 0.5 + 0.5);
     // billboards are 2× bigger than points
     let sizeMul = select(1.0, 2.0, u.topology == 1u);
-    offset = u.camRight * (q.x * p.size * sizeMul) + u.camUp * (q.y * p.size * sizeMul);
+    var billboardX = u.camRight;
+    var billboardY = u.camUp;
+    if (h.gaussian > 0.5) {
+      let axes = gaussianScreenAxes(p.pos, h, p);
+      billboardX = axes.majorOffset;
+      billboardY = axes.minorOffset;
+      gaussianSigma = q * GHOST_GAUSSIAN_SIGMA_EXTENT;
+      gaussianOpacityScale = axes.opacityScale;
+      offset = billboardX * q.x + billboardY * q.y;
+    } else {
+      offset =
+        billboardX * (q.x * p.size * sizeMul) +
+        billboardY * (q.y * p.size * sizeMul);
+    }
   }
 
   var out: VSOut;
   out.pos    = u.viewProj * vec4<f32>(p.pos + offset, 1.0);
   out.uv     = cornerUV;
-  out.color  = p.color;
+  out.color  = clamp(p.color * firstOrderShTint(h, p), vec3<f32>(0.0), vec3<f32>(4.0));
   out.alpha  = p.alpha * u.opacity;
   out.depth01 = clamp(out.pos.z / max(out.pos.w, 1e-5) * 0.5 + 0.5, 0.0, 1.0);
+  out.gaussian = h.gaussian;
+  out.gaussianSigma = gaussianSigma;
+  out.gaussianOpacityScale = gaussianOpacityScale;
   return out;
 }
 
@@ -608,6 +976,13 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let headTail = 1.0 - in.uv.x;
     let perp     = 1.0 - abs(in.uv.y - 0.5) * 2.0;
     mask = headTail * smoothstep(0.0, 0.4, perp);
+  } else if (in.gaussian > 0.5) {
+    // 3DGS-style elliptical density kernel. The vertex shader expands
+    // the quad to ±3σ along the projected covariance axes, and the
+    // fragment shader evaluates the gaussian in that local sigma space.
+    let r2 = dot(in.gaussianSigma, in.gaussianSigma);
+    let tailFade = 1.0 - smoothstep(7.2, 9.0, r2);
+    mask = exp(-0.5 * r2) * tailFade;
   } else if (u.topology == 1u) {
     // Billboard — soft gaussian-ish disc
     let d = distance(in.uv, vec2<f32>(0.5, 0.5)) * 2.0;
@@ -617,10 +992,79 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let d = distance(in.uv, vec2<f32>(0.5, 0.5)) * 2.0;
     mask = smoothstep(1.0, 0.2, d);
   }
-  let a = in.alpha * mask;
+  let a = in.alpha * mask * in.gaussianOpacityScale;
   let fogT = clamp((1.0 - exp(-in.depth01 * max(u.fogDensity, 0.0) * 4.0)) * u.fogOpacity, 0.0, 1.0);
   let color = mix(in.color, u.fogColor, fogT);
   return vec4<f32>(color * a, a);
+}
+`;
+
+/* ============================================================== */
+/* SORT — native graph depth keys + bitonic index ordering         */
+/* ============================================================== */
+const SORT_FILL_WGSL = /* wgsl */ `
+#include <sort>
+
+struct Live {
+  pos:   vec3<f32>,
+  alpha: f32,
+  vel:   vec3<f32>,
+  size:  f32,
+  color: vec3<f32>,
+  _pad:  f32,
+};
+
+struct U {
+  viewProj:   mat4x4<f32>,
+  pointCount: u32,
+  sortCount:  u32,
+  _pad0:      u32,
+  _pad1:      u32,
+};
+
+@group(0) @binding(0) var<storage, read>       live:      array<Live>;
+@group(0) @binding(1) var<storage, read_write> sortPairs: array<GhostSortPair>;
+@group(0) @binding(2) var<uniform>             u:         U;
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= u.sortCount) { return; }
+  if (i >= u.pointCount) {
+    sortPairs[i] = ghost_sort_pack_pair(GHOST_SORT_KEY_MAX, 0u);
+    return;
+  }
+  let p = live[i];
+  let clip = u.viewProj * vec4<f32>(p.pos, 1.0);
+  let depth01 = clamp(clip.z / max(clip.w, 1e-5) * 0.5 + 0.5, 0.0, 1.0);
+  sortPairs[i] = ghost_sort_pack_pair(ghost_sort_key_from_depth_far_to_near(depth01), i);
+}
+`;
+
+const SORT_STEP_WGSL = /* wgsl */ `
+#include <sort>
+
+struct U {
+  pointCount:    u32,
+  sortCount:     u32,
+  sequenceSize:  u32,
+  stride:        u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> sortPairs: array<GhostSortPair>;
+@group(0) @binding(1) var<uniform>             u:         U;
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= u.sortCount) { return; }
+  let partner = ghost_sort_bitonic_partner(i, u.stride);
+  if (partner <= i || partner >= u.sortCount) { return; }
+  let a = sortPairs[i];
+  let b = sortPairs[partner];
+  let ascending = ghost_sort_bitonic_ascending(i, u.sequenceSize);
+  sortPairs[i] = ghost_sort_pair_before(a, b, ascending);
+  sortPairs[partner] = ghost_sort_pair_after(a, b, ascending);
 }
 `;
 
@@ -798,14 +1242,846 @@ const BLEND_PREMULT_OVER: any = {
   alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
 };
 
+export const POINT_CLOUD_FX_NATIVE_SHADER_IDS = Object.freeze({
+  compute: 'point-cloud-fx/compute',
+  sortFill: 'point-cloud-fx/sort-fill',
+  sortStep: 'point-cloud-fx/sort-step',
+  render: 'point-cloud-fx/render',
+});
+
+export type PointCloudFXNativeShaderStage = 'compute' | 'render';
+
+export interface PointCloudFXNativeShaderSource {
+  shaderId: string;
+  label: string;
+  stage: PointCloudFXNativeShaderStage;
+  entry: string;
+  source: string;
+}
+
+export interface PointCloudFXNativePrecompileCommand {
+  type: 'precompile_shader';
+  shader_id: string;
+  stage: PointCloudFXNativeShaderStage;
+  entry: string;
+  source: string;
+}
+
+type PointCloudFXNativeGraphBinding = {
+  binding: number;
+  resource: string;
+  kind: string;
+};
+
+type PointCloudFXNativeGraphBuffer = {
+  id: string;
+  kind: 'uniform' | 'storage' | 'read-only-storage';
+  byte_length: number;
+  persistent?: boolean;
+  clear?: boolean;
+  initial_b64?: string;
+  initial_buffer?: ArrayBuffer | Uint8Array;
+};
+
+type PointCloudFXNativeGraphPass = {
+  name: string;
+  shader_id: string;
+  entry: string;
+  dispatch: [number, number, number];
+  bindings: PointCloudFXNativeGraphBinding[];
+};
+
+type PointCloudFXNativeGraphRenderPass = {
+  name: string;
+  shader_id: string;
+  vertex_entry: string;
+  fragment_entry: string;
+  target: 'source_frame';
+  source_id: string;
+  seq: number;
+  clear: boolean;
+  clear_color?: [number, number, number, number];
+  include_snapshot?: boolean;
+  blend: 'replace' | 'alpha' | 'add';
+  vertex_count: number;
+  instance_count: number;
+  bindings: PointCloudFXNativeGraphBinding[];
+};
+
+export interface PointCloudFXNativePointData {
+  signature: string;
+  pointCount: number;
+  sortCount: number;
+  homeByteLength: number;
+  liveByteLength: number;
+  sortByteLength: number;
+  homeInitialBuffer: ArrayBuffer;
+  liveInitialBuffer: ArrayBuffer;
+  sortInitialBuffer: ArrayBuffer;
+  sampledFromCount: number;
+  hasGaussianPayload: boolean;
+  depthSortEnabled: boolean;
+  sphericalHarmonicsDegree: number;
+  sphericalHarmonicsCoefficientCount: number;
+}
+
+export interface PointCloudFXNativePointDataOptions extends PointCloudFXDataOptions {
+  pointSize?: number;
+  signature?: string;
+  sphericalHarmonicsDegree?: number;
+  sphericalHarmonicsCoefficientCount?: number;
+}
+
+export interface PointCloudFXNativeGraphState {
+  pointDataSignature: string;
+  pointCount: number;
+  lastTime: number;
+  hueShiftPhase: number;
+  colorCyclePhase: number;
+  burstImpulse: number;
+  prevBass: number;
+  waveTime: number;
+  autoRotXPhase: number;
+  autoRotYPhase: number;
+  autoRotZPhase: number;
+}
+
+export interface PointCloudFXNativeGraphOptions {
+  sourceId: string;
+  pointData: PointCloudFXNativePointData;
+  params?: Record<string, any> | null;
+  width: number;
+  height: number;
+  time: number;
+  frameDelta: number;
+  frameIndex: number;
+  audioBass?: number;
+  audioTreble?: number;
+  state?: PointCloudFXNativeGraphState | null;
+  reset?: boolean;
+}
+
+export interface PointCloudFXNativeGraphBuildResult {
+  config: {
+    buffers: PointCloudFXNativeGraphBuffer[];
+    passes: PointCloudFXNativeGraphPass[];
+    render_passes: PointCloudFXNativeGraphRenderPass[];
+  };
+  state: PointCloudFXNativeGraphState;
+}
+
+export interface PointCloudFXPackedPointBuffers {
+  sourceCount: number;
+  pointCount: number;
+  sortCount: number;
+  normalization: PointCloudNormalization;
+  homeBytes: ArrayBuffer;
+  liveBytes: ArrayBuffer;
+  sortBytes: ArrayBuffer;
+  hasGaussianPayload: boolean;
+  depthSortEnabled: boolean;
+}
+
+export interface PointCloudFXPackedPointBufferOptions extends PointCloudFXDataOptions {
+  pointSize?: number;
+  depthSort?: boolean;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function bufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function rgbParam01(value: unknown, fallback: [number, number, number]): [number, number, number] {
+  if (!Array.isArray(value) || value.length < 3) return fallback;
+  const raw = [Number(value[0]), Number(value[1]), Number(value[2])];
+  if (!raw.every(Number.isFinite)) return fallback;
+  const scale = raw.some((v) => Math.abs(v) > 1.5) ? 255 : 1;
+  return [
+    clampNumber(raw[0] / scale, 0, 1),
+    clampNumber(raw[1] / scale, 0, 1),
+    clampNumber(raw[2] / scale, 0, 1),
+  ];
+}
+
+function wrapUnit(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return value - Math.floor(value);
+}
+
+function matrixRotateX(rad: number): Float32Array {
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
+}
+
+function matrixRotateY(rad: number): Float32Array {
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
+}
+
+function matrixRotateZ(rad: number): Float32Array {
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return new Float32Array([c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+}
+
+function pointCloudFXParamsFromRaw(
+  raw: Record<string, any> | null | undefined,
+  audioBass: number,
+  audioTreble: number,
+): PointCloudFXParams {
+  const p = raw ?? {};
+  const topology = p.topology === 'strokes' || p.topology === 'billboards' ? p.topology : 'points';
+  const colorMode = COLOR_MODE_ID[p.colorMode as ColorMode] !== undefined ? p.colorMode as ColorMode : DEFAULT_PARAMS.colorMode;
+  const colorMap = COLOR_MAP_ID[p.colorMap as ColorMap] !== undefined ? p.colorMap as ColorMap : DEFAULT_PARAMS.colorMap;
+  const filterMode = FILTER_MODE_ID[p.filterMode as PointCloudFilterMode] !== undefined ? p.filterMode as PointCloudFilterMode : DEFAULT_PARAMS.filterMode;
+  const filterAxis = FILTER_AXIS_ID[p.filterAxis as PointCloudFilterAxis] !== undefined ? p.filterAxis as PointCloudFilterAxis : DEFAULT_PARAMS.filterAxis;
+  const reactive = p.audioReactive !== false;
+  return {
+    ...DEFAULT_PARAMS,
+    topology,
+    pointSize: clampNumber(finiteNumber(p.pointSize, DEFAULT_PARAMS.pointSize), 0.0001, 0.2),
+    opacity: clampNumber(finiteNumber(p.opacity, DEFAULT_PARAMS.opacity), 0, 1),
+    windStrength: clampNumber(finiteNumber(p.windStrength, DEFAULT_PARAMS.windStrength), 0, 8),
+    windScale: clampNumber(finiteNumber(p.windScale, DEFAULT_PARAMS.windScale), 0.01, 24),
+    anchorPull: clampNumber(finiteNumber(p.anchorPull, DEFAULT_PARAMS.anchorPull), 0, 16),
+    damping: clampNumber(finiteNumber(p.damping, DEFAULT_PARAMS.damping), 0, 8),
+    twistAmount: clampNumber(finiteNumber(p.twistAmount, DEFAULT_PARAMS.twistAmount), -32, 32),
+    voxelMix: clampNumber(finiteNumber(p.voxelMix, DEFAULT_PARAMS.voxelMix), 0, 1),
+    voxelSize: clampNumber(finiteNumber(p.voxelSize, DEFAULT_PARAMS.voxelSize), 0.001, 4),
+    bass: reactive ? clampNumber(audioBass, 0, 4) : 0,
+    treble: reactive ? clampNumber(audioTreble, 0, 4) : 0,
+    shimmerStrength: clampNumber(finiteNumber(p.shimmerStrength, DEFAULT_PARAMS.shimmerStrength), 0, 2),
+    burstGain: clampNumber(finiteNumber(p.burstGain, DEFAULT_PARAMS.burstGain), 0, 8),
+    burstDecay: clampNumber(finiteNumber(p.burstDecay, DEFAULT_PARAMS.burstDecay), 0.01, 24),
+    waveEnabled: p.waveEnabled !== false,
+    waveSpeed: finiteNumber(p.waveSpeed, DEFAULT_PARAMS.waveSpeed),
+    waveOrbitRadius: clampNumber(finiteNumber(p.waveOrbitRadius, DEFAULT_PARAMS.waveOrbitRadius), 0, 8),
+    waveRadius: clampNumber(finiteNumber(p.waveRadius, DEFAULT_PARAMS.waveRadius), 0.001, 8),
+    waveFalloff: clampNumber(finiteNumber(p.waveFalloff, DEFAULT_PARAMS.waveFalloff), 0.001, 8),
+    waveStrength: clampNumber(finiteNumber(p.waveStrength, DEFAULT_PARAMS.waveStrength), 0, 16),
+    hueShiftSpeed: finiteNumber(p.hueShiftSpeed, DEFAULT_PARAMS.hueShiftSpeed),
+    saturation: clampNumber(finiteNumber(p.saturation, DEFAULT_PARAMS.saturation), 0, 8),
+    brightness: clampNumber(finiteNumber(p.brightness, DEFAULT_PARAMS.brightness), 0, 8),
+    colorMode,
+    colorMap,
+    colorMix: clampNumber(finiteNumber(p.colorMix, DEFAULT_PARAMS.colorMix), 0, 1),
+    colorMapScale: clampNumber(finiteNumber(p.colorMapScale, DEFAULT_PARAMS.colorMapScale), 0.001, 24),
+    colorMapOffset: finiteNumber(p.colorMapOffset, DEFAULT_PARAMS.colorMapOffset),
+    colorCycleSpeed: finiteNumber(p.colorCycleSpeed, DEFAULT_PARAMS.colorCycleSpeed),
+    randomSat: clampNumber(finiteNumber(p.randomSat, DEFAULT_PARAMS.randomSat), 0, 1),
+    randomVal: clampNumber(finiteNumber(p.randomVal, DEFAULT_PARAMS.randomVal), 0, 8),
+    filterMode,
+    filterAxis,
+    filterAmount: clampNumber(finiteNumber(p.filterAmount, DEFAULT_PARAMS.filterAmount), 0, 8),
+    filterSpeed: finiteNumber(p.filterSpeed, DEFAULT_PARAMS.filterSpeed),
+    filterPhase: finiteNumber(p.filterPhase, DEFAULT_PARAMS.filterPhase),
+    filterWidth: clampNumber(finiteNumber(p.filterWidth, DEFAULT_PARAMS.filterWidth), 0.001, 8),
+    filterSoftness: clampNumber(finiteNumber(p.filterSoftness, DEFAULT_PARAMS.filterSoftness), 0.001, 8),
+    contourBands: clampNumber(finiteNumber(p.contourBands, DEFAULT_PARAMS.contourBands), 1, 128),
+    fogDensity: clampNumber(finiteNumber(p.fogDensity, DEFAULT_PARAMS.fogDensity), 0, 16),
+    fogOpacity: clampNumber(finiteNumber(p.fogOpacity, DEFAULT_PARAMS.fogOpacity), 0, 1),
+    fogColor: rgbParam01(p.fogColor, DEFAULT_PARAMS.fogColor),
+    colorA: rgbParam01(p.colorA, DEFAULT_PARAMS.colorA),
+    colorB: rgbParam01(p.colorB, DEFAULT_PARAMS.colorB),
+    colorC: rgbParam01(p.colorC, DEFAULT_PARAMS.colorC),
+    colorD: rgbParam01(p.colorD, DEFAULT_PARAMS.colorD),
+    dissolveRadius: clampNumber(finiteNumber(p.dissolveRadius, DEFAULT_PARAMS.dissolveRadius), 0, 64),
+    dissolveSoftness: clampNumber(finiteNumber(p.dissolveSoftness, DEFAULT_PARAMS.dissolveSoftness), 0.001, 8),
+    strokeLength: clampNumber(finiteNumber(p.strokeLength, DEFAULT_PARAMS.strokeLength), 0.001, 4),
+    strokeWidth: clampNumber(finiteNumber(p.strokeWidth, DEFAULT_PARAMS.strokeWidth), 0.0001, 2),
+    fovDeg: clampNumber(finiteNumber(p.fovDeg, DEFAULT_PARAMS.fovDeg), 1, 160),
+    cameraZ: clampNumber(finiteNumber(p.cameraZ, DEFAULT_PARAMS.cameraZ), 0.05, 128),
+    rotateX: finiteNumber(p.rotateX, DEFAULT_PARAMS.rotateX),
+    rotateY: finiteNumber(p.rotateY, DEFAULT_PARAMS.rotateY),
+    rotateZ: finiteNumber(p.rotateZ, DEFAULT_PARAMS.rotateZ),
+    autoRotateX: finiteNumber(p.autoRotateX, DEFAULT_PARAMS.autoRotateX),
+    autoRotateY: finiteNumber(p.autoRotateY, DEFAULT_PARAMS.autoRotateY),
+    autoRotateZ: finiteNumber(p.autoRotateZ, DEFAULT_PARAMS.autoRotateZ),
+  };
+}
+
+export function buildPointCloudFXPackedPointBuffers(
+  positions: Float32Array,
+  colors: Float32Array,
+  options: PointCloudFXPackedPointBufferOptions = {},
+): PointCloudFXPackedPointBuffers | null {
+  const sourceCount = Math.floor(Math.min(positions.length / 3, colors.length / 3));
+  const hasGaussianPayload = !!options.gaussian || !!options.splatScale || !!options.splatRotation;
+  const requestedMaxPoints = Math.floor(clampNumber(options.maxPoints ?? MAX_POINTS, 1, MAX_POINTS));
+  const maxPoints = options.depthSort && hasGaussianPayload
+    ? Math.min(requestedMaxPoints, MAX_NATIVE_DEPTH_SORT_POINTS)
+    : requestedMaxPoints;
+  const n = Math.min(sourceCount, maxPoints);
+  if (n <= 0) return null;
+
+  const indexFor = (i: number) => pointCloudSourceIndexForSample(i, n, sourceCount);
+  const normalization = computePointCloudNormalization(n, (pointIndex, axis) => {
+    const src = indexFor(pointIndex) * 3;
+    return positions[src + axis];
+  });
+  const { cx, cy, cz, scale } = normalization;
+  const pointSize = clampNumber(options.pointSize ?? DEFAULT_POINT_SIZE, 0.0001, 0.2);
+  const depthSortEnabled = !!options.depthSort && hasGaussianPayload && n > 1;
+  const sortCount = depthSortEnabled ? nextPowerOfTwo(n) : n;
+  const shDegree = Math.max(0, Math.floor(options.sphericalHarmonicsDegree ?? 0));
+  const shCoeffCount = Math.max(0, Math.floor(options.sphericalHarmonicsCoefficientCount ?? 0));
+  const shRestStride = Math.max(0, Math.floor(options.sphericalHarmonicsRestStride ?? shCoeffCount));
+  const hasFirstOrderSh = shDegree >= 1 &&
+    shCoeffCount >= 9 &&
+    shRestStride >= 9 &&
+    !!options.sphericalHarmonicsRest &&
+    options.sphericalHarmonicsRest.length >= sourceCount * shRestStride;
+  const homeBytes = new ArrayBuffer(n * HOME_BYTES);
+  const homeF = new Float32Array(homeBytes);
+  const liveBytes = new ArrayBuffer(n * LIVE_BYTES);
+  const liveF = new Float32Array(liveBytes);
+  const sortBytes = buildIdentitySortBuffer(n, sortCount);
+
+  for (let i = 0; i < n; i++) {
+    const sourceIndex = indexFor(i);
+    const src = sourceIndex * 3;
+    const scaleSrc = sourceIndex * 3;
+    const rotSrc = sourceIndex * 4;
+    const homeOff = i * HOME_FLOATS;
+    const liveOff = i * 12;
+    const x = (positions[src + 0] - cx) * scale;
+    const y = (positions[src + 1] - cy) * scale;
+    const z = (positions[src + 2] - cz) * scale;
+    const alpha = clampNumber(options.alpha?.[sourceIndex] ?? 1, 0, 1);
+    const r = clampNumber(colors[src + 0], 0, 1);
+    const g = clampNumber(colors[src + 1], 0, 1);
+    const b = clampNumber(colors[src + 2], 0, 1);
+    const hasScale = !!options.splatScale &&
+      Number.isFinite(options.splatScale[scaleSrc + 0]) &&
+      Number.isFinite(options.splatScale[scaleSrc + 1]) &&
+      Number.isFinite(options.splatScale[scaleSrc + 2]);
+    const scale0 = hasScale ? options.splatScale![scaleSrc + 0] : 0;
+    const scale1 = hasScale ? options.splatScale![scaleSrc + 1] : 0;
+    const scale2 = hasScale ? options.splatScale![scaleSrc + 2] : 0;
+    const sizeMultiplier = hasScale ? gaussianSizeMultiplier(scale0, scale1, scale2, normalization.scale) : 1;
+    const [rot0, rot1, rot2, rot3] = normalizedQuaternion(
+      options.splatRotation?.[rotSrc + 0] ?? 1,
+      options.splatRotation?.[rotSrc + 1] ?? 0,
+      options.splatRotation?.[rotSrc + 2] ?? 0,
+      options.splatRotation?.[rotSrc + 3] ?? 0,
+    );
+    const [sh1Yr, sh1Yg, sh1Yb] = hasFirstOrderSh
+      ? firstOrderShColor(options.sphericalHarmonicsRest, shRestStride, sourceIndex, 0)
+      : [0, 0, 0];
+    const [sh1Zr, sh1Zg, sh1Zb] = hasFirstOrderSh
+      ? firstOrderShColor(options.sphericalHarmonicsRest, shRestStride, sourceIndex, 1)
+      : [0, 0, 0];
+    const [sh1Xr, sh1Xg, sh1Xb] = hasFirstOrderSh
+      ? firstOrderShColor(options.sphericalHarmonicsRest, shRestStride, sourceIndex, 2)
+      : [0, 0, 0];
+
+    homeF[homeOff + 0] = x;
+    homeF[homeOff + 1] = y;
+    homeF[homeOff + 2] = z;
+    homeF[homeOff + 3] = alpha;
+    homeF[homeOff + 4] = r;
+    homeF[homeOff + 5] = g;
+    homeF[homeOff + 6] = b;
+    homeF[homeOff + 7] = sizeMultiplier;
+    homeF[homeOff + 8] = hasScale ? normalizedGaussianScale(scale0, normalization.scale) : 1;
+    homeF[homeOff + 9] = hasScale ? normalizedGaussianScale(scale1, normalization.scale) : 1;
+    homeF[homeOff + 10] = hasScale ? normalizedGaussianScale(scale2, normalization.scale) : 1;
+    homeF[homeOff + 11] = hasGaussianPayload ? 1 : 0;
+    homeF[homeOff + 12] = rot0;
+    homeF[homeOff + 13] = rot1;
+    homeF[homeOff + 14] = rot2;
+    homeF[homeOff + 15] = rot3;
+    homeF[homeOff + 16] = sh1Yr;
+    homeF[homeOff + 17] = sh1Yg;
+    homeF[homeOff + 18] = sh1Yb;
+    homeF[homeOff + 19] = hasFirstOrderSh ? shDegree : 0;
+    homeF[homeOff + 20] = sh1Zr;
+    homeF[homeOff + 21] = sh1Zg;
+    homeF[homeOff + 22] = sh1Zb;
+    homeF[homeOff + 23] = hasFirstOrderSh ? shCoeffCount : 0;
+    homeF[homeOff + 24] = sh1Xr;
+    homeF[homeOff + 25] = sh1Xg;
+    homeF[homeOff + 26] = sh1Xb;
+    homeF[homeOff + 27] = 0;
+
+    liveF[liveOff + 0] = x;
+    liveF[liveOff + 1] = y;
+    liveF[liveOff + 2] = z;
+    liveF[liveOff + 3] = alpha;
+    liveF[liveOff + 4] = 0;
+    liveF[liveOff + 5] = 0;
+    liveF[liveOff + 6] = 0;
+    liveF[liveOff + 7] = pointSize * sizeMultiplier;
+    liveF[liveOff + 8] = r;
+    liveF[liveOff + 9] = g;
+    liveF[liveOff + 10] = b;
+    liveF[liveOff + 11] = 0;
+  }
+
+  return {
+    sourceCount,
+    pointCount: n,
+    sortCount,
+    normalization,
+    homeBytes,
+    liveBytes,
+    sortBytes,
+    hasGaussianPayload,
+    depthSortEnabled,
+  };
+}
+
+export function getPointCloudFXNativeShaderSources(): PointCloudFXNativeShaderSource[] {
+  return [
+    {
+      shaderId: POINT_CLOUD_FX_NATIVE_SHADER_IDS.compute,
+      label: POINT_CLOUD_FX_NATIVE_SHADER_IDS.compute,
+      stage: 'compute',
+      entry: 'cs_main',
+      source: resolveGhostWgsl(COMPUTE_WGSL, POINT_CLOUD_FX_NATIVE_SHADER_IDS.compute),
+    },
+    {
+      shaderId: POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortFill,
+      label: POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortFill,
+      stage: 'compute',
+      entry: 'cs_main',
+      source: resolveGhostWgsl(SORT_FILL_WGSL, POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortFill),
+    },
+    {
+      shaderId: POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortStep,
+      label: POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortStep,
+      stage: 'compute',
+      entry: 'cs_main',
+      source: resolveGhostWgsl(SORT_STEP_WGSL, POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortStep),
+    },
+    {
+      shaderId: POINT_CLOUD_FX_NATIVE_SHADER_IDS.render,
+      label: POINT_CLOUD_FX_NATIVE_SHADER_IDS.render,
+      stage: 'render',
+      entry: 'vs_main',
+      source: resolveGhostWgsl(RENDER_WGSL, POINT_CLOUD_FX_NATIVE_SHADER_IDS.render),
+    },
+  ];
+}
+
+export function buildPointCloudFXNativePrecompileCommands(): PointCloudFXNativePrecompileCommand[] {
+  return getPointCloudFXNativeShaderSources().map((source) => ({
+    type: 'precompile_shader',
+    shader_id: source.shaderId,
+    stage: source.stage,
+    entry: source.entry,
+    source: source.source,
+  }));
+}
+
+export function buildPointCloudFXNativePointData(
+  positions: Float32Array,
+  colors: Float32Array,
+  options: PointCloudFXNativePointDataOptions = {},
+): PointCloudFXNativePointData {
+  const packed = buildPointCloudFXPackedPointBuffers(positions, colors, {
+    ...options,
+    depthSort: true,
+    pointSize: options.pointSize ?? DEFAULT_POINT_SIZE,
+  });
+  if (!packed) {
+    throw new Error('point-cloud-fx native point data requires at least one point');
+  }
+  const {
+    sourceCount,
+    pointCount: n,
+    sortCount,
+    homeBytes,
+    liveBytes,
+    sortBytes,
+    hasGaussianPayload,
+    depthSortEnabled,
+  } = packed;
+  const indexFor = (i: number) => pointCloudSourceIndexForSample(i, n, sourceCount);
+  const sphericalHarmonicsDegree = Math.max(0, Math.floor(options.sphericalHarmonicsDegree ?? 0));
+  const sphericalHarmonicsCoefficientCount = Math.max(0, Math.floor(options.sphericalHarmonicsCoefficientCount ?? 0));
+
+  const first = indexFor(0) * 3;
+  const mid = indexFor(Math.floor((n - 1) / 2)) * 3;
+  const last = indexFor(n - 1) * 3;
+  const fallbackSignature = [
+    sourceCount,
+    n,
+    positions[first + 0]?.toFixed(4),
+    positions[mid + 1]?.toFixed(4),
+    positions[last + 2]?.toFixed(4),
+    colors[first + 0]?.toFixed(4),
+    colors[mid + 1]?.toFixed(4),
+    colors[last + 2]?.toFixed(4),
+    hasGaussianPayload ? 'gaussian' : 'points',
+    `sh${sphericalHarmonicsDegree}:${sphericalHarmonicsCoefficientCount}`,
+    options.alpha?.[indexFor(0)]?.toFixed(4) ?? 'a1',
+    options.splatScale?.[indexFor(0) * 3 + 0]?.toFixed(4) ?? 's1',
+    options.splatRotation?.[indexFor(0) * 4 + 0]?.toFixed(4) ?? 'r1',
+  ].join(':');
+
+  return {
+    signature: options.signature || fallbackSignature,
+    pointCount: n,
+    sortCount,
+    homeByteLength: homeBytes.byteLength,
+    liveByteLength: liveBytes.byteLength,
+    sortByteLength: sortBytes.byteLength,
+    homeInitialBuffer: homeBytes,
+    liveInitialBuffer: liveBytes,
+    sortInitialBuffer: sortBytes,
+    sampledFromCount: sourceCount,
+    hasGaussianPayload,
+    depthSortEnabled,
+    sphericalHarmonicsDegree,
+    sphericalHarmonicsCoefficientCount,
+  };
+}
+
+function buildPointCloudFXComputeUniform(
+  params: PointCloudFXParams,
+  state: PointCloudFXNativeGraphState,
+  dt: number,
+  time: number,
+): string {
+  const cuBuf = new ArrayBuffer(288);
+  const cuF = new Float32Array(cuBuf);
+  const cuU = new Uint32Array(cuBuf);
+  cuF[0] = dt;
+  cuF[1] = time;
+  cuU[2] = state.pointCount >>> 0;
+  cuF[3] = params.pointSize;
+  cuF[4] = params.windStrength;
+  cuF[5] = params.windScale;
+  cuF[6] = params.anchorPull;
+  cuF[7] = params.damping;
+  cuF[8] = params.bass;
+  cuF[9] = params.treble;
+  cuF[10] = state.burstImpulse;
+  cuF[11] = params.shimmerStrength;
+  const wEnabled = params.waveEnabled ? 1 : 0;
+  const wAng = state.waveTime;
+  cuF[12] = wEnabled * Math.cos(wAng) * params.waveOrbitRadius;
+  cuF[13] = wEnabled * Math.sin(wAng) * params.waveOrbitRadius * 0.6;
+  cuF[14] = wEnabled * Math.sin(wAng * 0.7) * params.waveOrbitRadius * 0.4;
+  cuF[15] = params.waveRadius;
+  cuF[16] = params.waveStrength * wEnabled;
+  cuF[17] = params.waveFalloff;
+  cuF[18] = params.twistAmount;
+  cuF[19] = params.voxelSize;
+  cuF[20] = params.voxelMix;
+  cuF[21] = params.dissolveRadius;
+  cuF[22] = params.dissolveSoftness;
+  cuF[23] = state.hueShiftPhase;
+  cuF[24] = params.saturation;
+  cuF[25] = params.brightness;
+  cuU[26] = COLOR_MODE_ID[params.colorMode] >>> 0;
+  cuU[27] = COLOR_MAP_ID[params.colorMap] >>> 0;
+  cuF[28] = params.colorMix;
+  cuF[29] = params.colorMapScale;
+  cuF[30] = params.colorMapOffset;
+  cuF[31] = state.colorCyclePhase;
+  cuF[32] = params.randomSat;
+  cuF[33] = params.randomVal;
+  cuU[34] = FILTER_MODE_ID[params.filterMode] >>> 0;
+  cuU[35] = FILTER_AXIS_ID[params.filterAxis] >>> 0;
+  cuF[36] = params.colorA[0]; cuF[37] = params.colorA[1]; cuF[38] = params.colorA[2];
+  cuF[40] = params.colorB[0]; cuF[41] = params.colorB[1]; cuF[42] = params.colorB[2];
+  cuF[44] = params.colorC[0]; cuF[45] = params.colorC[1]; cuF[46] = params.colorC[2];
+  cuF[48] = params.colorD[0]; cuF[49] = params.colorD[1]; cuF[50] = params.colorD[2];
+  cuF[52] = params.filterAmount;
+  cuF[53] = params.filterSpeed;
+  cuF[54] = params.filterPhase;
+  cuF[55] = params.filterWidth;
+  cuF[56] = params.filterSoftness;
+  cuF[57] = params.contourBands;
+  cuF[58] = params.fogDensity;
+  cuF[59] = params.fogOpacity;
+  cuF[60] = params.fogColor[0];
+  cuF[61] = params.fogColor[1];
+  cuF[62] = params.fogColor[2];
+  return bufferToBase64(cuBuf);
+}
+
+function buildPointCloudFXViewProj(
+  params: PointCloudFXParams,
+  state: PointCloudFXNativeGraphState,
+  width: number,
+  height: number,
+): Float32Array {
+  const aspect = Math.max(1, width) / Math.max(1, height);
+  const proj = perspective(params.fovDeg, aspect, 0.05, 100);
+  const view = translate(0, 0, -params.cameraZ);
+  const d2r = Math.PI / 180;
+  const objRot = mat4Mul(
+    matrixRotateZ((params.rotateZ + state.autoRotZPhase) * d2r),
+    mat4Mul(
+      matrixRotateY((params.rotateY + state.autoRotYPhase) * d2r),
+      matrixRotateX((params.rotateX + state.autoRotXPhase) * d2r),
+    ),
+  );
+  return mat4Mul(proj, mat4Mul(view, objRot));
+}
+
+function buildPointCloudFXSortFillUniform(
+  params: PointCloudFXParams,
+  state: PointCloudFXNativeGraphState,
+  width: number,
+  height: number,
+  sortCount: number,
+): string {
+  const suBuf = new ArrayBuffer(80);
+  const suF = new Float32Array(suBuf);
+  const suU = new Uint32Array(suBuf);
+  suF.set(buildPointCloudFXViewProj(params, state, width, height), 0);
+  suU[16] = state.pointCount >>> 0;
+  suU[17] = Math.max(1, Math.floor(sortCount)) >>> 0;
+  return bufferToBase64(suBuf);
+}
+
+function buildPointCloudFXSortStepUniform(
+  pointCount: number,
+  sortCount: number,
+  sequenceSize: number,
+  stride: number,
+): string {
+  const suBuf = new ArrayBuffer(16);
+  const suU = new Uint32Array(suBuf);
+  suU[0] = Math.max(1, Math.floor(pointCount)) >>> 0;
+  suU[1] = Math.max(1, Math.floor(sortCount)) >>> 0;
+  suU[2] = Math.max(1, Math.floor(sequenceSize)) >>> 0;
+  suU[3] = Math.max(1, Math.floor(stride)) >>> 0;
+  return bufferToBase64(suBuf);
+}
+
+function buildPointCloudFXRenderUniform(
+  params: PointCloudFXParams,
+  state: PointCloudFXNativeGraphState,
+  width: number,
+  height: number,
+): string {
+  const viewProj = buildPointCloudFXViewProj(params, state, width, height);
+  const ruBuf = new ArrayBuffer(192);
+  const ruF = new Float32Array(ruBuf);
+  const ruU = new Uint32Array(ruBuf);
+  ruF.set(viewProj, 0);
+  ruF[16] = 1; ruF[17] = 0; ruF[18] = 0; ruF[19] = params.cameraZ;
+  ruF[20] = 0; ruF[21] = 1; ruF[22] = 0; ruF[23] = 0;
+  ruU[24] = params.topology === 'strokes' ? 2 : (params.topology === 'billboards' ? 1 : 0);
+  ruF[25] = params.strokeLength;
+  ruF[26] = params.strokeWidth;
+  ruF[27] = params.opacity;
+  ruU[28] = state.pointCount >>> 0;
+  ruF[29] = width;
+  ruF[30] = height;
+  ruF[31] = GAUSSIAN_AA_PIXELS;
+  const fogModeBoost = params.filterMode === 'fog' ? 1 : 0;
+  ruF[32] = params.fogColor[0];
+  ruF[33] = params.fogColor[1];
+  ruF[34] = params.fogColor[2];
+  ruF[35] = Math.max(params.fogOpacity, fogModeBoost * params.filterAmount * 0.65);
+  ruF[36] = Math.max(params.fogDensity, fogModeBoost * (0.45 + params.filterAmount * 1.4));
+  return bufferToBase64(ruBuf);
+}
+
+export function buildPointCloudFXNativeComputeGraph(options: PointCloudFXNativeGraphOptions): PointCloudFXNativeGraphBuildResult {
+  const width = Math.max(1, Math.round(options.width));
+  const height = Math.max(1, Math.round(options.height));
+  const time = Math.max(0, Number.isFinite(options.time) ? options.time : 0);
+  const dt = clampNumber(options.frameDelta, 0, 1 / 15);
+  const params = pointCloudFXParamsFromRaw(options.params, options.audioBass ?? 0, options.audioTreble ?? 0);
+  const previous = options.state;
+  const mustReset = !!options.reset ||
+    !previous ||
+    previous.pointDataSignature !== options.pointData.signature ||
+    previous.pointCount !== options.pointData.pointCount;
+  const prevBass = mustReset ? 0 : previous.prevBass;
+  const bassDelta = Math.max(0, params.bass - prevBass);
+  const state: PointCloudFXNativeGraphState = {
+    pointDataSignature: options.pointData.signature,
+    pointCount: options.pointData.pointCount,
+    lastTime: time,
+    hueShiftPhase: wrapUnit((mustReset ? 0 : previous.hueShiftPhase) + params.hueShiftSpeed * dt),
+    colorCyclePhase: wrapUnit((mustReset ? 0 : previous.colorCyclePhase) + params.colorCycleSpeed * dt),
+    burstImpulse: Math.max(
+      0,
+      (mustReset ? 0 : previous.burstImpulse) +
+        (bassDelta > 0.04 ? bassDelta * params.burstGain * 8 : 0),
+    ),
+    prevBass: params.bass,
+    waveTime: (mustReset ? 0 : previous.waveTime) + params.waveSpeed * dt,
+    autoRotXPhase: (mustReset ? 0 : previous.autoRotXPhase) + params.autoRotateX * dt,
+    autoRotYPhase: (mustReset ? 0 : previous.autoRotYPhase) + params.autoRotateY * dt,
+    autoRotZPhase: (mustReset ? 0 : previous.autoRotZPhase) + params.autoRotateZ * dt,
+  };
+  state.burstImpulse = Math.max(0, state.burstImpulse - state.burstImpulse * params.burstDecay * dt);
+
+  const id = (name: string) => `${options.sourceId}:point-cloud-fx:${name}`;
+  const source = getPointCloudFXNativeShaderSources();
+  const computeSource = source.find((item) => item.shaderId === POINT_CLOUD_FX_NATIVE_SHADER_IDS.compute)!;
+  const sortFillSource = source.find((item) => item.shaderId === POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortFill)!;
+  const sortStepSource = source.find((item) => item.shaderId === POINT_CLOUD_FX_NATIVE_SHADER_IDS.sortStep)!;
+  const renderSource = source.find((item) => item.stage === 'render')!;
+  const shouldDepthSort = options.pointData.depthSortEnabled && options.pointData.sortCount > 1;
+  const buffers: PointCloudFXNativeGraphBuffer[] = [
+    {
+      id: id('home'),
+      kind: 'read-only-storage',
+      byte_length: options.pointData.homeByteLength,
+      persistent: true,
+      clear: mustReset,
+      ...(mustReset ? { initial_buffer: options.pointData.homeInitialBuffer } : {}),
+    },
+    {
+      id: id('live'),
+      kind: 'storage',
+      byte_length: options.pointData.liveByteLength,
+      persistent: true,
+      clear: mustReset,
+      ...(mustReset ? { initial_buffer: options.pointData.liveInitialBuffer } : {}),
+    },
+    {
+      id: id('sort-pairs'),
+      kind: 'storage',
+      byte_length: options.pointData.sortByteLength,
+      persistent: true,
+      clear: mustReset,
+      ...(mustReset ? { initial_buffer: options.pointData.sortInitialBuffer } : {}),
+    },
+    {
+      id: id('compute-uniform'),
+      kind: 'uniform',
+      byte_length: 288,
+      initial_b64: buildPointCloudFXComputeUniform(params, state, dt, time),
+    },
+    {
+      id: id('render-uniform'),
+      kind: 'uniform',
+      byte_length: 192,
+      initial_b64: buildPointCloudFXRenderUniform(params, state, width, height),
+    },
+  ];
+  const passes: PointCloudFXNativeGraphPass[] = [
+    {
+      name: 'point-cloud-fx/sim',
+      shader_id: computeSource.shaderId,
+      entry: computeSource.entry,
+      dispatch: [Math.max(1, Math.ceil(options.pointData.pointCount / 64)), 1, 1],
+      bindings: [
+        { binding: 0, resource: id('home'), kind: 'read-only-storage' },
+        { binding: 1, resource: id('live'), kind: 'storage' },
+        { binding: 2, resource: id('compute-uniform'), kind: 'uniform' },
+      ],
+    },
+  ];
+  if (shouldDepthSort) {
+    buffers.push({
+      id: id('sort-fill-uniform'),
+      kind: 'uniform',
+      byte_length: 80,
+      initial_b64: buildPointCloudFXSortFillUniform(params, state, width, height, options.pointData.sortCount),
+    });
+    passes.push({
+      name: 'point-cloud-fx/sort-fill',
+      shader_id: sortFillSource.shaderId,
+      entry: sortFillSource.entry,
+      dispatch: [Math.max(1, Math.ceil(options.pointData.sortCount / 64)), 1, 1],
+      bindings: [
+        { binding: 0, resource: id('live'), kind: 'read-only-storage' },
+        { binding: 1, resource: id('sort-pairs'), kind: 'storage' },
+        { binding: 2, resource: id('sort-fill-uniform'), kind: 'uniform' },
+      ],
+    });
+    let sortPassIndex = 0;
+    for (let sequenceSize = 2; sequenceSize <= options.pointData.sortCount; sequenceSize *= 2) {
+      for (let stride = sequenceSize / 2; stride >= 1; stride /= 2) {
+        const uniformId = id(`sort-step-uniform-${sortPassIndex}`);
+        buffers.push({
+          id: uniformId,
+          kind: 'uniform',
+          byte_length: 16,
+          initial_b64: buildPointCloudFXSortStepUniform(
+            options.pointData.pointCount,
+            options.pointData.sortCount,
+            sequenceSize,
+            stride,
+          ),
+        });
+        passes.push({
+          name: `point-cloud-fx/sort-step-${sortPassIndex}`,
+          shader_id: sortStepSource.shaderId,
+          entry: sortStepSource.entry,
+          dispatch: [Math.max(1, Math.ceil(options.pointData.sortCount / 64)), 1, 1],
+          bindings: [
+            { binding: 0, resource: id('sort-pairs'), kind: 'storage' },
+            { binding: 1, resource: uniformId, kind: 'uniform' },
+          ],
+        });
+        sortPassIndex++;
+      }
+    }
+  }
+  return {
+    config: {
+      buffers,
+      passes,
+      render_passes: [
+        {
+          name: 'point-cloud-fx/render',
+          shader_id: renderSource.shaderId,
+          vertex_entry: 'vs_main',
+          fragment_entry: 'fs_main',
+          target: 'source_frame',
+          source_id: options.sourceId,
+          seq: Math.max(0, Math.round(options.frameIndex)),
+          clear: true,
+          clear_color: [0, 0, 0, 0],
+          include_snapshot: false,
+          blend: 'alpha',
+          vertex_count: 6,
+          instance_count: options.pointData.pointCount,
+          bindings: [
+            { binding: 0, resource: id('home'), kind: 'read-only-storage' },
+            { binding: 1, resource: id('live'), kind: 'read-only-storage' },
+            { binding: 2, resource: id('render-uniform'), kind: 'uniform' },
+            { binding: 3, resource: id('sort-pairs'), kind: 'read-only-storage' },
+          ],
+        },
+      ],
+    },
+    state,
+  };
+}
+
 export class WebGPUPointCloudFX {
   private device: any;
   private presentFormat: any;
 
   private homeBuffer: any = null;
   private liveBuffer: any = null;
+  private sortBuffer: any = null;
   private computeUniformBuffer: any;
   private renderUniformBuffer: any;
+  private computeUniformBufferHandle: GhostGpuBufferHandle | null = null;
+  private renderUniformBufferHandle: GhostGpuBufferHandle | null = null;
   private computePipeline: any;
   private renderPipeline: any;
   private computeBindGroupLayout: any;
@@ -844,19 +2120,34 @@ export class WebGPUPointCloudFX {
   }
 
   private init(): void {
-    this.computeUniformBuffer = this.device.createBuffer({
+    const runtime = getGhostGpuRuntime();
+    const uniformBufferUsage = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+    this.computeUniformBufferHandle = runtime?.resources.acquireBuffer(
+      288,
+      uniformBufferUsage,
+      'point-cloud-fx/compute-uniforms',
+    ) ?? null;
+    this.computeUniformBuffer = this.computeUniformBufferHandle?.buffer ?? this.device.createBuffer({
+      label: 'point-cloud-fx/compute-uniforms',
       // 9 16-byte blocks for core params + 4 palette blocks +
       // 3 gesture/filter blocks = 16 × 16 = 256 bytes. Round to 288
       // for headroom and backwards safety while iterating.
       size: 288,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      usage: uniformBufferUsage,
     });
-    this.renderUniformBuffer = this.device.createBuffer({
+    this.renderUniformBufferHandle = runtime?.resources.acquireBuffer(
+      192,
+      uniformBufferUsage,
+      'point-cloud-fx/render-uniforms',
+    ) ?? null;
+    this.renderUniformBuffer = this.renderUniformBufferHandle?.buffer ?? this.device.createBuffer({
+      label: 'point-cloud-fx/render-uniforms',
       size: 192,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      usage: uniformBufferUsage,
     });
 
-    const computeModule = this.device.createShaderModule({ code: COMPUTE_WGSL });
+    const shaderRuntime = runtime ?? this.device;
+    const computeModule = createAndWarmWgslShaderModule(shaderRuntime, COMPUTE_WGSL, 'point-cloud-fx/compute');
     this.computeBindGroupLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -869,11 +2160,13 @@ export class WebGPUPointCloudFX {
       compute: { module: computeModule, entryPoint: 'cs_main' },
     });
 
-    const renderModule = this.device.createShaderModule({ code: RENDER_WGSL });
+    const renderModule = createAndWarmWgslShaderModule(shaderRuntime, RENDER_WGSL, 'point-cloud-fx/render');
     this.renderBindGroupLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX,   buffer: { type: 'read-only-storage' } },
-        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX,   buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 3, visibility: GPUShaderStage.VERTEX,   buffer: { type: 'read-only-storage' } },
       ],
     });
     this.renderPipeline = this.device.createRenderPipeline({
@@ -892,69 +2185,33 @@ export class WebGPUPointCloudFX {
    *  3N XYZ values in any coordinate frame; `colors` is a Float32Array
    *  of 3N RGB values in 0..1. Both arrays must have the same point
    *  count. The renderer normalizes positions into a unit-ish cube
-   *  centered at the origin so the camera framing works regardless
-   *  of the source's scale (Gaussian splats arrive in millimeters,
-   *  PLY scans in meters, etc.). */
-  setPointCloudData(positions: Float32Array, colors: Float32Array): void {
-    const n = Math.min(MAX_POINTS, Math.floor(Math.min(positions.length / 3, colors.length / 3)));
-    if (n === 0) return;
-
-    // ── Compute centroid + bounding extent for normalization ───
-    let cx = 0, cy = 0, cz = 0;
-    for (let i = 0; i < n; i++) {
-      cx += positions[i * 3 + 0];
-      cy += positions[i * 3 + 1];
-      cz += positions[i * 3 + 2];
-    }
-    cx /= n; cy /= n; cz /= n;
-    let maxR = 0;
-    for (let i = 0; i < n; i++) {
-      const dx = positions[i * 3 + 0] - cx;
-      const dy = positions[i * 3 + 1] - cy;
-      const dz = positions[i * 3 + 2] - cz;
-      const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (r > maxR) maxR = r;
-    }
-    const scale = maxR > 0 ? 0.9 / maxR : 1.0;
-
-    // ── Build the home buffer (32 bytes/point) ─────────────────
-    const homeBytes = new ArrayBuffer(n * HOME_BYTES);
-    const homeF = new Float32Array(homeBytes);
-    for (let i = 0; i < n; i++) {
-      const off = i * 8;  // 32 bytes / 4 = 8 floats
-      homeF[off + 0] = (positions[i * 3 + 0] - cx) * scale;
-      homeF[off + 1] = (positions[i * 3 + 1] - cy) * scale;
-      homeF[off + 2] = (positions[i * 3 + 2] - cz) * scale;
-      homeF[off + 3] = 0;
-      homeF[off + 4] = colors[i * 3 + 0];
-      homeF[off + 5] = colors[i * 3 + 1];
-      homeF[off + 6] = colors[i * 3 + 2];
-      homeF[off + 7] = 0;
-    }
-
-    // ── Build the live buffer seed (initial = home) ────────────
-    // alpha=1, vel=0, size=baseSize, color=homeColor
-    const liveBytes = new ArrayBuffer(n * LIVE_BYTES);
-    const liveF = new Float32Array(liveBytes);
-    for (let i = 0; i < n; i++) {
-      const off = i * 12;  // 48 bytes / 4 = 12 floats
-      liveF[off + 0] = homeF[i * 8 + 0];  // pos.x
-      liveF[off + 1] = homeF[i * 8 + 1];  // pos.y
-      liveF[off + 2] = homeF[i * 8 + 2];  // pos.z
-      liveF[off + 3] = 1.0;               // alpha
-      liveF[off + 4] = 0;                 // vel.x
-      liveF[off + 5] = 0;                 // vel.y
-      liveF[off + 6] = 0;                 // vel.z
-      liveF[off + 7] = this.params.pointSize;  // size
-      liveF[off + 8] = homeF[i * 8 + 4];  // color.r
-      liveF[off + 9] = homeF[i * 8 + 5];  // color.g
-      liveF[off + 10] = homeF[i * 8 + 6]; // color.b
-      liveF[off + 11] = 0;
-    }
+   *  centered at the origin with outlier-resistant framing so the
+   *  camera works regardless of source scale (Gaussian splats arrive
+   *  in millimeters, PLY scans in meters, etc.). */
+  setPointCloudData(
+    positions: Float32Array,
+    colors: Float32Array,
+    options: PointCloudFXDataOptions = {},
+  ): void {
+    const packed = buildPointCloudFXPackedPointBuffers(positions, colors, {
+      ...options,
+      depthSort: false,
+      pointSize: this.params.pointSize,
+    });
+    if (!packed) return;
+    const {
+      sourceCount,
+      pointCount: n,
+      normalization,
+      homeBytes,
+      liveBytes,
+      sortBytes,
+    } = packed;
 
     // ── (Re)allocate buffers at the right size ─────────────────
     try { this.homeBuffer?.destroy?.(); } catch { /* */ }
     try { this.liveBuffer?.destroy?.(); } catch { /* */ }
+    try { this.sortBuffer?.destroy?.(); } catch { /* */ }
     this.homeBuffer = this.device.createBuffer({
       size: n * HOME_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -963,8 +2220,13 @@ export class WebGPUPointCloudFX {
       size: n * LIVE_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
+    this.sortBuffer = this.device.createBuffer({
+      size: n * SORT_PAIR_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
     this.device.queue.writeBuffer(this.homeBuffer, 0, homeBytes);
     this.device.queue.writeBuffer(this.liveBuffer, 0, liveBytes);
+    this.device.queue.writeBuffer(this.sortBuffer, 0, sortBytes);
 
     // Bind groups capture buffer handles — re-create them.
     this.computeBindGroup = this.device.createBindGroup({
@@ -978,13 +2240,23 @@ export class WebGPUPointCloudFX {
     this.renderBindGroup = this.device.createBindGroup({
       layout: this.renderBindGroupLayout,
       entries: [
-        { binding: 0, resource: { buffer: this.liveBuffer } },
-        { binding: 1, resource: { buffer: this.renderUniformBuffer } },
+        { binding: 0, resource: { buffer: this.homeBuffer } },
+        { binding: 1, resource: { buffer: this.liveBuffer } },
+        { binding: 2, resource: { buffer: this.renderUniformBuffer } },
+        { binding: 3, resource: { buffer: this.sortBuffer } },
       ],
     });
 
     this.pointCount = n;
-    console.log('[pointcloud-fx] loaded', n, 'points (normalized to unit cube; src scale =', scale.toFixed(4), ')');
+    console.log(
+      '[pointcloud-fx] loaded',
+      n,
+      'points from',
+      sourceCount,
+      '(normalized to unit cube; src scale =',
+      normalization.scale.toFixed(4),
+      ')',
+    );
   }
 
   setParams(p: Partial<PointCloudFXParams>): void {
@@ -1160,13 +2432,16 @@ export class WebGPUPointCloudFX {
     const ruF = new Float32Array(ruBuf);
     const ruU = new Uint32Array(ruBuf);
     ruF.set(viewProj, 0);
-    ruF[16] = camRight[0]; ruF[17] = camRight[1]; ruF[18] = camRight[2]; ruF[19] = 0;
+    ruF[16] = camRight[0]; ruF[17] = camRight[1]; ruF[18] = camRight[2]; ruF[19] = this.params.cameraZ;
     ruF[20] = camUp[0]; ruF[21] = camUp[1]; ruF[22] = camUp[2]; ruF[23] = 0;
     ruU[24] = this.params.topology === 'strokes' ? 2 : (this.params.topology === 'billboards' ? 1 : 0);
     ruF[25] = this.params.strokeLength;
     ruF[26] = this.params.strokeWidth;
     ruF[27] = this.params.opacity;
     ruU[28] = this.pointCount >>> 0;
+    ruF[29] = this.viewportW;
+    ruF[30] = this.viewportH;
+    ruF[31] = GAUSSIAN_AA_PIXELS;
     const fogModeBoost = this.params.filterMode === 'fog' ? 1 : 0;
     ruF[32] = this.params.fogColor[0];
     ruF[33] = this.params.fogColor[1];
@@ -1192,10 +2467,18 @@ export class WebGPUPointCloudFX {
   dispose(): void {
     try { this.homeBuffer?.destroy?.(); } catch { /* */ }
     try { this.liveBuffer?.destroy?.(); } catch { /* */ }
-    try { this.computeUniformBuffer?.destroy?.(); } catch { /* */ }
-    try { this.renderUniformBuffer?.destroy?.(); } catch { /* */ }
+    try { this.sortBuffer?.destroy?.(); } catch { /* */ }
+    if (this.computeUniformBufferHandle) this.computeUniformBufferHandle.release();
+    else try { this.computeUniformBuffer?.destroy?.(); } catch { /* */ }
+    if (this.renderUniformBufferHandle) this.renderUniformBufferHandle.release();
+    else try { this.renderUniformBuffer?.destroy?.(); } catch { /* */ }
     this.homeBuffer = null;
     this.liveBuffer = null;
+    this.sortBuffer = null;
+    this.computeUniformBuffer = null;
+    this.renderUniformBuffer = null;
+    this.computeUniformBufferHandle = null;
+    this.renderUniformBufferHandle = null;
     this.pointCount = 0;
   }
 }

@@ -25,7 +25,7 @@
   import Canvas from './lib/components/Canvas.svelte';
   import { initStateBroadcast, destroyStateBroadcast } from './lib/sync/stateBroadcast';
   import { initLicense } from './lib/stores/license';
-  import { settings, type OutputSlice, masterWarpIsActive } from './lib/stores/settings';
+  import { settings, outputFrozen, type OutputSlice, masterWarpIsActive } from './lib/stores/settings';
   import { applyEdgeBlending } from './lib/output/outputPostProcess';
   import { startMasterWarpOutput, stopMasterWarpOutput, tickMasterWarpOutput, getMasterWarpCanvas, disposeMasterWarpOutput } from './lib/sync/outputComposite';
   import { ensureWebGPUDevice } from './lib/renderer/webgpuShared';
@@ -45,6 +45,12 @@
   // primary display path imports each received frame as a WebGPU
   // external texture and presents through the slice shader below.
   const zeroCopySliceMode = !!window.opener && !!sliceId;
+  // Set once the main process confirms a native presentation layer is
+  // parented into this window. The core then composites this slice's region
+  // at the display's own resolution and pushes it straight to the layer, so
+  // the window must render nothing and stay transparent — mounting Canvas
+  // here would run a second full renderer for no visible benefit.
+  let nativeSlicePresentation = false;
   // Latest VideoFrame received on the MessagePort. Closed and replaced
   // each frame; the WebGPU path keeps only this one live frame.
   let latestFrame: VideoFrame | null = null;
@@ -429,6 +435,27 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     sliceGpuDevice.queue.writeBuffer(sliceGpuUniformBuffer, 0, sliceGpuUniformStaging);
   }
 
+  /** Blackout for the WebGPU present path: a bare clear-to-black pass, so
+   *  the kill switch blanks a zero-copy slice the same as a Canvas2D one. */
+  function clearSliceWebGPU(): void {
+    if (!sliceGpuReady || !sliceGpuDevice || !sliceGpuContext) return;
+    try {
+      const encoder = sliceGpuDevice.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: sliceGpuContext.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.end();
+      sliceGpuDevice.queue.submit([encoder.finish()]);
+    } catch (err: any) {
+      console.warn('[SliceOutput] blackout clear failed:', err?.message ?? err);
+    }
+  }
+
   function renderZeroCopyWebGPU(frame: VideoFrame, s: OutputSlice): boolean {
     if (!sliceGpuReady || !sliceGpuDevice || !sliceGpuPipeline || !sliceGpuContext || !sliceGpuBindGroupLayout) return false;
     if (!sliceGpuSampler || !sliceGpuUniformBuffer || !presentCanvas) return false;
@@ -529,14 +556,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   // need an obvious escape hatch. The hint reuses Esc → IPC close.
   let showEscHint = true;
 
-  function closeSliceOutput(): void {
-    invoke('output_close_slice_window', { sliceId }).catch(() => {
-      // Fallback: if IPC fails (preload not exposing the channel
-      // yet), close the renderer window itself.
-      window.close();
-    });
-  }
-
   // Look up the slice's live config every render. The BroadcastChannel
   // state-sync pushes settings into this window's store automatically,
   // so editing the slice in the editor immediately reflects here.
@@ -544,10 +563,41 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   $: waitingForSlice = !slice;
 
   let _diagFrameCount = 0;
+  // Tracks whether the last painted frame was the blackout fill, so leaving
+  // blackout repaints once even while frozen.
+  let paintedBlackout = false;
   function presentOneFrame() {
     rafId = requestAnimationFrame(presentOneFrame);
     _diagFrameCount++;
+    // The core owns this window's pixels; blackout and freeze are applied
+    // there too, so there is nothing to do on the DOM side.
+    if (nativeSlicePresentation) return;
     if (!presentCanvas) return;
+
+    // Blackout is the live kill switch and has to reach the projectors.
+    // In the editor it is a DOM overlay, which the slice presenter never
+    // captured — it reads canvas pixels directly — so slice displays kept
+    // playing through a blackout. Paint black here instead.
+    if ($settings.output?.blackout) {
+      if (!paintedBlackout) {
+        paintedBlackout = true;
+        if (presentCtx) {
+          presentCtx.save();
+          presentCtx.filter = 'none';
+          presentCtx.globalCompositeOperation = 'source-over';
+          presentCtx.fillStyle = '#000';
+          presentCtx.fillRect(0, 0, presentCanvas.width, presentCanvas.height);
+          presentCtx.restore();
+        } else if (sliceGpuReady) {
+          clearSliceWebGPU();
+        }
+      }
+      return;
+    }
+    // Freeze holds the last presented frame: stop painting and the slice
+    // window keeps showing exactly what was on screen when it was hit.
+    if ($outputFrozen && !paintedBlackout) return;
+    paintedBlackout = false;
 
     // The window size = display's bounds (set by main.js). The
     // presentation canvas pixel-buffer matches CSS px because we
@@ -779,6 +829,32 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     initStateBroadcast('receiver');
 
     void (async () => {
+      // Ask the main process whether the core is presenting this slice
+      // natively BEFORE anything else mounts — the answer decides whether
+      // this window runs a renderer at all.
+      // The main process attaches the layer asynchronously (it probes the
+      // core first), so wait while it reports `pending` rather than racing
+      // it and needlessly spinning up a renderer we'd immediately discard.
+      for (let attempt = 0; attempt < 12; attempt++) {
+        try {
+          const state = await invoke('slice_native_presentation_state', { sliceId }) as
+            { active?: boolean; pending?: boolean };
+          nativeSlicePresentation = !!state?.active;
+          if (state?.active || !state?.pending) break;
+        } catch {
+          nativeSlicePresentation = false;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (nativeSlicePresentation) {
+        console.log('[SliceOutput] native presentation active — skipping local render');
+        // Important: the arcade theme paints body with !important, which
+        // beats a plain inline style and hides the layer under the page.
+        document.documentElement.style.setProperty('background', 'transparent', 'important');
+        document.body.style.setProperty('background', 'transparent', 'important');
+        return;
+      }
       // Wait one tick so Canvas (mounted below) has appended its
       // .main-canvas to the DOM before the first frame query.
       await tick();
@@ -808,7 +884,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
-        closeSliceOutput();
+        invoke('output_close_slice_window', { sliceId }).catch(() => {
+          // Fallback: if IPC fails (preload not exposing the channel
+          // yet), close the renderer window itself.
+          window.close();
+        });
       }
     };
     window.addEventListener('keydown', onKey);
@@ -846,7 +926,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   });
 </script>
 
-<div class="slice-output">
+<div class="slice-output" class:native-presentation={nativeSlicePresentation}>
   {#if waitingForSlice}
     <!-- The slice config takes one BroadcastChannel round-trip to
          arrive from the editor. Show a discrete placeholder so the
@@ -861,9 +941,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
          monitor and covers everything else. -->
     <div class="esc-hint">Press <kbd>Esc</kbd> to close</div>
   {/if}
-  <button class="fullscreen-exit" onclick={closeSliceOutput} title="Close fullscreen slice output (Esc)">
-    Close Output
-  </button>
   <!-- Canvas is mounted but visually hidden — it still runs the
        state-synced render loop, just behind the presentation canvas.
        Set to a fixed 1920×1080 box so it doesn't fight the window
@@ -871,12 +948,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
        Skipped entirely in zeroCopySliceMode — we read the editor's
        already-warped .webgpu-present canvas via window.opener instead
        of running our own Three.js scene + warp pipeline. -->
-  {#if !zeroCopySliceMode}
+  {#if !zeroCopySliceMode && !nativeSlicePresentation}
     <div class="hidden-canvas">
       <Canvas />
     </div>
   {/if}
-  <canvas class="slice-present" bind:this={presentCanvas}></canvas>
+  {#if !nativeSlicePresentation}
+    <canvas class="slice-present" bind:this={presentCanvas}></canvas>
+  {/if}
 </div>
 
 <style>
@@ -901,6 +980,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     inset: 0;
     background: #000;
     overflow: hidden;
+  }
+  /* The core's layer sits under the page: an opaque fill here hides it. */
+  .slice-output.native-presentation {
+    background: transparent;
   }
   /* The actual rendering canvas is hidden — its pixels are read by
      the presentation canvas every frame via drawImage AND, when the
@@ -980,36 +1063,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     margin: 0 2px;
     font-family: inherit;
     font-size: 12px;
-  }
-  .fullscreen-exit {
-    position: fixed;
-    top: 54px;
-    right: 16px;
-    z-index: 102;
-    border: 1px solid rgba(255, 122, 99, 0.55);
-    border-radius: 6px;
-    background: rgba(0, 0, 0, 0.72);
-    color: #ffd4cc;
-    padding: 8px 12px;
-    font: 700 12px/1.1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    letter-spacing: 0;
-    opacity: 0;
-    transform: translateY(-3px);
-    transition: opacity 140ms ease, transform 140ms ease, border-color 140ms ease, background 140ms ease;
-    cursor: pointer !important;
-  }
-  .slice-output:hover .fullscreen-exit,
-  .fullscreen-exit:hover,
-  .fullscreen-exit:focus-visible {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  .fullscreen-exit:hover,
-  .fullscreen-exit:focus-visible {
-    background: rgba(255, 122, 99, 0.92);
-    border-color: rgba(255, 172, 152, 0.95);
-    color: #120806;
-    outline: none;
   }
   @keyframes esc-fade {
     0% { opacity: 0; transform: translateY(-4px); }

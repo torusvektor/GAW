@@ -1,3 +1,4 @@
+import { localServerFetch } from '../remote/remotePairing';
 /**
  * SpoutCanvasReceiver — minimal, self-contained receiver that turns a
  * Spout (Windows) / Syphon (macOS) sender into a raw RGBA frame
@@ -16,12 +17,15 @@
  *   - Tauri: HTTP GET http://127.0.0.1:9002/spout/receive/<sender>
  *     with body = raw RGBA pixels for the previously-negotiated size.
  *
- * Pipeline cost: native side reads the Spout DX11/IOSurface into CPU
- * RGBA (one unavoidable readback), IPC moves the buffer, and we hand
- * the same buffer to WebGPU's writeTexture. There is NO extra CPU →
- * canvas → driver upload round trip on the JS side. Consumers ask
- * for the latest frame via `getLatestFrame()` and feed the bytes
- * straight to the GPU.
+ * Pipeline cost for the compatibility frame path: native side reads the
+ * Spout DX11/IOSurface into CPU RGBA, IPC moves the buffer, and we hand
+ * the same buffer to WebGPU's writeTexture. Consumers ask for the latest
+ * frame via `getLatestFrame()` and feed the bytes straight to the GPU.
+ *
+ * Windows builds can also expose a DXGI shared-texture handle via
+ * `receiveSpoutTextureInfo()`. macOS exposes an IOSurfaceID when the
+ * Syphon receiver can materialize one. That path is metadata-only and is the
+ * bridge the native renderer uses for zero-copy-ish source-frame imports.
  */
 
 import { invoke, isElectron } from '$lib/bridge';
@@ -35,6 +39,26 @@ export interface SpoutFrame {
    *  receive. Consumers can compare against the previous value to
    *  skip uploading the same frame twice. */
   frameId: number;
+}
+
+export type SpoutSharedTextureHandleEncoding = 'base64' | 'integer';
+
+export interface SpoutSharedTextureInfo {
+  available: boolean;
+  platform: 'spout' | 'syphon' | string;
+  label: string;
+  reason?: string;
+  senderName?: string;
+  width?: number;
+  height?: number;
+  format?: number | string;
+  updated?: boolean;
+  isNewFrame?: boolean;
+  frame?: number;
+  fps?: number;
+  handle?: string;
+  handleEncoding?: SpoutSharedTextureHandleEncoding;
+  handleByteLength?: number;
 }
 
 interface ReceiverState {
@@ -51,6 +75,18 @@ interface ReceiverState {
 }
 
 type RawFrameData = ArrayBuffer | ArrayBufferView;
+
+export async function receiveSpoutTextureInfo(): Promise<SpoutSharedTextureInfo | null> {
+  if (!isElectron) {
+    return {
+      available: false,
+      platform: 'spout',
+      label: 'Spout',
+      reason: 'electron-required',
+    };
+  }
+  return invoke<SpoutSharedTextureInfo | null>('spout_receive_texture_info');
+}
 
 export class SpoutCanvasReceiver {
   private state: ReceiverState | null = null;
@@ -149,7 +185,7 @@ export class SpoutCanvasReceiver {
       if (state.inFlight) { state.rafId = requestAnimationFrame(tick); return; }
       state.inFlight = true;
       try {
-        const resp = await fetch(`http://127.0.0.1:9002/spout/receive/${encodeURIComponent(state.senderName)}`);
+        const resp = await localServerFetch(`/spout/receive/${encodeURIComponent(state.senderName)}`);
         if (resp.ok && resp.status !== 204) {
           const buf = await resp.arrayBuffer();
           this.acceptFrame(state, buf, state.width, state.height);

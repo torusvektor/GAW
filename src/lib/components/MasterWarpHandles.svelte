@@ -14,13 +14,37 @@
    * positions on the master canvas (y=0 at top, no flip), identical to
    * the screen-warp convention so pixel mapping is `n * containerSize`.
    * Identity (TL 0,0 / TR 1,0 / BL 0,1 / BR 1,1) is a visual no-op.
+   *
+   * Bezier mesh: with the mesh's Bezier toggle on, the selected point
+   * shows tangent handles that bend its cell edges, with the layer mesh's
+   * rules (meshWarp.ts): handles move as a linked pair, Alt-drag unlinks
+   * one, double-click straightens it, and the arrow keys nudge the handle
+   * clicked last.
    */
   import { onDestroy, onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { project } from '../stores/layers';
   import { settings } from '../stores/settings';
-  import type { WarpCorners, MeshWarpGrid } from '../types';
+  import { recordDiscreteAction } from '../stores/historyHooks';
+  import type { WarpCorners, MeshWarpGrid, Point2D } from '../types';
   import { normalizedWarpNudge } from '../utils/warpNudge';
+  import { releaseFormControlFocus } from '../utils/formFocus';
+  import { claimWarpKeys, ownsWarpKeys } from '../utils/warpKeyOwner';
+  import { insetHandle, meshMoveGrip } from '../utils/warpHandleLayout';
+  import { screens, selectedScreenId } from '../stores/screens';
+  import {
+    MESH_CURVE_SEGMENTS,
+    cloneMeshGrid,
+    meshEdgePoint,
+    meshTangentLinked,
+    meshTangentSides,
+    meshTangentsAfterDrag,
+    meshTangentsAfterStraighten,
+    resolveMeshTangents,
+    withMeshPointTangents,
+    withMeshPoints,
+    type MeshTangentSide,
+  } from '../utils/meshWarp';
 
   interface Props {
     containerWidth: number;
@@ -39,13 +63,19 @@
   let mode = $derived(warp.mode === 'mesh' && warp.meshGrid ? 'mesh' : 'corners');
   let corners = $derived(warp.corners ?? IDENTITY_CORNERS);
   let meshGrid = $derived(warp.meshGrid ?? null);
+  // While a screen is selected on the Screens tab its handles are the ones
+  // being edited, so they sit above these where the two overlap (a
+  // screen's corner mesh point under a Master Warp corner could not be
+  // picked). ScreenWarpHandles only draws an enabled selected screen.
+  let yieldToScreen = $derived($screens.some((s) => s.id === $selectedScreenId && s.enabled));
 
   // ─── Drag state ────────────────────────────────────────────────────
   type DragKind =
     | { kind: 'corner'; corner: keyof WarpCorners }
     | { kind: 'corners-move' }
     | { kind: 'mesh'; row: number; col: number }
-    | { kind: 'mesh-move' };
+    | { kind: 'mesh-move' }
+    | { kind: 'tangent'; row: number; col: number; side: MeshTangentSide };
 
   let drag: {
     kind: DragKind;
@@ -56,20 +86,33 @@
   } | null = $state(null);
   let selectedCorner: keyof WarpCorners | null = $state(null);
   let selectedMeshPoint: { row: number; col: number } | null = $state(null);
+  // Bezier mesh: the tangent handle the arrow keys nudge (the last one
+  // clicked on the selected point).
+  let selectedTangent: MeshTangentSide | null = $state(null);
 
   function startDrag(e: MouseEvent, kind: DragKind) {
     e.preventDefault();
     e.stopPropagation();
+    // The arrow keys nudge what was pressed, not the panel control that
+    // still has focus (a toggle just clicked, a number field).
+    releaseFormControlFocus();
+    claimWarpKeys('master');
     cancelDrag();
     if (kind.kind === 'corner') {
       selectedCorner = kind.corner;
       selectedMeshPoint = null;
     } else if (kind.kind === 'mesh') {
       selectedCorner = null;
+      if (selectedMeshPoint?.row !== kind.row || selectedMeshPoint?.col !== kind.col) selectedTangent = null;
       selectedMeshPoint = { row: kind.row, col: kind.col };
+    } else if (kind.kind === 'tangent') {
+      selectedCorner = null;
+      selectedMeshPoint = { row: kind.row, col: kind.col };
+      selectedTangent = kind.side;
     } else {
       selectedCorner = null;
       selectedMeshPoint = null;
+      selectedTangent = null;
     }
     drag = {
       kind,
@@ -77,10 +120,8 @@
       startClientY: e.clientY,
       startCorners: { ...corners, topLeft: { ...corners.topLeft }, topRight: { ...corners.topRight }, bottomLeft: { ...corners.bottomLeft }, bottomRight: { ...corners.bottomRight } },
       // Manual deep-copy (not structuredClone — it throws DataCloneError
-      // on some nested store values) of the {rows,cols,points} lattice.
-      startMesh: meshGrid
-        ? { rows: meshGrid.rows, cols: meshGrid.cols, points: meshGrid.points.map(r => r.map(p => ({ x: p.x, y: p.y }))) }
-        : null,
+      // on some nested store values), tangents included.
+      startMesh: meshGrid ? cloneMeshGrid(meshGrid) : null,
     };
     if ((window as any).__MWARP_DEBUG__ === true) console.log('[mwarp] handle drag start', kind, { enabled: warp.enabled, mode });
     window.addEventListener('mousemove', onMouseMove);
@@ -97,12 +138,19 @@
     removeDragListeners();
   }
 
-  function onMouseUp() {
+  /** A drag ends as one undo step (history skips it if nothing moved). */
+  function endDrag() {
+    const wasDragging = drag !== null;
     cancelDrag();
+    if (wasDragging) recordDiscreteAction();
+  }
+
+  function onMouseUp() {
+    endDrag();
   }
 
   function onVisibilityChange() {
-    if (document.hidden) cancelDrag();
+    if (document.hidden) endDrag();
   }
 
   function isTextEditingTarget(target: EventTarget | null) {
@@ -129,11 +177,16 @@
   }
 
   function handleKeyDown(e: KeyboardEvent) {
-    if (!warp.enabled || isTextEditingTarget(e.target)) return;
+    if (!warp.enabled || isTextEditingTarget(e.target) || !ownsWarpKeys('master')) return;
 
     if (e.key === 'Escape') {
-      selectedCorner = null;
-      selectedMeshPoint = null;
+      // A selected tangent handle lets go first, then the point.
+      if (selectedTangent) {
+        selectedTangent = null;
+      } else {
+        selectedCorner = null;
+        selectedMeshPoint = null;
+      }
       cancelDrag();
       return;
     }
@@ -176,6 +229,7 @@
           [selectedCorner]: { x: clamp01(current.x + dx), y: clamp01(current.y + dy) },
         },
       });
+      recordDiscreteAction();
       return;
     }
 
@@ -183,32 +237,62 @@
       const { row, col } = selectedMeshPoint;
       const p = meshGrid.points[row]?.[col];
       if (!p) return;
+      // With a tangent handle picked on a Bezier mesh, the arrows move the
+      // handle (Alt unlinks it from its mirror) instead of the point.
+      if (selectedTangent && meshGrid.bezier && meshTangentSides(meshGrid, row, col).includes(selectedTangent)) {
+        const t = resolveMeshTangents(meshGrid, row, col)[selectedTangent];
+        const end = meshLocalToNorm(p.x + t.x, p.y + t.y);
+        moveTangentEnd(meshGrid, row, col, selectedTangent, { x: end.x + dx, y: end.y + dy }, e.altKey);
+        recordDiscreteAction();
+        return;
+      }
       const curNorm = meshLocalToNorm(p.x, p.y);
       const next = normToMeshLocal(clamp01(curNorm.x + dx), clamp01(curNorm.y + dy));
       const points = meshGrid.points.map((meshRow, ri) =>
         meshRow.map((pt, ci) => (ri === row && ci === col ? { x: next.u, y: next.v } : pt))
       );
-      settings.setMasterWarp({ meshGrid: { rows: meshGrid.rows, cols: meshGrid.cols, points } });
+      settings.setMasterWarp({ meshGrid: withMeshPoints(meshGrid, points) });
+      recordDiscreteAction();
       return;
     }
 
     nudgeCorners(dx, dy);
+    recordDiscreteAction();
   }
 
   onMount(() => {
     window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('blur', cancelDrag);
+    window.addEventListener('blur', endDrag);
     document.addEventListener('visibilitychange', onVisibilityChange);
   });
 
   onDestroy(() => {
     cancelDrag();
     window.removeEventListener('keydown', handleKeyDown);
-    window.removeEventListener('blur', cancelDrag);
+    window.removeEventListener('blur', endDrag);
     document.removeEventListener('visibilitychange', onVisibilityChange);
   });
 
   const clamp01 = (v: number) => Math.min(Math.max(0, v), 1);
+
+  /** Put one tangent handle's end at a master-canvas position. The handle
+   *  may sit outside the quad (a boundary edge bending outward), so its end
+   *  goes through the unclamped inverse. */
+  function moveTangentEnd(grid: MeshWarpGrid, row: number, col: number, side: MeshTangentSide, end: Point2D, unlink: boolean) {
+    const local = normToMeshLocalRaw(end.x, end.y);
+    const p = grid.points[row]?.[col];
+    if (!local || !p) return;
+    const tangents = meshTangentsAfterDrag(grid, row, col, side, { x: local.u - p.x, y: local.v - p.y }, unlink);
+    settings.setMasterWarp({ meshGrid: withMeshPointTangents(grid, row, col, tangents) });
+  }
+
+  /** Double-click a tangent handle: back onto the straight edge. */
+  function straightenTangent(row: number, col: number, side: MeshTangentSide) {
+    const grid = meshGrid;
+    if (!grid) return;
+    settings.setMasterWarp({ meshGrid: withMeshPointTangents(grid, row, col, meshTangentsAfterStraighten(grid, row, col, side)) });
+    recordDiscreteAction();
+  }
 
   function onMouseMove(e: MouseEvent) {
     if (!drag) return;
@@ -244,19 +328,57 @@
       const points = g.points.map((row, r) =>
         row.map((pt, c) => (r === k.row && c === k.col ? { x: next.u, y: next.v } : pt))
       );
-      settings.setMasterWarp({ meshGrid: { rows: g.rows, cols: g.cols, points } });
+      settings.setMasterWarp({ meshGrid: withMeshPoints(g, points) });
     } else if (k.kind === 'mesh-move' && drag.startMesh) {
       // Whole-mesh nudge in local space (deltas are small; local≈master
       // scale near identity — good enough for a coarse move handle).
       const g = drag.startMesh;
       const points = g.points.map(row => row.map(pt => ({ x: clamp01(pt.x + dxN), y: clamp01(pt.y + dyN) })));
-      settings.setMasterWarp({ meshGrid: { rows: g.rows, cols: g.cols, points } });
+      settings.setMasterWarp({ meshGrid: withMeshPoints(g, points) });
+    } else if (k.kind === 'tangent' && drag.startMesh && meshGrid) {
+      // The handle's end follows the cursor; linkedness and the stored
+      // sides come from the live grid so an Alt unlink freezes the mirror
+      // where it is now.
+      const g = drag.startMesh;
+      const p = g.points[k.row]?.[k.col];
+      if (!p) return;
+      const t = resolveMeshTangents(g, k.row, k.col)[k.side];
+      const end = meshLocalToNorm(p.x + t.x, p.y + t.y);
+      moveTangentEnd(meshGrid, k.row, k.col, k.side, { x: end.x + dxN, y: end.y + dyN }, e.altKey);
     }
   }
 
   // ─── Pixel helpers ─────────────────────────────────────────────────
   const px = (nx: number) => nx * containerWidth;
   const py = (ny: number) => ny * containerHeight;
+  // Handles are drawn whole inside the canvas (a point on the right edge
+  // would otherwise be half under the sidebar); `half` is the handle's
+  // half-size in px. Lines keep the true positions.
+  const hx = (x: number, half: number) => insetHandle(x, containerWidth, half);
+  const hy = (y: number, half: number) => insetHandle(y, containerHeight, half);
+
+  // A corner grip sits inside its corner, toward the middle of the quad, on
+  // a short leader. The corner itself is often exactly where a screen's
+  // corner point is (a full-canvas screen under an identity warp), and
+  // there the selected screen's point is on top; the grip keeps the Master
+  // Warp corner reachable beside it. It steps in far enough along both
+  // axes to clear a corner point drawn at the same corner.
+  const CORNER_GRIP_AXIS_INSET_PX = 22;
+  const CORNER_GRIP_MAX_INSET_PX = 64;
+  function cornerGrip(cn: keyof WarpCorners): { x: number; y: number; ox: number; oy: number } {
+    const ox = px(corners[cn].x);
+    const oy = py(corners[cn].y);
+    const ctr = cornersCenter(corners);
+    const dx = ctr.x - ox;
+    const dy = ctr.y - oy;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-6) return { x: hx(ox, 10), y: hy(oy, 10), ox, oy };
+    const ux = dx / len;
+    const uy = dy / len;
+    const axis = Math.max(1e-3, Math.min(Math.abs(ux), Math.abs(uy)));
+    const inset = Math.min(CORNER_GRIP_MAX_INSET_PX, len * 0.25, CORNER_GRIP_AXIS_INSET_PX / axis);
+    return { x: hx(ox + ux * inset, 10), y: hy(oy + uy * inset, 10), ox, oy };
+  }
 
   // Mesh points are quad-LOCAL 0..1 (they deform within the corner quad),
   // so handle display/drag must map through the corner quad — same as the
@@ -274,6 +396,10 @@
   // Inverse bilinear (Inigo Quilez closed form) — master-canvas 0..1 → quad-local.
   function cross2(ax: number, ay: number, bx: number, by: number) { return ax * by - ay * bx; }
   function normToMeshLocal(pxN: number, pyN: number): { u: number; v: number } {
+    const raw = normToMeshLocalRaw(pxN, pyN);
+    return raw ? { u: clamp01(raw.u), v: clamp01(raw.v) } : { u: 0.5, v: 0.5 };
+  }
+  function normToMeshLocalRaw(pxN: number, pyN: number): { u: number; v: number } | null {
     const c = corners;
     const a = c.topLeft, b = c.topRight, cc = c.bottomRight, d = c.bottomLeft;
     const ex = b.x - a.x, ey = b.y - a.y;
@@ -289,11 +415,11 @@
       // collapsed / collinear quad makes both k2 and k1 vanish → -k0/k1 is
       // 0/0 = NaN, which clamp01 does NOT sanitize (Math.max(0,NaN)=NaN)
       // and would persist into the stored mesh point. Bail to center.
-      if (Math.abs(k1) < 1e-6) return { u: 0.5, v: 0.5 };
+      if (Math.abs(k1) < 1e-6) return null;
       v = -k0 / k1;
     } else {
       const w = k1 * k1 - 4 * k0 * k2;
-      if (w < 0) return { u: 0.5, v: 0.5 };
+      if (w < 0) return null;
       const sq = Math.sqrt(w);
       const v1 = (-k1 - sq) / (2 * k2), v2 = (-k1 + sq) / (2 * k2);
       v = (v1 >= 0 && v1 <= 1) ? v1 : v2;
@@ -304,9 +430,8 @@
       ? (hx - fx * v) / denomU
       : (Math.abs(denomU2) > 1e-6 ? (hy - fy * v) / denomU2 : 0.5);
     // Final NaN/Int sanitize — never let a bad value reach the stored mesh.
-    const su = Number.isFinite(u) ? u : 0.5;
-    const sv = Number.isFinite(v) ? v : 0.5;
-    return { u: clamp01(su), v: clamp01(sv) };
+    if (!Number.isFinite(u) || !Number.isFinite(v)) return null;
+    return { u, v };
   }
 
   function cornersCenter(c: WarpCorners) {
@@ -316,16 +441,48 @@
     };
   }
   function meshCenter(g: MeshWarpGrid) {
-    // Average the points in master-canvas space (each pushed through the
-    // corner quad) so the move handle sits at the visual center.
-    let sx = 0, sy = 0, n = 0;
-    for (const row of g.points) for (const p of row) {
-      const np = meshLocalToNorm(p.x, p.y); sx += np.x; sy += np.y; n++;
-    }
-    return { x: px(sx / Math.max(1, n)), y: py(sy / Math.max(1, n)) };
+    // The middle of the central cell, pushed through the corner quad: never
+    // on a mesh point (the centre point of a 5x5 mesh used to be under it).
+    const grip = meshMoveGrip(g.points, g.rows, g.cols);
+    const np = meshLocalToNorm(grip.x, grip.y);
+    return { x: px(np.x), y: py(np.y) };
   }
   const cornersPath = (c: WarpCorners) =>
     `${px(c.topLeft.x)},${py(c.topLeft.y)} ${px(c.topRight.x)},${py(c.topRight.y)} ${px(c.bottomRight.x)},${py(c.bottomRight.y)} ${px(c.bottomLeft.x)},${py(c.bottomLeft.y)}`;
+
+  /** One cell edge as SVG polyline points: two when straight, sampled
+   *  along its cubic in Bezier mode (the curve the core renders). */
+  function edgePolyline(g: MeshWarpGrid, r0: number, c0: number, r1: number, c1: number): string {
+    const steps = g.bezier ? MESH_CURVE_SEGMENTS : 1;
+    const out: string[] = [];
+    for (let i = 0; i <= steps; i++) {
+      const p = meshEdgePoint(g, r0, c0, r1, c1, i / steps);
+      out.push(`${meshPx(p.x, p.y)},${meshPy(p.x, p.y)}`);
+    }
+    return out.join(' ');
+  }
+
+  // Tangent handles follow the point being dragged, or the selected one.
+  function draggedMeshPoint(): { row: number; col: number } | null {
+    const k = drag?.kind;
+    return k && (k.kind === 'tangent' || k.kind === 'mesh') ? { row: k.row, col: k.col } : null;
+  }
+  let tangentPoint = $derived(draggedMeshPoint() ?? selectedMeshPoint);
+  let tangentHandles = $derived.by(() => {
+    const g = meshGrid;
+    const point = tangentPoint;
+    void containerWidth; void containerHeight; void corners;
+    if (mode !== 'mesh' || !g?.bezier || !point || !g.points[point.row]?.[point.col]) return [];
+    const origin = g.points[point.row][point.col];
+    const resolved = resolveMeshTangents(g, point.row, point.col);
+    return meshTangentSides(g, point.row, point.col).map((side) => {
+      const end = meshLocalToNorm(origin.x + resolved[side].x, origin.y + resolved[side].y);
+      return { side, x: px(end.x), y: py(end.y), linked: meshTangentLinked(g, point.row, point.col, side) };
+    });
+  });
+  $effect(() => {
+    if (!meshGrid?.bezier) selectedTangent = null;
+  });
 
   const CORNER_KEYS: Array<keyof WarpCorners> = ['topLeft', 'topRight', 'bottomLeft', 'bottomRight'];
   const CORNER_LABEL: Record<keyof WarpCorners, string> = {
@@ -334,30 +491,39 @@
 </script>
 
 {#if warp.enabled}
-  <div class="master-warp-handles" style="width: {containerWidth}px; height: {containerHeight}px;">
+  <div data-help-page="projection-mapping" class="master-warp-handles" class:yield-to-screen={yieldToScreen} style="width: {containerWidth}px; height: {containerHeight}px;">
     <!-- Outline / grid lines -->
     <svg class="lines-overlay" width={containerWidth} height={containerHeight}>
       {#if mode === 'corners'}
         <polygon points={cornersPath(corners)} fill="none" stroke="#f0a35e" stroke-width="2" />
+        {#each CORNER_KEYS as cn}
+          {@const grip = cornerGrip(cn)}
+          <line x1={grip.ox} y1={grip.oy} x2={grip.x} y2={grip.y} stroke="#f0a35e" stroke-width="1.5" stroke-opacity="0.8" />
+        {/each}
         <text x={px(corners.topLeft.x) + 6} y={py(corners.topLeft.y) + 16} fill="#f0a35e"
-          font-size="13" font-family="IBM Plex Mono, ui-monospace, monospace"
+          font-size="13" font-family="Geist Mono, ui-monospace, monospace"
           paint-order="stroke" stroke="rgba(0,0,0,0.7)" stroke-width="3">Master warp</text>
       {:else if mode === 'mesh' && meshGrid}
         {@const g = meshGrid}
         {#each g.points as row, ri}
-          {#each row as p, ci}
+          {#each row as _p, ci}
             {#if ci < g.cols - 1}
-              {@const pn = g.points[ri][ci + 1]}
-              <line x1={meshPx(p.x, p.y)} y1={meshPy(p.x, p.y)} x2={meshPx(pn.x, pn.y)} y2={meshPy(pn.x, pn.y)} stroke="#f0a35e" stroke-width="1.5" />
+              <polyline points={edgePolyline(g, ri, ci, ri, ci + 1)} fill="none" stroke="#f0a35e" stroke-width="1.5" />
             {/if}
             {#if ri < g.rows - 1}
-              {@const pd = g.points[ri + 1][ci]}
-              <line x1={meshPx(p.x, p.y)} y1={meshPy(p.x, p.y)} x2={meshPx(pd.x, pd.y)} y2={meshPy(pd.x, pd.y)} stroke="#f0a35e" stroke-width="1.5" />
+              <polyline points={edgePolyline(g, ri, ci, ri + 1, ci)} fill="none" stroke="#f0a35e" stroke-width="1.5" />
             {/if}
           {/each}
         {/each}
+        {#if tangentPoint && g.points[tangentPoint.row]?.[tangentPoint.col]}
+          {@const o = g.points[tangentPoint.row][tangentPoint.col]}
+          {#each tangentHandles as handle (handle.side)}
+            <line x1={meshPx(o.x, o.y)} y1={meshPy(o.x, o.y)} x2={handle.x} y2={handle.y}
+              stroke="#00d4ff" stroke-width="1" stroke-opacity="0.8" stroke-dasharray={handle.linked ? undefined : '3,3'} />
+          {/each}
+        {/if}
         <text x={meshPx(g.points[0][0].x, g.points[0][0].y) + 6} y={meshPy(g.points[0][0].x, g.points[0][0].y) + 16} fill="#f0a35e"
-          font-size="13" font-family="IBM Plex Mono, ui-monospace, monospace"
+          font-size="13" font-family="Geist Mono, ui-monospace, monospace"
           paint-order="stroke" stroke="rgba(0,0,0,0.7)" stroke-width="3">Master warp</text>
       {/if}
     </svg>
@@ -365,17 +531,17 @@
     <!-- Handles -->
     {#if mode === 'corners'}
       {#each CORNER_KEYS as cn}
-        {@const cp = corners[cn]}
+        {@const grip = cornerGrip(cn)}
         <div class="handle corner-handle" class:dragging={drag?.kind.kind === 'corner' && drag?.kind.corner === cn}
           class:selected={selectedCorner === cn}
-          style="left:{px(cp.x)}px; top:{py(cp.y)}px;"
+          style="left:{grip.x}px; top:{grip.y}px;"
           onmousedown={(e) => startDrag(e, { kind: 'corner', corner: cn })}>
           <span class="handle-label">{CORNER_LABEL[cn]}</span>
         </div>
       {/each}
       {@const ctr = cornersCenter(corners)}
       <div class="handle move-handle" class:dragging={drag?.kind.kind === 'corners-move'}
-        style="left:{ctr.x}px; top:{ctr.y}px;"
+        style="left:{hx(ctr.x, 18)}px; top:{hy(ctr.y, 18)}px;"
         onmousedown={(e) => startDrag(e, { kind: 'corners-move' })}
         title="Drag to move the whole warp">✥</div>
     {:else if mode === 'mesh' && meshGrid}
@@ -384,6 +550,7 @@
         {#each row as p, ci}
           {@const isCorner = (ri === 0 || ri === g.rows - 1) && (ci === 0 || ci === g.cols - 1)}
           {@const isEdge = ri === 0 || ri === g.rows - 1 || ci === 0 || ci === g.cols - 1}
+          {@const half = isCorner ? 8 : isEdge ? 6 : 5}
           <div
             class="handle mesh-handle"
             class:corner={isCorner}
@@ -391,16 +558,36 @@
             class:inner={!isEdge}
             class:dragging={drag?.kind.kind === 'mesh' && drag?.kind.row === ri && drag?.kind.col === ci}
             class:selected={selectedMeshPoint?.row === ri && selectedMeshPoint?.col === ci}
-            style="left:{meshPx(p.x, p.y)}px; top:{meshPy(p.x, p.y)}px;"
+            style="left:{hx(meshPx(p.x, p.y), half)}px; top:{hy(meshPy(p.x, p.y), half)}px;"
             onmousedown={(e) => startDrag(e, { kind: 'mesh', row: ri, col: ci })}
           ></div>
         {/each}
       {/each}
       {@const ctr = meshCenter(g)}
       <div class="handle move-handle" class:dragging={drag?.kind.kind === 'mesh-move'}
-        style="left:{ctr.x}px; top:{ctr.y}px;"
+        style="left:{hx(ctr.x, 18)}px; top:{hy(ctr.y, 18)}px;"
         onmousedown={(e) => startDrag(e, { kind: 'mesh-move' })}
         title="Drag to move the whole warp">✥</div>
+      <!-- Tangent handles: drag to bend (Alt-drag unlinks the pair),
+           double-click to straighten -->
+      {#if tangentPoint}
+        {@const tp = tangentPoint}
+        {#each tangentHandles as handle (handle.side)}
+          <div
+            class="tangent-handle"
+            class:unlinked={!handle.linked}
+            class:dragging={drag?.kind.kind === 'tangent' && drag.kind.side === handle.side}
+            class:selected={selectedTangent === handle.side && drag?.kind.kind !== 'tangent'}
+            style="left:{hx(handle.x, 5)}px; top:{hy(handle.y, 5)}px;"
+            onmousedown={(e) => startDrag(e, { kind: 'tangent', row: tp.row, col: tp.col, side: handle.side })}
+            ondblclick={(e) => { e.preventDefault(); e.stopPropagation(); straightenTangent(tp.row, tp.col, handle.side); }}
+            role="button"
+            tabindex="-1"
+            title="Drag to bend. Alt-drag to move this handle on its own. Double-click to straighten."
+            aria-label="Tangent {handle.side} of master warp point {tp.row},{tp.col}{handle.linked ? '' : ' (unlinked)'}"
+          ></div>
+        {/each}
+      {/if}
     {/if}
   </div>
 {/if}
@@ -410,11 +597,14 @@
     position: absolute;
     top: 0; left: 0;
     pointer-events: none;
-    /* Above the purple screen handles so the global warp wins clicks. */
+    /* Above the purple screen handles so the global warp wins clicks... */
     z-index: 55;
     user-select: none;
     -webkit-user-select: none;
   }
+  /* ...except while a screen is selected: its handles are the ones being
+     edited, so they win where the two overlap. */
+  .master-warp-handles.yield-to-screen { z-index: 45; }
   .lines-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
 
   .handle {
@@ -452,7 +642,8 @@
   .move-handle:hover { background: rgba(240, 163, 94, 0.2); }
   .move-handle.dragging { cursor: grabbing; background: rgba(255, 255, 0, 0.2); border-color: #ffff00; color: #ffff00; }
 
-  .mesh-handle { cursor: grab; }
+  /* Above the move grip, so a point under it can always be picked. */
+  .mesh-handle { cursor: grab; z-index: 56; }
   .mesh-handle.corner {
     width: 16px; height: 16px; margin-left: -8px; margin-top: -8px;
     background: #f0a35e; border: 2px solid #fff; border-radius: 50%;
@@ -470,6 +661,25 @@
   .mesh-handle.selected {
     box-shadow: 0 0 0 3px rgba(240, 163, 94, 0.35), 0 0 14px rgba(240, 163, 94, 0.7);
   }
+
+  /* Bezier tangent handles: small diamonds, hollow once unlinked (same as
+     the layer mesh). */
+  .tangent-handle {
+    position: absolute;
+    width: 9px; height: 9px;
+    margin-left: -5px; margin-top: -5px;
+    background: #00d4ff;
+    border: 1px solid #fff;
+    transform: rotate(45deg);
+    pointer-events: auto;
+    cursor: grab;
+    z-index: 56;
+    transition: transform 0.1s ease;
+  }
+  .tangent-handle.unlinked { background: transparent; border: 2px solid #00d4ff; }
+  .tangent-handle:hover, .tangent-handle.dragging { transform: rotate(45deg) scale(1.4); }
+  .tangent-handle.dragging { cursor: grabbing; }
+  .tangent-handle.selected { box-shadow: 0 0 8px #00d4ff; transform: rotate(45deg) scale(1.3); }
 
   .handle-label {
     position: absolute;

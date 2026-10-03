@@ -1,11 +1,15 @@
 <script lang="ts">
+  import { mobileConnectionUrl } from './lib/remote/mobileConnectionUrl';
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import Canvas from './lib/components/Canvas.svelte';
+  import { projectionSimHistoryVersion } from './lib/projectionSim/store';
+  import { startProjectionSimSceneSync } from './lib/projectionSim/sceneSync';
   import WebGPUCanvas from './lib/components/WebGPUCanvas.svelte';
   import { probeWebGPU } from './lib/renderer/webgpuCapability';
   import AudioInputPicker from './lib/components/AudioInputPicker.svelte';
-  import BpmTapWidget from './lib/components/BpmTapWidget.svelte';
+  import ClipAudioMasterControl from './lib/components/ClipAudioMasterControl.svelte';
+  import AudioMeterPanel from './lib/components/AudioMeterPanel.svelte';
   // Feature tour removed at user request — was an interactive multi-step
   // overlay shown on first launch, but disrupted the experience for users
   // already familiar with VJ software. The OnboardingTour.svelte and
@@ -48,15 +52,21 @@
     catch { return false; }
   };
   import VJModePanel from './lib/components/VJModePanel.svelte';
-  import StageDesignerPanel from './lib/components/StageDesignerPanel.svelte';
+  import VJStageEditPanel from './lib/components/VJStageEditPanel.svelte';
+  import VJStageInspector from './lib/components/VJStageInspector.svelte';
+  import StageEditorHeader from './lib/components/StageEditorHeader.svelte';
+  import { stageScreenGuidePath } from './lib/utils/stageScreenGuide';
+  import { vjStageEdit } from './lib/stores/vjStageEdit';
   import ProjectionSimulatorPanel from './lib/components/ProjectionSimulatorPanel.svelte';
   import OfflineRenderModal from './lib/components/OfflineRenderModal.svelte';
   import VideoConverterModal from './lib/components/VideoConverterModal.svelte';
+  import ProjectMediaModal from './lib/components/ProjectMediaModal.svelte';
   import { workspace } from './lib/stores/workspace';
   import PresetTray from './lib/components/PresetTray.svelte';
   import BottomDock from './lib/components/BottomDock.svelte';
   import LayerSequencer from './lib/components/LayerSequencer.svelte';
   import KeyframeTimeline from './lib/components/KeyframeTimeline.svelte';
+  import ShowTimeline from './lib/components/ShowTimeline.svelte';
   import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import MediaPipeLearnHUD from './lib/components/MediaPipeLearnHUD.svelte';
   import MediaPipeLearnOverlay from './lib/components/MediaPipeLearnOverlay.svelte';
@@ -68,15 +78,37 @@
   import UpdateModal from './lib/components/UpdateModal.svelte';
   import { updateModalOpen, leftSidebarTab } from './lib/stores/uiState';
   import { showToast } from './lib/stores/errorToast';
-  import { project, selectedLayer, selectedLayerIds, selectedLinesLayer, selectedLineElement, selectedLightPaintingLayer, selectedAdvLightPaintingLayer, selectedTextLayer, selectedSVGLayer, selectedMediaLayer, selectedSplatLayer, selectedModel3DLayer, selectedPixelFXLayer, selectedGPULayer, selectedGroupLayer, setHistoryCallback } from './lib/stores/layers';
-  import { keyframeTimeline } from './lib/stores/keyframeTimeline';
-  import { layerSequencer } from './lib/stores/layerSequencer';
-  import { settings, outputFrozen } from './lib/stores/settings';
   import { maskEditingLayerId } from './lib/stores/maskEditing';
+  import { paintMaskLayerId } from './lib/stores/paintMaskTool';
+  import PaintMaskOverlay from './lib/components/PaintMaskOverlay.svelte';
+  import { project, selectedLayer, selectedLayerIds, selectedLinesLayer, selectedLineElement, selectedLightPaintingLayer, selectedAdvLightPaintingLayer, selectedTextLayer, selectedSVGLayer, selectedMediaLayer, selectedSplatLayer, selectedModel3DLayer, selectedPixelFXLayer, selectedGPULayer, selectedGroupLayer, setHistoryCallback, flushPendingHistorySnapshot } from './lib/stores/layers';
+  import { keyframeTimeline } from './lib/stores/keyframeTimeline';
+  import ChaseOrderBadges from './lib/components/ChaseOrderBadges.svelte';
+  import { beginHistoryRestore, endHistoryRestore } from './lib/stores/historyHooks';
+  import { showTimeline, setShowTransitionSink } from './lib/stores/showTimeline';
+  import { installShowControl, showRuntimeHooks } from './lib/show/showControlRuntime';
+  import { hydrateShowControl } from './lib/show/showControlPersistence';
+  import { cueList } from './lib/show/cueList';
+  import {
+    installPromptSuppression,
+    isShowModeLaunch,
+    launchConfig,
+    promptsSuppressed,
+    runShowModeLaunch,
+  } from './lib/show/showStartup';
+  import { compositionTransition } from './lib/stores/compositionTransition';
+  import { layerSequencer } from './lib/stores/layerSequencer';
+  import { NATIVE_ENGINE_ONLY, settings, outputFrozen } from './lib/stores/settings';
+  import { screenSetups } from './lib/stores/screenSetups';
+  import { mcpStore } from './lib/mcp/mcpStore';
   import { checkForUpdate, type VersionCheckResult } from './lib/utils/versionCheck';
+  import { fitToolbar } from './lib/utils/toolbarFit';
   import { startRecording as startRec, formatRecordingDuration, type RecorderHandle } from './lib/recording/recorder';
+  import RecordingSourcePicker from './lib/components/RecordingSourcePicker.svelte';
   import { vjClipLauncher } from './lib/stores/vjClipLauncher';
   import { audioStore } from './lib/stores/audio';
+  // Side effect: the analyser follows clip audio when no live input runs.
+  import './lib/audio/clipAudioFollow';
   // macros.ts registers a callback with midiRouter on import so
   // `vj:macro:N:value` MIDI messages route into the macro store. Pulled in
   // here to guarantee it runs at app boot, even if the VJ panel hasn't
@@ -88,6 +120,7 @@
   // reactive blocks like syncVJClips.
   import { snapshots as snapshotsStore } from './lib/stores/snapshots';
   import { mediaLibrary } from './lib/stores/media';
+  import { createAssetRefFromGeneratedBlob, type AssetRef } from './lib/storage/assetRegistry';
   import {
     PHONE_CAMERA_MEDIA_ID,
     PHONE_CAMERA_SOURCE_PREFIX,
@@ -104,18 +137,40 @@
     type PhoneVisionPointCloudPreset,
     type PhoneVisionSegmentationPipeline,
   } from './lib/stores/phoneVision';
-  import { history, canUndo, canRedo } from './lib/stores/history';
+  import { history, canUndo, canRedo, outputHistoryPatch, type HistorySnapshot } from './lib/stores/history';
+  import { selectedScreenId, selectedScreenMaskId, screenMaskPlacing } from './lib/stores/screens';
   import { recentFiles } from './lib/stores/recentFiles';
   import { initLicense, destroyLicense } from './lib/stores/license';
   import { startUpdateChecker, stopUpdateChecker } from './lib/stores/updateChecker';
   import { startAutoEngine, stopAutoEngine } from './lib/audio/autoEngine';
-  import { linesStore } from './lib/stores/lines';
+  import { linesStore, linesDrawingModeForTool } from './lib/stores/lines';
+  import { startInterfaceScale } from './lib/stores/interfaceScale';
   import { loadShadersFromServer, loadCloudShadersFromDisk, shaderLibrary } from './lib/stores/shaderLibrary';
   import { mediaTrayShaders } from './lib/stores/mediaTrayShaders';
-  import { getNativeRendererStatus } from './lib/api/native-renderer';
+  import {
+    getNativeRendererStatus,
+    setNativeEditorPreviewOverlay,
+    type NativeEditorPreviewOverlay,
+    type NativeEditorPreviewOverlayHandle,
+    type NativeEditorPreviewOverlayPoint,
+  } from './lib/api/native-renderer';
+  import {
+    nativeRendererRuntime,
+    type NativeRendererRuntimeState,
+  } from './lib/stores/nativeRenderer';
   import { startSpoutScanner, stopSpoutScanner } from './lib/stores/spout';
   import { preloadShaderLibrary, populateShaderListForSync } from './lib/preload';
   import { invoke, isMac, isDesktopApp, openExternalUrl } from './lib/bridge';
+  import {
+    DEFAULT_REMOTE_HTTP_PORT,
+    DEFAULT_REMOTE_WS_PORT,
+    PAIRING_QUERY_PARAM,
+    formatPairingCode,
+    getRemotePairingInfo,
+    localServerFetch,
+    resetRemotePairing,
+    withPairingToken,
+  } from './lib/remote/remotePairing';
   import type { Point2D, BezierPoint, Layer, WarpCorners, MediaSource, LayerShapeParams, LayerShapeType } from './lib/types';
   import { createDefaultCorners, generateUUID } from './lib/types';
   import { createDefaultFreehandLine, createDefaultPointClickLine } from './lib/lines/types';
@@ -123,6 +178,7 @@
   // main App chunk — it's only needed when the mobile-connect panel opens.
   import { midiManager } from './lib/midi/midiManager';
   import { oscStore } from './lib/osc/oscStore';
+  import { dmxStore } from './lib/dmx/dmxStore';
   import { midiStore } from './lib/midi/midiStore';
   import { keyboardStore } from './lib/keyboard/keyboardStore';
   import { synthVisionStore, sessionClipCache, isfShaderCache } from './lib/stores/synthVision';
@@ -136,11 +192,169 @@
   // import DirectorPanel from './lib/components/DirectorPanel.svelte';
   // import { directorStore } from './lib/stores/director';
   import { fpsStore } from './lib/stores/fps';
+  import { editorCanvasGeometry } from './lib/stores/editorCanvasGeometry';
 
   // Drawing mode for lines layers (connected to LinesPanel)
   let linesDrawingMode: 'none' | 'freehand' | 'pointClick' = 'none';
   let linesDrawingPoints: Point2D[] = [];
   let isLinesDrawing = false;
+  let nativePreviewOverlayRaf: number | null = null;
+  let nativePreviewOverlaySignature = '';
+  // Frameless window-control state (Windows/Linux, where the transparent
+  // underlay window has no OS title bar).
+  let winMaximized = false;
+  // Anything interactive in the toolbar must not start a window drag.
+  function isToolbarControl(target: HTMLElement | null): boolean {
+    return !!target?.closest(
+      'button, a, input, select, textarea, label, [role="button"], .dropdown, .mobile-btn-wrapper, .mobile-info-popup, .win-controls',
+    );
+  }
+
+  function presenterPoint(point: Point2D): NativeEditorPreviewOverlayPoint {
+    return { x: point.x, y: 1 - point.y };
+  }
+
+  function appendPresenterSegment(
+    lines: NativeEditorPreviewOverlayPoint[],
+    a: Point2D,
+    b: Point2D,
+  ): void {
+    lines.push(presenterPoint(a), presenterPoint(b));
+  }
+
+  function selectedLayerPresenterOverlay(): NativeEditorPreviewOverlay {
+    const layer = get(selectedLayer);
+    if (!layer?.corners || get(leftSidebarTab) === 'screens') {
+      return { lines: [], points: [], handles: [] };
+    }
+
+    const corners = layer.corners;
+    const lines: NativeEditorPreviewOverlayPoint[] = [];
+    const points: NativeEditorPreviewOverlayPoint[] = [];
+    const handles: NativeEditorPreviewOverlayHandle[] = [];
+    if (layer.warpMode === 'mesh' && layer.meshGrid) {
+      const rows = Math.max(0, Math.min(layer.meshGrid.rows, layer.meshGrid.points.length));
+      const cols = Math.max(0, layer.meshGrid.cols);
+      const warped: Point2D[][] = [];
+      for (let row = 0; row < rows; row++) {
+        const sourceRow = layer.meshGrid.points[row] ?? [];
+        const outputRow: Point2D[] = [];
+        for (let col = 0; col < Math.min(cols, sourceRow.length); col++) {
+          const point = sourceRow[col];
+          const screenPoint = warpPointThroughCorners(corners, point.x, point.y);
+          outputRow.push(screenPoint);
+          points.push(presenterPoint(screenPoint));
+        }
+        warped.push(outputRow);
+      }
+      for (let row = 0; row < warped.length; row++) {
+        for (let col = 0; col + 1 < warped[row].length; col++) {
+          appendPresenterSegment(lines, warped[row][col], warped[row][col + 1]);
+        }
+      }
+      for (let row = 0; row + 1 < warped.length; row++) {
+        const sharedCols = Math.min(warped[row].length, warped[row + 1].length);
+        for (let col = 0; col < sharedCols; col++) {
+          appendPresenterSegment(lines, warped[row][col], warped[row + 1][col]);
+        }
+      }
+    } else {
+      appendPresenterSegment(lines, corners.topLeft, corners.topRight);
+      appendPresenterSegment(lines, corners.topRight, corners.bottomRight);
+      appendPresenterSegment(lines, corners.bottomRight, corners.bottomLeft);
+      appendPresenterSegment(lines, corners.bottomLeft, corners.topLeft);
+      handles.push(
+        { ...presenterPoint(corners.topLeft), kind: 'corner' },
+        { ...presenterPoint(corners.topRight), kind: 'corner' },
+        { ...presenterPoint(corners.bottomRight), kind: 'corner' },
+        { ...presenterPoint(corners.bottomLeft), kind: 'corner' },
+      );
+    }
+
+    const topMidpoint = {
+      x: (corners.topLeft.x + corners.topRight.x) / 2,
+      y: (corners.topLeft.y + corners.topRight.y) / 2,
+    };
+    const bottomMidpoint = {
+      x: (corners.bottomLeft.x + corners.bottomRight.x) / 2,
+      y: (corners.bottomLeft.y + corners.bottomRight.y) / 2,
+    };
+    const center = {
+      x: (corners.topLeft.x + corners.topRight.x + corners.bottomLeft.x + corners.bottomRight.x) / 4,
+      y: (corners.topLeft.y + corners.topRight.y + corners.bottomLeft.y + corners.bottomRight.y) / 4,
+    };
+    const topPresenter = presenterPoint(topMidpoint);
+    const bottomPresenter = presenterPoint(bottomMidpoint);
+    const leftPresenter = presenterPoint({
+      x: (corners.topLeft.x + corners.bottomLeft.x) / 2,
+      y: (corners.topLeft.y + corners.bottomLeft.y) / 2,
+    });
+    const rightPresenter = presenterPoint({
+      x: (corners.topRight.x + corners.bottomRight.x) / 2,
+      y: (corners.topRight.y + corners.bottomRight.y) / 2,
+    });
+    const rotatePoint = {
+      x: topPresenter.x,
+      y: topPresenter.y - 40 / Math.max(1, canvasHeight),
+    };
+    const scalePoint = {
+      x: bottomPresenter.x,
+      y: bottomPresenter.y + 40 / Math.max(1, canvasHeight),
+    };
+    const movePoint = layer.warpMode === 'mesh'
+      ? {
+          x: corners.topLeft.x - 30 / Math.max(1, canvasWidth),
+          y: 1 - corners.topLeft.y - 30 / Math.max(1, canvasHeight),
+        }
+      : presenterPoint(center);
+
+    lines.push(topPresenter, rotatePoint, bottomPresenter, scalePoint);
+    handles.push(
+      { ...topPresenter, kind: 'edge-horizontal' },
+      { ...bottomPresenter, kind: 'edge-horizontal' },
+      { ...leftPresenter, kind: 'edge-vertical' },
+      { ...rightPresenter, kind: 'edge-vertical' },
+      { ...movePoint, kind: 'move' },
+      { ...rotatePoint, kind: 'rotate' },
+      { ...scalePoint, kind: 'scale' },
+    );
+    return { lines, points, handles };
+  }
+
+  function scheduleNativePresenterOverlay(): void {
+    if (nativePreviewOverlayRaf !== null || typeof requestAnimationFrame === 'undefined') return;
+    nativePreviewOverlayRaf = requestAnimationFrame(() => {
+      nativePreviewOverlayRaf = null;
+      // The native preview is an underlay on both platforms now (macOS Metal
+      // subview below the web content; Windows a top-level window behind the
+      // transparent Electron window). Editor chrome therefore belongs entirely
+      // to the DOM — controls, menus and modals share one z-order and hit-test
+      // system — and the presenter supplies composite pixels only.
+      const overlay = { lines: [], points: [], handles: [] };
+      const signature = JSON.stringify(overlay);
+      if (signature === nativePreviewOverlaySignature) return;
+      nativePreviewOverlaySignature = signature;
+      void setNativeEditorPreviewOverlay(overlay).catch(() => {
+        nativePreviewOverlaySignature = '';
+      });
+    });
+  }
+
+  $: {
+    void $selectedLayer;
+    void $leftSidebarTab;
+    void $nativeRendererRuntime.nativeEditorPreviewProductionReady;
+    void canvasWidth;
+    void canvasHeight;
+    scheduleNativePresenterOverlay();
+  }
+
+  onDestroy(() => {
+    if (nativePreviewOverlayRaf !== null) cancelAnimationFrame(nativePreviewOverlayRaf);
+    nativePreviewOverlayRaf = null;
+    nativePreviewOverlaySignature = '';
+    void setNativeEditorPreviewOverlay({ lines: [], points: [], handles: [] }).catch(() => {});
+  });
 
   // File menu state
   let fileMenuOpen = false;
@@ -155,12 +369,116 @@
   // WebGL context, so LED screens sample the local composite texture
   // without a canvas/media bridge.
   let showStage3D = false;
+  import {
+    isWindowed,
+    resolveDisplayForSurface,
+    surfacesDisplacedBy,
+    SURFACE_LABELS,
+    displayForBounds,
+    type DisplayInfo,
+    type OutputSurface,
+  } from './lib/output/displayAssignment';
+
   let stage3DWindowOpen = false;
   let projectionSimWindowOpen = false;
+  // The editor owns the Map Sim scene that is saved with the project and
+  // drives the native projector views; the pop-out edits the same scene.
+  const stopProjectionSimSceneSync = startProjectionSimSceneSync('editor');
+  onDestroy(() => stopProjectionSimSceneSync());
+  /*
+   * Output surfaces and the screens they compete for.
+   *
+   * Live Output, Stage Sim and Map Sim used to each resolve "first non-primary
+   * display" independently, so with a projector AND a monitor they all landed on
+   * the same one. Now each has an assignment, and when two share a screen they
+   * take turns: opening one closes whoever is holding it. A surface set to
+   * `windowed` opts out and floats beside the editor instead.
+   */
+  let cachedDisplays: DisplayInfo[] = [];
+
+  async function refreshDisplays(): Promise<DisplayInfo[]> {
+    if (!isDesktopApp) return [];
+    try {
+      cachedDisplays = (await invoke<DisplayInfo[]>('get_displays')) ?? [];
+    } catch (e) {
+      console.warn('[Displays] enumeration failed:', e);
+    }
+    return cachedDisplays;
+  }
+
+  function openSurfaces(): OutputSurface[] {
+    const open: OutputSurface[] = [];
+    if (outputIsOpen) open.push('liveOutput');
+    if (stage3DWindowOpen) open.push('stageSim');
+    if (projectionSimWindowOpen) open.push('mapSim');
+    return open;
+  }
+
+  /** Close whatever is holding the screen this surface is about to take. */
+  async function yieldDisplayFor(surface: OutputSurface) {
+    const displays = await refreshDisplays();
+    const assignments = $settings.output.displayAssignments;
+    for (const other of surfacesDisplacedBy(displays, assignments, surface, openSurfaces())) {
+      if (other === 'liveOutput') {
+        closeOutputWindow();
+      } else if (other === 'stageSim') {
+        await invoke('stage3d_window_closing').catch(() => {});
+        stage3DWindowOpen = false;
+      } else if (other === 'mapSim') {
+        await invoke('projection_sim_window_closing').catch(() => {});
+        projectionSimWindowOpen = false;
+      }
+    }
+  }
+
+  /* Right-click menu state for the three output buttons. */
+  let displayMenu: { surface: OutputSurface; x: number; y: number } | null = null;
+
+  async function openDisplayMenu(event: MouseEvent, surface: OutputSurface) {
+    if (!isDesktopApp) return;
+    event.preventDefault();
+    await refreshDisplays();
+    displayMenu = { surface, x: event.clientX, y: event.clientY };
+  }
+
+  function chooseSurfaceTarget(surface: OutputSurface, target: number | 'windowed' | null) {
+    settings.setDisplayAssignment(surface, target);
+    displayMenu = null;
+  }
+
+  /*
+   * Remember where the user dragged a sim window. Main reports the bounds when
+   * the window settles or closes; mapping the centre back to a display is what
+   * makes "put it here and keep it here" work across launches.
+   */
+  function handleSimWindowMoved(payload: { surface?: string; bounds?: { x: number; y: number; width: number; height: number } }) {
+    const surface = payload?.surface as OutputSurface | undefined;
+    const bounds = payload?.bounds;
+    if (!surface || !bounds || !cachedDisplays.length) return;
+    // A window the user parked as a floating one should stay floating.
+    if (isWindowed($settings.output.displayAssignments, surface)) return;
+    const display = displayForBounds(cachedDisplays, bounds);
+    if (display && $settings.output.displayAssignments[surface] !== display.id) {
+      settings.setDisplayAssignment(surface, display.id);
+    }
+  }
+
   async function openStage3D() {
     if (isDesktopApp) {
+      // Toggle: a second click on the button that owns the screen closes it.
+      if (stage3DWindowOpen) {
+        await invoke('stage3d_window_closing').catch(() => {});
+        stage3DWindowOpen = false;
+        return;
+      }
       try {
-        await invoke('open_stage3d_window');
+        await yieldDisplayFor('stageSim');
+        const displays = await refreshDisplays();
+        const assignments = $settings.output.displayAssignments;
+        const target = isWindowed(assignments, 'stageSim')
+          ? null
+          : resolveDisplayForSurface(displays, assignments, 'stageSim');
+        await invoke('open_stage3d_window', { displayId: target?.id ?? null });
         stage3DWindowOpen = true;
         return;
       } catch (e) {
@@ -172,8 +490,19 @@
 
   async function openProjectionSim() {
     if (isDesktopApp) {
+      if (projectionSimWindowOpen) {
+        await invoke('projection_sim_window_closing').catch(() => {});
+        projectionSimWindowOpen = false;
+        return;
+      }
       try {
-        await invoke('open_projection_sim_window');
+        await yieldDisplayFor('mapSim');
+        const displays = await refreshDisplays();
+        const assignments = $settings.output.displayAssignments;
+        const target = isWindowed(assignments, 'mapSim')
+          ? null
+          : resolveDisplayForSurface(displays, assignments, 'mapSim');
+        await invoke('open_projection_sim_window', { displayId: target?.id ?? null });
         projectionSimWindowOpen = true;
         return;
       } catch (e) {
@@ -214,6 +543,21 @@
     projectionSimWindowPoll = null;
   }
   let canvasComponent: Canvas | null = null;
+
+  // Composite mirror handle for the in-editor projection simulator. Held
+  // only while the sim workspace is open so the snapshot pump is free the
+  // rest of the time.
+  let projectionSimMirror: import('$lib/sync/nativeCompositeMirror').CompositeMirrorHandle | null = null;
+  $: if (nativePrimaryRenderer && $workspace === 'projection-sim' && !projectionSimMirror) {
+    void import('$lib/sync/nativeCompositeMirror').then(({ acquireNativeCompositeMirror }) => {
+      if ($workspace === 'projection-sim' && !projectionSimMirror) {
+        projectionSimMirror = acquireNativeCompositeMirror({ maxDim: 640, fps: 20 });
+      }
+    });
+  } else if ($workspace !== 'projection-sim' && projectionSimMirror) {
+    projectionSimMirror.release();
+    projectionSimMirror = null;
+  }
   // Phase 3.0 bridge: bound when experimental.editorWebGPU is on so
   // we can push the WebGL canvas reference into it after both
   // components mount. See the WebGPUCanvas mount block for the
@@ -221,6 +565,27 @@
   let webgpuBridgeComponent: WebGPUCanvas | null = null;
   let lastReactiveBridgeSource: HTMLCanvasElement | null = null;
   let lastReactiveBridge: WebGPUCanvas | null = null;
+  let nativePrimaryRenderer = false;
+  let nativePreviewGlassActive = false;
+  // VJ mode in full-native punches a transparent hole in its overlay for the
+  // Metal underlay; the editor DOM must not bleed through that hole.
+  let vjNativeUnderlayActive = false;
+  $: nativePrimaryRenderer = isDesktopApp && NATIVE_ENGINE_ONLY;
+  $: vjNativeUnderlayActive = nativePrimaryRenderer && $vjClipLauncher.isOpen && !$vjStageEdit;
+  $: if ($vjStageEdit && $vjClipLauncher.isOpen && !$vjClipLauncher.stageMode) vjStageEdit.set(false);
+  $: nativePreviewGlassActive = !!(
+    nativePrimaryRenderer
+    && $nativeRendererRuntime.running
+    && $nativeRendererRuntime.backendReady
+    && $nativeRendererRuntime.sharedTextureOutputExportReady
+    && $nativeRendererRuntime.readinessChecks
+      ?.find((check) => check.id === 'native-editor-preview-frame-source')
+      ?.ok === true
+  );
+  $: if (typeof document !== 'undefined') {
+    document.documentElement.classList.toggle('native-primary-presenter', nativePreviewGlassActive);
+    document.body.classList.toggle('native-primary-presenter', nativePreviewGlassActive);
+  }
   // Browsers without WebGPU (Safari before macOS 26 / iOS 26, Firefox,
   // older Android Chrome) fall back to the plain WebGL editor instead of
   // showing the bridge error. Runtime-only: the saved setting is kept so
@@ -233,7 +598,7 @@
     }
   });
   $: editorWebGPUActive = !!$settings.experimental?.editorWebGPU && !webgpuUnavailable;
-  $: if (editorWebGPUActive && !showStage3D && canvasComponent && webgpuBridgeComponent) {
+  $: if (!nativePrimaryRenderer && editorWebGPUActive && !showStage3D && canvasComponent && webgpuBridgeComponent) {
     const source = canvasComponent.getCanvas?.();
     if (source && (source !== lastReactiveBridgeSource || webgpuBridgeComponent !== lastReactiveBridge)) {
       webgpuBridgeComponent.setSourceCanvas(source);
@@ -253,8 +618,39 @@
       try { window.localStorage?.setItem(INTEGRATED_GPU_BANNER_DISMISSED_KEY, '1'); } catch { /* */ }
     }
   }
+  /*
+   * Show the OUTPUT frame rate whenever the native core is rendering.
+   *
+   * This counter used to report the editor's own render loop and label it "UI",
+   * which was honest but not useful: with the core owning rendering, the
+   * editor's loop rate says nothing about what actually reaches a projector.
+   * state.outputFps is measured from the core's presented-frame counter, so it
+   * is the real figure. The UI rate is kept in the tooltip, since a stalled
+   * editor is still worth being able to see.
+   *
+   * It falls back to the UI rate for the first poll or two, while the frame
+   * delta has no interval to measure over -- better a briefly stale honest
+   * number than a fabricated one.
+   */
+  function fpsCounterLabel(state: NativeRendererRuntimeState, fps: number): string {
+    const nativeOwns = state.driverMode !== 'offline' || nativePrimaryRenderer;
+    if (!nativeOwns) return `${fps} FPS`;
+    const out = state.outputFps;
+    return Number.isFinite(out ?? NaN) ? `${Math.round(out as number)} FPS` : `UI ${fps} FPS`;
+  }
+  function fpsCounterTitle(state: NativeRendererRuntimeState): string {
+    if (state.driverMode === 'offline' && !nativePrimaryRenderer) return 'Editor render loop frame rate';
+    const out = state.outputFps;
+    const nativeMs = Number.isFinite(state.averageGpuMs ?? NaN)
+      ? ` Native GPU average: ${Number(state.averageGpuMs).toFixed(2)} ms.`
+      : '';
+    if (Number.isFinite(out ?? NaN)) {
+      return `Output frame rate, measured from frames presented by the native render core.${nativeMs}`;
+    }
+    return `Editor UI refresh rate. Waiting on the first output measurement from the native core.${nativeMs}`;
+  }
   async function checkGPU() {
-    // First try native D3D11 renderer status (this is the real GPU for shader rendering)
+    // First try native render-core status (this is the real GPU for native shader rendering)
     try {
       const status = await getNativeRendererStatus();
       if (status && status.adapter_name) {
@@ -267,12 +663,17 @@
           vendor: nameLower.includes('nvidia') ? 'NVIDIA' : nameLower.includes('amd') || nameLower.includes('radeon') ? 'AMD' : nameLower.includes('intel') ? 'Intel' : 'Unknown',
           isIntegrated: !isDiscrete,
         };
-        console.log(`[GPU] Native D3D11 renderer on: ${name} (${isDiscrete ? 'discrete' : 'integrated'})`);
+        console.log(`[GPU] Native ${status.backend ?? 'render-core'} renderer on: ${name} (${isDiscrete ? 'discrete' : 'integrated'})`);
         return;
       }
-    } catch (_) { /* native renderer not running yet, fall through to WebGL */ }
+    } catch (_) {
+      if (nativePrimaryRenderer) {
+        gpuInfo = { renderer: 'Native renderer unavailable', vendor: 'Native', isIntegrated: false };
+        return;
+      }
+    }
 
-    // Fallback: read from WebGL engine (this reports WebView2's GPU, often integrated)
+    // Non-native builds can still read from the browser engine.
     const engine = canvasComponent?.getEngine();
     if (engine) {
       gpuInfo = engine.getGPUInfo();
@@ -323,6 +724,21 @@
   // in LayerPanel flips this to `edit` so the toolbar appears even when
   // the user re-enters edit mode after closing all shapes.
   let maskPenMode: 'edit' | 'add' | 'remove' = 'edit';
+  // Add and Remove only act on closed shapes, and their toolbar stays hidden
+  // until a shape is closed. A mode left over from an earlier mask turned
+  // every click on a new one into a silent no-op, so each mask editing session
+  // starts in Edit, and without a closed shape the pen always draws.
+  let maskPenModeTarget: string | null = null;
+  // The paint brush is armed on one layer; selecting another disarms it.
+  $: if ($paintMaskLayerId && $selectedLayer?.id !== $paintMaskLayerId) paintMaskLayerId.set(null);
+
+  $: if (($maskEditingLayerId ?? null) !== maskPenModeTarget) {
+    maskPenModeTarget = $maskEditingLayerId ?? null;
+    maskPenMode = 'edit';
+  }
+  function activeMaskPenMode(): 'edit' | 'add' | 'remove' {
+    return $selectedLayer?.mask?.shapes?.some((shape) => shape.closed) ? maskPenMode : 'edit';
+  }
   // Currently-hovered edge index keyed by shape, for add-mode visual.
   // -1 means "no edge under cursor."
   let maskHoverShapeIdx: number = -1;
@@ -339,19 +755,18 @@
   let viewportWidth = 800;
   let viewportHeight = 600;
 
-  // Computed canvas dimensions (aspect-ratio constrained within viewport)
-  // When measured values from Canvas component are available, use those for pixel-perfect alignment
+  // Canvas.svelte owns editor geometry. These overlays use the layout-space
+  // half of the same revision that positions the native Metal presenter.
   $: canvasAspect = ($project.width || 1920) / ($project.height || 1080);
   $: viewportAspect = viewportWidth / viewportHeight;
-  $: canvasWidth = measuredCanvasWidth ?? (viewportAspect > canvasAspect
+  $: canvasWidth = $editorCanvasGeometry?.layoutWidth ?? (viewportAspect > canvasAspect
     ? viewportHeight * canvasAspect
     : viewportWidth);
-  $: canvasHeight = measuredCanvasHeight ?? (viewportAspect > canvasAspect
+  $: canvasHeight = $editorCanvasGeometry?.layoutHeight ?? (viewportAspect > canvasAspect
     ? viewportHeight
     : viewportWidth / canvasAspect);
-  // Offset for letterboxing (centering)
-  $: canvasOffsetX = measuredCanvasOffsetX ?? (viewportWidth - canvasWidth) / 2;
-  $: canvasOffsetY = measuredCanvasOffsetY ?? (viewportHeight - canvasHeight) / 2;
+  $: canvasOffsetX = $editorCanvasGeometry?.layoutX ?? (viewportWidth - canvasWidth) / 2;
+  $: canvasOffsetY = $editorCanvasGeometry?.layoutY ?? (viewportHeight - canvasHeight) / 2;
 
   // Recalculate viewport size when keyframe tray opens/closes.
   // Subscribe directly instead of using $: reactive block, because $keyframeTimeline
@@ -379,6 +794,47 @@
   let panStartPanY = 0;
   let isSpacePressed = false;
 
+  /**
+   * Does the show transport own the spacebar right now?
+   *
+   * True only while the show tray is genuinely the thing on screen: mapping
+   * workspace, tray open, no full-screen takeover (VJ / Stage Designer /
+   * projection sim) and no modal in front of it. Everywhere else Space keeps
+   * its original job of arming canvas panning.
+   *
+   * The typing guard is NOT here — the caller checks the event target,
+   * because only it can see what was focused.
+   */
+  function showTransportOwnsSpace(): boolean {
+    if (!$showTimeline.isOpen) return false;
+    // ShowTimeline.svelte force-closes itself when the VJ panel opens, but
+    // check anyway so the two can never disagree for a frame.
+    if ($vjClipLauncher.isOpen) return false;
+    // 'main' is the mapping workspace; 'vj' / 'stage' / 'projection-sim' are
+    // full-screen takeovers with their own key handling.
+    if ($workspace !== 'main') return false;
+    if (
+      showSettings ||
+      showShortcutHelp ||
+      showOfflineRender ||
+      showVideoConverter ||
+      showProjectMedia ||
+      showWelcome ||
+      showCloseModal ||
+      showRecoveryModal ||
+      showNewProjectModal ||
+      showMobileInfo ||
+      showOutputSettings
+    ) {
+      return false;
+    }
+    // Anything that opened a native <dialog> or an ARIA modal on top.
+    if (typeof document !== 'undefined' && document.querySelector('dialog[open], [aria-modal="true"]')) {
+      return false;
+    }
+    return true;
+  }
+
   // Light painting draw mode toggle — when off, warp/mesh handles are accessible
   let lpDrawingEnabled = true;
 
@@ -401,6 +857,14 @@
   // the offlineRender store.
   let showOfflineRender = false;
   let showVideoConverter = false;
+  let showProjectMedia = false;
+
+  function applyMediaRelinks(json: string) {
+    const sep = currentProjectPath?.includes('\\') ? '\\' : '/';
+    const dir = currentProjectPath?.substring(0, currentProjectPath.lastIndexOf(sep) + 1);
+    vjClipLauncher.stopAll();
+    if (!project.importProjectJSON(json, dir)) throw new Error('Could not reload the relinked project.');
+  }
 
   // Keyboard shortcut help overlay
   let showShortcutHelp = false;
@@ -434,6 +898,39 @@
   // "Presets" pill. Bound to PresetTray so the existing toggle button
   // inside it stays in sync.
   let presetTrayOpen = false;
+  // VJ MAP sub-mode: surface the mapping-preset tray above the VJ overlay
+  // so presets can be dragged into the deck. Auto-open on entry; the
+  // user's pill toggle still works to tuck it away.
+  $: vjMapPresetDragActive = $vjClipLauncher.isOpen && $vjClipLauncher.mapMode;
+  let _prevVjMapPresetDrag = false;
+  $: {
+    if (vjMapPresetDragActive && !_prevVjMapPresetDrag) presetTrayOpen = true;
+    _prevVjMapPresetDrag = vjMapPresetDragActive;
+  }
+
+  // The four bottom trays (Presets, Sequencer, Keyframes, Show) share one
+  // fixed slot above the dock, and the viewport only reserves room for one
+  // of them, so they are exclusive: opening one closes the others. Before,
+  // the Show tray could sit on top of Presets and hide its "+ Save".
+  type BottomTray = 'presets' | 'sequencer' | 'keyframes' | 'show';
+  let _prevBottomTrays: Record<BottomTray, boolean> = { presets: false, sequencer: false, keyframes: false, show: false };
+  $: {
+    const open: Record<BottomTray, boolean> = {
+      presets: presetTrayOpen,
+      sequencer: $layerSequencer.isOpen,
+      keyframes: $keyframeTimeline.isOpen,
+      show: $showTimeline.isOpen,
+    };
+    const opened = (Object.keys(open) as BottomTray[]).filter((tray) => open[tray] && !_prevBottomTrays[tray]);
+    const keep = opened[opened.length - 1];
+    if (keep) {
+      if (keep !== 'presets' && presetTrayOpen) { presetTrayOpen = false; open.presets = false; }
+      if (keep !== 'sequencer' && open.sequencer) { layerSequencer.setOpen(false); open.sequencer = false; }
+      if (keep !== 'keyframes' && open.keyframes) { keyframeTimeline.setOpen(false); open.keyframes = false; }
+      if (keep !== 'show' && open.show) { showTimeline.setOpen(false); open.show = false; }
+    }
+    _prevBottomTrays = open;
+  }
 
   // Unsaved changes tracking - increments on every project change, resets on save
   let lastSavedState: string | null = null;
@@ -455,6 +952,9 @@
     const currentState = JSON.stringify({
       layers: $project.layers.map(l => ({ id: l.id, name: l.name, type: l.type, opacity: l.opacity, visible: l.visible, corners: l.corners, contentFit: l.contentFit })),
       name: $project.name,
+      // Map Sim edits persist in the project file now, so they must be able
+      // to dirty the project; the history counter bumps on every sim edit.
+      simEdits: $projectionSimHistoryVersion,
     });
     hasUnsavedChanges = lastSavedState !== null && currentState !== lastSavedState;
   }
@@ -463,6 +963,7 @@
     const currentState = JSON.stringify({
       layers: get(project).layers.map(l => ({ id: l.id, name: l.name, type: l.type, opacity: l.opacity, visible: l.visible, corners: l.corners, contentFit: l.contentFit })),
       name: get(project).name,
+      simEdits: get(projectionSimHistoryVersion),
     });
     lastSavedState = currentState;
     hasUnsavedChanges = false;
@@ -470,6 +971,10 @@
 
   // Auto-save cleanup
   onDestroy(() => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.remove('native-primary-presenter');
+      document.body.classList.remove('native-primary-presenter');
+    }
     if (autosaveInterval) {
       clearInterval(autosaveInterval);
       autosaveInterval = null;
@@ -477,17 +982,29 @@
     viewportEl?.removeEventListener('wheel', handleViewportWheel);
     destroyPhoneVisionSession(true);
     oscStore.destroy();
+    dmxStore.destroy();
   });
 
   // Recovery modal actions
   function recoverAutosave() {
     const savedData = localStorage.getItem('ghostarcade-autosave');
     if (savedData) {
-      project.importProjectJSON(savedData);
+      // Recover against the same project directory the snapshot was taken
+      // in, so relative / sibling asset references resolve exactly as they
+      // do on a normal Open.
+      const savedPath = localStorage.getItem('ghostarcade-autosave-path') || '';
+      let projectDir: string | undefined;
+      if (savedPath) {
+        const sep = savedPath.includes('\\') ? '\\' : '/';
+        projectDir = savedPath.substring(0, savedPath.lastIndexOf(sep) + 1) || undefined;
+        currentProjectPath = savedPath;
+      }
+      project.importProjectJSON(savedData, projectDir);
       markAsSaved();
     }
     localStorage.removeItem('ghostarcade-autosave');
     localStorage.removeItem('ghostarcade-autosave-timestamp');
+    localStorage.removeItem('ghostarcade-autosave-path');
     showRecoveryModal = false;
   }
 
@@ -578,21 +1095,70 @@
   // =========================================================================
   // SCREENSHOT — capture canvas as PNG, save to recordings folder + media lib
   // =========================================================================
+  // Native mode: the WebGL canvas is a cleared underlay — snapshot the
+  // core's presented frame instead. Returns null when unavailable so the
+  // canvas path stays as fallback.
+  async function captureNativeScreenshotBlob(): Promise<Blob | null> {
+    if (!nativePrimaryRenderer) return null;
+    try {
+      const snap = await invoke('native_renderer_get_frame_snapshot', { include_pixels: true }) as {
+        rgba_b64?: string;
+        width?: number;
+        height?: number;
+        format?: string;
+        bytes_per_row?: number;
+        padded_bytes_per_row?: number;
+      } | null;
+      if (!snap?.rgba_b64 || !snap.width || !snap.height) return null;
+      const raw = atob(snap.rgba_b64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      const w = snap.width;
+      const h = snap.height;
+      const stride = snap.padded_bytes_per_row || snap.bytes_per_row || w * 4;
+      const bgra = /bgra/i.test(String(snap.format ?? ''));
+      const img = new ImageData(w, h);
+      for (let y = 0; y < h; y++) {
+        const src = y * stride;
+        const dst = y * w * 4;
+        for (let x = 0; x < w; x++) {
+          const si = src + x * 4;
+          const di = dst + x * 4;
+          img.data[di]     = bytes[bgra ? si + 2 : si];
+          img.data[di + 1] = bytes[si + 1];
+          img.data[di + 2] = bytes[bgra ? si : si + 2];
+          img.data[di + 3] = 255;
+        }
+      }
+      const full = document.createElement('canvas');
+      full.width = w;
+      full.height = h;
+      full.getContext('2d')!.putImageData(img, 0, 0);
+      return await new Promise<Blob | null>((resolve) => full.toBlob(resolve, 'image/png'));
+    } catch (err) {
+      console.warn('[App] Native screenshot failed, falling back to canvas:', err);
+      return null;
+    }
+  }
+
   async function takeScreenshot() {
     try {
-      const canvas = document.querySelector('canvas.main-canvas') as HTMLCanvasElement ||
-                     document.querySelector('.canvas-container canvas') as HTMLCanvasElement ||
-                     document.querySelector('canvas') as HTMLCanvasElement;
-
-      if (!canvas) {
-        console.warn('[App] No canvas found for screenshot');
-        return;
-      }
-
-      // Capture full-resolution PNG blob from canvas
-      const blob: Blob | null = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      let blob: Blob | null = await captureNativeScreenshotBlob();
       if (!blob) {
-        console.warn('[App] Failed to capture canvas blob');
+        const canvas = document.querySelector('canvas.main-canvas') as HTMLCanvasElement ||
+                       document.querySelector('.canvas-container canvas') as HTMLCanvasElement ||
+                       document.querySelector('canvas') as HTMLCanvasElement;
+
+        if (!canvas) {
+          console.warn('[App] No canvas found for screenshot');
+          return;
+        }
+
+        // Capture full-resolution PNG blob from canvas
+        blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/png'));
+      }
+      if (!blob) {
+        console.warn('[App] Failed to capture screenshot');
         return;
       }
 
@@ -602,36 +1168,36 @@
       // Create blob URL for media library
       const blobUrl = URL.createObjectURL(blob);
 
-      // Generate thumbnail (120x68)
+      // Generate thumbnail (120x68) from the captured blob — works for
+      // both the native-snapshot and canvas capture paths.
       let thumbnail: string | undefined;
-      const thumbCanvas = document.createElement('canvas');
-      thumbCanvas.width = 120;
-      thumbCanvas.height = 68;
-      const ctx = thumbCanvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(canvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
-        thumbnail = thumbCanvas.toDataURL('image/jpeg', 0.7);
-      }
-
-      // Add to media library as image
-      mediaLibrary.addItem({
-        id: generateUUID(),
-        name: filename,
-        type: 'image',
-        src: blobUrl,
-        thumbnail,
-      });
-      console.log('[App] Screenshot added to media library:', filename);
+      try {
+        const bitmap = await createImageBitmap(blob);
+        const thumbCanvas = document.createElement('canvas');
+        thumbCanvas.width = 120;
+        thumbCanvas.height = 68;
+        const ctx = thumbCanvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(bitmap, 0, 0, thumbCanvas.width, thumbCanvas.height);
+          thumbnail = thumbCanvas.toDataURL('image/jpeg', 0.7);
+        }
+        bitmap.close();
+      } catch { /* thumbnail is optional */ }
 
       // Save to the same folder used for recordings (File System Access API)
       const currentSettings = settings.get();
       const dirHandle = currentSettings.recording.saveDirectoryHandle;
+      let savedPath: string | null = null;
       if (dirHandle) {
         try {
           const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
           const writable = await fileHandle.createWritable();
           await writable.write(blob);
           await writable.close();
+          // The Electron shim handle carries the absolute directory path, so
+          // the file we just wrote is itself a core-readable asset.
+          const dirPath = (dirHandle as any)._path;
+          if (typeof dirPath === 'string' && dirPath) savedPath = `${dirPath}/${filename}`;
           console.log('[App] Screenshot saved to:', dirHandle.name + '/' + filename);
         } catch (err) {
           console.warn('[App] Failed to save screenshot to folder, falling back to download:', err);
@@ -641,6 +1207,40 @@
         // Fallback: browser download
         downloadBlob(blob, filename);
       }
+
+      // The native core reads files, not the browser's blob: object URLs, so a
+      // library entry carrying only a blob URL is unassignable to a layer
+      // (`image:native-readable-uri-required`). Attach an AssetRef the same way
+      // file imports and recordings do — reusing the file we just wrote when we
+      // know its path, otherwise persisting a managed copy.
+      let assetRef: AssetRef | undefined;
+      if (savedPath) {
+        assetRef = {
+          kind: 'local-file',
+          originalPath: savedPath,
+          name: filename,
+          mime: 'image/png',
+          size: blob.size,
+          lastModified: Date.now(),
+        };
+      } else {
+        try {
+          ({ assetRef } = await createAssetRefFromGeneratedBlob(blob, filename, 'image/png', blobUrl));
+        } catch (err) {
+          console.warn('[App] Failed to persist screenshot asset:', err);
+        }
+      }
+
+      // Add to media library as image
+      mediaLibrary.addItem({
+        id: generateUUID(),
+        name: filename,
+        type: 'image',
+        src: blobUrl,
+        thumbnail,
+        _assetRef: assetRef,
+      });
+      console.log('[App] Screenshot added to media library:', filename, assetRef?.originalPath ?? '(no disk path)');
     } catch (err) {
       console.error('[App] Screenshot failed:', err);
     }
@@ -662,7 +1262,7 @@
   $: selectedPluginId = selectedMediaSource?.effectSource?.effectType ?? selectedMediaSource?.spoutSource?.pluginId ?? null;
   // Show the plugin-controls tab for any registered integrated effect type
   // (fluid, particles, milkdrop, …) plus the legacy Spout plugin ids.
-  $: hasPluginControls = selectedPluginId === 'fluid' || selectedPluginId === 'fluidgen' || selectedPluginId === 'particles' || selectedPluginId === 'particles3d' || selectedPluginId === 'milkdrop' || selectedPluginId === 'audiomotion' || selectedPluginId === 'wavejs' || selectedPluginId === 'hydra' || selectedPluginId === 'ghostfx' || selectedPluginId === 'analyzerlab' || selectedPluginId === 'handfx';
+  $: hasPluginControls = selectedPluginId === 'fluid' || selectedPluginId === 'fluidgen' || selectedPluginId === 'particles' || selectedPluginId === 'particles3d' || selectedPluginId === 'milkdrop' || selectedPluginId === 'audiomotion' || selectedPluginId === 'wavejs' || selectedPluginId === 'hydra' || selectedPluginId === 'ghostfx' || selectedPluginId === 'handfx';
   // Auto-switch to plugin tab when a plugin layer is first selected
   let prevPluginId: string | null = null;
   $: if (hasPluginControls && selectedPluginId !== prevPluginId) {
@@ -718,12 +1318,53 @@
 
   onMount(() => {
     let appMounted = true;
+    const stopInterfaceScale = startInterfaceScale();
+    // Sim windows report where they settle so the assignment follows a drag.
+    void refreshDisplays();
+    const offSimMoved = (window as any).electronAPI?.on?.('sim-window-moved', handleSimWindowMoved);
     // Debug/automation hook: expose the live store singletons on window so
     // CDP-driven tests and DevTools reach the SAME instances the render
     // loop uses (a dynamic `import('/src/...')` over CDP can resolve to a
     // separate module record after a Vite dep re-optimization). Harmless
     // read/write surface; no behaviour depends on it.
-    try { (window as any).__ghostArcade = { project, settings }; } catch { /* sealed */ }
+    // `showTimeline` and `getEngine` are here for the same stated reason as
+    // project/settings: a CDP-driven check of a show crossfade has to observe
+    // the SAME store and the SAME RenderEngine the transport and the render
+    // loop use, and a dynamic import cannot reach either.
+    try {
+      (window as any).__ghostArcade = {
+        project,
+        settings,
+        showTimeline,
+        // DMX input and the VJ deck, so a CDP check of a desk binding reads
+        // the same bindings and clip state the router writes.
+        dmxStore,
+        vjClipLauncher,
+        getEngine: () => canvasComponent?.getEngine() ?? null,
+      };
+    } catch { /* sealed */ }
+
+    // Show control: cue list executor, show:* control paths, timeline
+    // markers, timecode chase, the scheduler and projector polling.
+    const stopShowControl = installShowControl();
+    showRuntimeHooks.ensureOutputs = ensureOutputsFullscreen;
+    // Show mode (start at boot): nothing modal may stand between a machine
+    // booting in an empty room and the show starting.
+    const restorePrompts = promptsSuppressed()
+      ? installPromptSuppression((message) => showToast(message, 'warning'))
+      : () => {};
+
+    // Show timeline → renderer transitions.
+    //
+    // This used to call `engine.startTransition()`, which is WebGL-only: this
+    // build runs NATIVE_ENGINE_ONLY, `getEngine()` returns null, and every
+    // show boundary (and every preset-tray click) hard-cut no matter what the
+    // transition menu said. The native implementation instead puts BOTH
+    // compositions' layers in the scene and crossfades their opacity, driven
+    // by a `progress` the show timeline resolves from show time on every
+    // `seek()` — so a scrub, a playing transport and an offline render all
+    // land on the identical frame.
+    setShowTransitionSink((transition) => compositionTransition.driveFromClock(transition));
     const bridgeTimeouts = new Set<ReturnType<typeof setTimeout>>();
     const scheduleBridgeTimeout = (fn: () => void, delay: number) => {
       const id = setTimeout(() => {
@@ -754,6 +1395,7 @@
     let _lastWiredBridge: WebGPUCanvas | null = null;
     const unsubscribeSettings = settings.subscribe((s) => {
       if (!appMounted) return;
+      if (isDesktopApp && s.experimental?.outputNativeCore) return;
       if (!s.experimental?.editorWebGPU || webgpuUnavailable) return;
       // Idempotent — only re-wire when the canvas or bridge instance
       // actually changes (component remount). Otherwise every settings
@@ -818,6 +1460,8 @@
       // itself (visibility/lock/delete buttons live there and the user
       // expects those to apply to the multi-selection).
       if (tgt.closest('.viewport, .layer-row, .layer-list')) return;
+      // Controls built to act on every selected layer (Edge Effect presets).
+      if (tgt.closest('[data-keep-layer-selection]')) return;
       const active = get(selectedLayer);
       if (!active) return;
       if (ctl instanceof HTMLSelectElement) {
@@ -854,7 +1498,7 @@
     // while we show the modal; the modal's button handlers call
     // window.close() programmatically when the user makes a choice.
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (!hasUnsavedChanges) return;
+      if (!hasUnsavedChanges || promptsSuppressed()) return;
       // Only intercept once — if the modal is already open, let the
       // user finish their decision (and the modal handler will close).
       if (showCloseModal) return;
@@ -869,18 +1513,19 @@
     // Background update check — first run shows cached result if any,
     // then re-fetches if it's been > 24 h since last check. Manual
     // "Check now" from Settings calls runVersionCheck(true).
-    runVersionCheck(false);
+    // (Show mode skips both update checks: no banners or modals over a show.)
+    if (!promptsSuppressed()) runVersionCheck(false);
 
     // No license check in the OSS build — go straight to first-run UX.
     initLicense().then(() => {
       const welcomeSeen = localStorage.getItem('ghostarcade-welcome-seen');
-      if (!welcomeSeen) {
+      if (!welcomeSeen && !promptsSuppressed()) {
         showWelcome = true;
       }
     });
 
     // Check for app updates (compares against latest GitHub release)
-    startUpdateChecker();
+    if (!promptsSuppressed()) startUpdateChecker();
 
     // Start the per-param Auto playhead engine. Walks every layer's
     // paramAuto / shaderValueAuto each frame and writes resolved
@@ -947,7 +1592,14 @@
     midiManager.init().then(ok => {
       if (ok) console.log('[MIDI] Ready — devices detected');
     });
+    // Attach OSC bridge listeners + restore the saved enable/port state
+    // so the listener comes back on boot without a Settings visit.
     void oscStore.initialize();
+    // DMX input comes back only if it was switched on on this machine.
+    void dmxStore.initialize();
+    // Restores the server if it was enabled last session, and attaches the
+    // tool bridge either way so a later enable does not need a restart.
+    void mcpStore.initialize();
 
     // Rejoin the Ableton Link session if the user had it enabled last
     // run (no-op otherwise; lazy — doesn't load the native addon until
@@ -959,13 +1611,15 @@
     let autoConnectTimeout: ReturnType<typeof setTimeout> | null = null;
     let retryInterval: ReturnType<typeof setInterval> | null = null;
     if (!isMobile) {
-      const autoConnect = () => {
+      const autoConnect = async () => {
+        // The server refuses anyone without the pairing token, this window included.
+        await loadRemotePairing();
         if (!ws || ws.readyState === WebSocket.CLOSED) {
           connectToServer();
         }
       };
       // Initial attempt after 1s (give Rust server time to bind)
-      autoConnectTimeout = setTimeout(autoConnect, 1000);
+      autoConnectTimeout = setTimeout(() => void autoConnect(), 1000);
       // Retry every 5s if not connected
       retryInterval = setInterval(() => {
         if (wsServerReady) {
@@ -974,14 +1628,14 @@
             retryInterval = null;
           }
         } else {
-          autoConnect();
+          void autoConnect();
         }
       }, 5000);
     }
 
     // Listen for drawing mode changes from LinesPanel
-    const handleLinesModeChange = (e: CustomEvent<{ mode: 'none' | 'freehand' | 'pointClick' }>) => {
-      linesDrawingMode = e.detail.mode;
+    const handleLinesModeChange = (e: CustomEvent<{ mode: unknown }>) => {
+      linesDrawingMode = linesDrawingModeForTool(e.detail.mode);
       linesDrawingPoints = [];
       isLinesDrawing = false;
     };
@@ -1000,10 +1654,30 @@
 
     // --- Crash recovery: check for auto-saved project ---
     const savedAutosave = localStorage.getItem('ghostarcade-autosave');
-    if (savedAutosave) {
+    // Show mode opens its own project; the recovery offer would sit on top
+    // of the show forever. The autosave is left in place for the next
+    // normal launch.
+    if (savedAutosave && !promptsSuppressed()) {
       const ts = localStorage.getItem('ghostarcade-autosave-timestamp');
       recoveryTimestamp = ts ? new Date(parseInt(ts, 10)).toLocaleString() : 'unknown time';
       showRecoveryModal = true;
+    }
+
+    // --- Show mode: open the show project, the outputs, and start ---
+    if (isShowModeLaunch()) {
+      const config = launchConfig();
+      if (config) {
+        // Give the render core a moment to come up before driving outputs.
+        scheduleBridgeTimeout(() => {
+          void runShowModeLaunch(config, {
+            openProject: (path) => openProjectAtPath(path),
+            openOutputs: ensureOutputsFullscreen,
+            go: () => cueList.go(),
+            playTimeline: () => showTimeline.play(),
+            log: (message) => console.log('[ShowMode]', message),
+          });
+        }, 1500);
+      }
     }
 
     // --- Auto-save interval: every 30 seconds ---
@@ -1012,8 +1686,23 @@
       if (proj.layers.length > 0) {
         try {
           const jsonStr = project.exportProjectJSON();
-          localStorage.setItem('ghostarcade-autosave', jsonStr);
+          try {
+            localStorage.setItem('ghostarcade-autosave', jsonStr);
+          } catch {
+            // Over quota — almost always a Stage 3D scene with an inline
+            // model. Retry without it so recovery still gets the layers
+            // instead of autosave silently dying for the whole session.
+            const trimmed = JSON.parse(jsonStr);
+            delete trimmed?.project?.stage3d;
+            delete trimmed?.project?.projectionSim;
+            delete trimmed?.project?.showTimeline;
+            localStorage.setItem('ghostarcade-autosave', JSON.stringify(trimmed));
+            console.warn('[AutoSave] Project too large for autosave — 3D scene, Map Sim and show timeline excluded from recovery snapshot.');
+          }
           localStorage.setItem('ghostarcade-autosave-timestamp', Date.now().toString());
+          // Remember which file this snapshot belongs to so recovery can
+          // resolve sibling-relative asset paths the same way Open does.
+          localStorage.setItem('ghostarcade-autosave-path', currentProjectPath ?? '');
         } catch (e) {
           console.warn('[AutoSave] Failed to auto-save project:', e);
         }
@@ -1023,7 +1712,10 @@
     // Keyboard handlers for spacebar panning + undo/redo
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      const inInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
+      // A focused <select> takes letters as typeahead; without it here, typing
+      // to pick an option also fired single-key shortcuts (B blacks out the
+      // output, T cycles its test pattern).
+      const inInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable;
 
       // ESC exits lines drawing mode
       if (e.key === 'Escape' && linesDrawingMode !== 'none') {
@@ -1052,7 +1744,7 @@
       // Toggle MIDI Learn edit mode. Kept on Cmd/Ctrl+M so it is easy to
       // reach during setup without stealing normal single-key performance
       // shortcuts from VJ mode.
-      if ((e.metaKey || e.ctrlKey) && (e.key === 'm' || e.key === 'M') && !e.shiftKey && !e.altKey) {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'm' || e.key === 'M') && !e.shiftKey && !e.altKey && !e.repeat) {
         const currentMidi = get(midiStore);
         midiStore.setEditMode(!currentMidi.editMode);
         e.preventDefault();
@@ -1106,7 +1798,7 @@
       if (!inInput && !e.ctrlKey && !e.metaKey && !e.altKey) {
         const vjState = get(vjClipLauncher);
         const svState = get(synthVisionStore);
-        if (vjState.isOpen && !svState.active) {
+        if (vjState.isOpen && !svState.keyboardActive) {
           // Number keys 1-9 trigger columns 0-8, 0 triggers column 9
           const num = parseInt(e.key, 10);
           if (!isNaN(num) && e.key.length === 1 && e.key >= '0' && e.key <= '9') {
@@ -1138,6 +1830,20 @@
         e.preventDefault();
         handleRedo();
         return;
+      }
+
+      // File actions use the same guarded flows as the File menu.
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.repeat) {
+        const key = e.key.toLowerCase();
+        if (key === 'n' && !e.shiftKey && !inInput) {
+          e.preventDefault(); newComposition(); return;
+        }
+        if (key === 'o' && !e.shiftKey && !inInput) {
+          e.preventDefault(); loadComposition(); return;
+        }
+        if (key === 's' && e.shiftKey) {
+          e.preventDefault(); saveCompositionAs(); return;
+        }
       }
 
       // Save: Ctrl+S
@@ -1239,8 +1945,31 @@
         return;
       }
 
+      // ── Spacebar ──────────────────────────────────────────────────────
+      // Two jobs, and the show timeline wins when it is on screen.
+      //
+      // Historically Space was ONLY "arm canvas panning" (hold Space, drag
+      // with the left button). That is still what it does with the show
+      // tray closed. With the tray open it is the transport, because that is
+      // what Space means in every editor the user is comparing this to —
+      // and a panel that shows a playhead but does not respond to Space
+      // reads as broken.
+      //
+      // Conflicts checked before claiming it: VJ mode's own shortcuts are
+      // 1-9/0 and F1-F8 (above); SynthVision/Performer binds its keys on its
+      // own capture-phase document handler and is only live in VJ mode,
+      // where the show tray force-closes itself; nothing else in the app
+      // binds Space.
       if (e.code === 'Space' && !e.repeat) {
-        if (inInput) return;
+        if (inInput || e.ctrlKey || e.metaKey || e.altKey) return;
+        // SELECT is not covered by `inInput` and Space opens a native
+        // dropdown — never steal it from one.
+        if (target.tagName === 'SELECT') return;
+        if (showTransportOwnsSpace()) {
+          e.preventDefault();
+          showTimeline.togglePlay();
+          return;
+        }
         e.preventDefault();
         isSpacePressed = true;
       }
@@ -1282,12 +2011,8 @@
     const viewportResizeObserver = new ResizeObserver(() => {
       updateViewportSize();
     });
-    let canvasContainerObserver: MutationObserver | null = null;
     if (viewportEl) {
       viewportResizeObserver.observe(viewportEl);
-      // Also observe the canvas container directly for size changes
-      const canvasContainer = viewportEl.querySelector('.canvas-container');
-      if (canvasContainer) viewportResizeObserver.observe(canvasContainer);
       // Force immediate viewport size calculation to prevent stale 800x600 defaults
       updateViewportSize();
       // Schedule deferred updates as Electron window chrome and layout settle
@@ -1297,17 +2022,18 @@
       setTimeout(() => updateViewportSize(), 500);
       setTimeout(() => updateViewportSize(), 1000);
       setTimeout(() => updateViewportSize(), 2000);
-      // Watch for canvas container appearing (if it mounts later)
-      canvasContainerObserver = new MutationObserver(() => {
-        const cc = viewportEl.querySelector('.canvas-container');
-        if (cc) { viewportResizeObserver.observe(cc); updateViewportSize(); canvasContainerObserver?.disconnect(); canvasContainerObserver = null; }
-      });
-      canvasContainerObserver.observe(viewportEl, { childList: true, subtree: true });
     }
 
     return () => {
       appMounted = false;
+      stopShowControl();
+      showRuntimeHooks.ensureOutputs = null;
+      restorePrompts();
+      stopInterfaceScale();
+      setShowTransitionSink(null);
+      compositionTransition.clear();
       unsubscribeSettings();
+      offSimMoved?.();
       for (const id of bridgeTimeouts) clearTimeout(id);
       bridgeTimeouts.clear();
       window.removeEventListener('error', onError);
@@ -1337,7 +2063,6 @@
       document.removeEventListener('click', handleClickOutside);
       viewportEl?.removeEventListener('wheel', handleViewportWheel);
       viewportResizeObserver.disconnect();
-      canvasContainerObserver?.disconnect();
       stopSpoutScanner();
       if (ws) {
         try { ws.close(); } catch {}
@@ -1349,43 +2074,14 @@
     };
   });
 
-  // Track viewport size and actual canvas position for warp handles.
-  // The canvas-container is the element that holds the WebGL canvas and is aspect-ratio
-  // constrained + centered by flexbox. We measure it directly from the DOM so the overlay
-  // handles match exactly where the shader renders — no computed guesswork.
+  // Track only the viewport fallback size. Canvas.svelte publishes the actual
+  // canvas rectangle; App.svelte must never independently remeasure it.
   function updateViewportSize() {
     if (viewportEl) {
       viewportWidth = viewportEl.offsetWidth;
       viewportHeight = viewportEl.offsetHeight;
     }
-
-    // Measure overlay alignment using offsetWidth/offsetHeight (layout pixels, NOT
-    // affected by CSS transforms). This matches exactly how Canvas.svelte sizes its
-    // container via sizeContainer() — both use offsetWidth, so they always agree.
-    // NEVER use getBoundingClientRect() here — it goes through the CSS transform
-    // compositing layer and produces unreliable results in Electron's Chromium.
-    const containerEl = viewportEl?.querySelector('.canvas-container') as HTMLElement | null;
-    const wrapperEl = viewportEl?.querySelector('.canvas-wrapper') as HTMLElement | null;
-    if (containerEl && wrapperEl) {
-      const cw = containerEl.offsetWidth;
-      const ch = containerEl.offsetHeight;
-      const ww = wrapperEl.offsetWidth;
-      const wh = wrapperEl.offsetHeight;
-      if (cw > 0 && ch > 0) {
-        measuredCanvasWidth = cw;
-        measuredCanvasHeight = ch;
-        // Container is centered by flexbox within wrapper
-        measuredCanvasOffsetX = (ww - cw) / 2;
-        measuredCanvasOffsetY = (wh - ch) / 2;
-      }
-    }
   }
-
-  // Measured canvas dimensions from Canvas component (updated by updateViewportSize)
-  let measuredCanvasOffsetX: number | undefined;
-  let measuredCanvasOffsetY: number | undefined;
-  let measuredCanvasWidth: number | undefined;
-  let measuredCanvasHeight: number | undefined;
 
   /**
    * Bilinear interpolation: map a normalized (0-1) UV point through the layer's corner warp.
@@ -1435,18 +2131,37 @@
     return { x: Math.max(0, Math.min(1, u)), y: Math.max(0, Math.min(1, v)) };
   }
 
+  const QUAD_WARP_SHAPE_TYPES = new Set(['circle', 'ellipse', 'star']);
+
   function isLayerShapeWarpable(layer: Layer | null | undefined): boolean {
     const t = layer?.layerShape?.type;
-    return !!t && (t === 'circle' || t === 'triangle');
+    return !!t && (QUAD_WARP_SHAPE_TYPES.has(t) || t === 'triangle');
   }
 
-  function getDefaultLayerShapeControlPoints(type: 'circle' | 'triangle'): Point2D[] {
-    if (type === 'circle') {
+  function getDefaultLayerShapeControlPoints(type: string, shapeParams?: import('./lib/types').LayerShapeParams): Point2D[] {
+    if (type === 'polygon') {
+      // Handles ARE the polygon vertices (regular n-gon to start).
+      const sides = Math.max(3, Math.min(12, Math.round(Number(shapeParams?.sides ?? 6))));
+      const rotationRad = (Number(shapeParams?.rotation ?? 0) * Math.PI) / 180;
+      const scale = Number(shapeParams?.scale ?? 1) || 1;
+      const circumradius = (0.4 / Math.cos(Math.PI / sides)) * scale;
+      const vertices: Point2D[] = [];
+      for (let index = 0; index < sides; index++) {
+        const angle = ((2 * index + 1) * Math.PI) / sides + rotationRad;
+        vertices.push({
+          x: 0.5 + circumradius * Math.cos(angle),
+          y: 0.5 + circumradius * Math.sin(angle),
+        });
+      }
+      return vertices;
+    }
+    if (QUAD_WARP_SHAPE_TYPES.has(type)) {
+      // Corners at the layer bounds = identity warp until dragged.
       return [
-        { x: 0.2, y: 0.8 },
-        { x: 0.8, y: 0.8 },
-        { x: 0.2, y: 0.2 },
-        { x: 0.8, y: 0.2 },
+        { x: 0, y: 1 },
+        { x: 1, y: 1 },
+        { x: 0, y: 0 },
+        { x: 1, y: 0 },
         { x: 0.5, y: 0.5 },
       ];
     }
@@ -1459,10 +2174,23 @@
 
   function ensureActiveLayerShapeControlPoints() {
     if (!$selectedLayer || !$selectedLayer.layerShape || !isLayerShapeWarpable($selectedLayer)) return;
-    const existing = $selectedLayer.layerShape.controlPoints;
-    if (existing && existing.length > 0) return;
-    const shapeType = $selectedLayer.layerShape.type as 'circle' | 'triangle';
-    project.initShapeControlPoints($selectedLayer.id, getDefaultLayerShapeControlPoints(shapeType));
+    const layerShape = $selectedLayer.layerShape;
+    const existing = layerShape.controlPoints;
+    const expected = getDefaultLayerShapeControlPoints(layerShape.type, layerShape.params);
+    // Re-seed when absent, or when a polygon's side count changed (topology
+    // change resets the warp, same rule as custom shapes).
+    if (existing && existing.length > 0 && existing.length === expected.length) return;
+    project.initShapeControlPoints($selectedLayer.id, expected);
+  }
+
+  $: if (
+    shapeWarpModeEnabled &&
+    $selectedLayer?.layerShape?.type === 'polygon' &&
+    ($selectedLayer.layerShape.controlPoints?.length ?? 0) > 0 &&
+    ($selectedLayer.layerShape.controlPoints?.length ?? 0) !==
+      Math.max(3, Math.min(12, Math.round(Number($selectedLayer.layerShape.params.sides ?? 6))))
+  ) {
+    ensureActiveLayerShapeControlPoints();
   }
 
   function startShapeControlPointDrag(index: number, e: MouseEvent) {
@@ -1623,14 +2351,25 @@
   const VIEWPORT_SELECTION_INTERACTIVE_SELECTOR = [
     '.viewport-info',
     '.warp-handles-offset .handle',
+    '.warp-handles-offset .tangent-handle',
+    '.warp-handles-offset .mask-place-layer',
     '.custom-shape-handles',
+    '.chase-badges-done',
     '.layer-shape-warp-overlay',
     '.shape-interaction-overlay',
     '.mask-overlay',
     '.mask-anchor',
     '.mask-handle',
     '.mask-pen-toolbar',
+    '.paint-mask-overlay',
+    '.light-painting-overlay',
     '.lp-draw-overlay',
+    '[data-editor-pointer-owner="light-painting"]',
+    '.native-engine-pending',
+    '.native-engine-pending__actions',
+    // Map Sim calibration pad (the crosshair the operator drags onto a
+    // physical feature) when Map Sim runs inside the editor window.
+    '.psim-calibration-pad',
   ].join(', ');
 
   function viewportClientToCanvasCoords(clientX: number, clientY: number): Point2D {
@@ -1709,6 +2448,7 @@
     // overlays; because the marquee begins on pointerdown (which those overlays
     // don't stop), without this guard it hijacks those clicks.
     if ($selectedLayer?.mask?.enabled && $maskEditingLayerId === $selectedLayer.id) return false;
+    if ($selectedLayer && $paintMaskLayerId === $selectedLayer.id) return false;
     if ($selectedLightPaintingLayer && (lpDrawingEnabled || lpIsPathEditMode)) return false;
     const target = e.target instanceof Element ? e.target : null;
     if (
@@ -1894,8 +2634,20 @@
   let wsServerReady = false;   // Desktop is connected to WS server (can show QR)
   let mobileConnected = false; // At least one mobile client is connected
   let clientCount = 0;
-  let wsPort = 9001;
-  let httpPort = 9002; // HTTP info server port
+  let wsPort = DEFAULT_REMOTE_WS_PORT;
+  let httpPort = DEFAULT_REMOTE_HTTP_PORT; // HTTP info server port
+  // Every device on the remote's servers presents this, the desktop included.
+  let pairingToken = '';
+
+  // Token and ports for the LAN remote, from main. Outside the desktop app
+  // there are none and the defaults stand.
+  async function loadRemotePairing() {
+    const info = await getRemotePairingInfo();
+    if (!info) return;
+    pairingToken = info.token;
+    wsPort = info.wsPort;
+    httpPort = info.httpPort;
+  }
   const LP_LIVE_PREVIEW_SYNC_INTERVAL_MS = 50;
   const LP_LIVE_PREVIEW_MAX_POINTS = 300;
 
@@ -2743,7 +3495,7 @@
 
   function connectToServer() {
     connectionError = '';
-    const url = `ws://127.0.0.1:${wsPort}`;
+    const url = withPairingToken(`ws://127.0.0.1:${wsPort}`, pairingToken);
 
     if (ws) {
       ws.onopen = null;
@@ -3822,7 +4574,7 @@
   // Output window state
   let outputMode: 'embedded' | 'window' | 'fullscreen' = 'embedded';
 
-  function openOutputWindow() {
+  async function openOutputWindow() {
     outputMode = 'window';
     // Already attached (e.g. after an editor reload) — don't re-open the
     // 'ga-output' window; that reloads it and re-handshakes. Just resync
@@ -3833,9 +4585,10 @@
       return;
     }
     if (outputWindow) {
-      outputWindow.openPopup();
-      outputIsOpen = true;
-      settings.setOutputWindowOpen(true);
+      const opened = await outputWindow.openPopup();
+      outputIsOpen = !!opened;
+      outputMode = opened ? 'window' : 'embedded';
+      settings.setOutputWindowOpen(!!opened);
     }
   }
 
@@ -3863,6 +4616,20 @@
   }
 
   async function toggleFullscreen() {
+    if (isDesktopApp && NATIVE_ENGINE_ONLY) {
+      if (outputIsOpen && outputMode === 'fullscreen' && outputWindow) {
+        closeOutputWindow();
+        return;
+      }
+      if (outputWindow) {
+        const opened = await outputWindow.openFullscreenExternal();
+        outputIsOpen = !!opened;
+        outputMode = opened ? 'fullscreen' : 'embedded';
+        settings.setOutputWindowOpen(!!opened);
+      }
+      return;
+    }
+
     const status = outputWindow ? await outputWindow.getStatus() : null;
     if (outputMode === 'fullscreen' || (status?.exists && status.isExternal)) {
       // Close the dedicated projector/external fullscreen output.
@@ -3931,7 +4698,7 @@
     // Method 1: Ask the WebSocket server for IPs (most reliable)
     // The server uses Node's os.networkInterfaces() which is accurate
     try {
-      const response = await fetch(`http://localhost:${httpPort}/info`, {
+      const response = await localServerFetch('/info', {
         signal: AbortSignal.timeout(2000)
       });
       if (response.ok) {
@@ -3999,16 +4766,43 @@
 
   function getMobileUrl(ip?: string) {
     const host = ip || selectedIP || localIPs[0] || window.location.hostname;
-    // In production: serve from the HTTP server on port 9002 (accessible over LAN)
-    // In dev: use Vite dev server on port 1420
-    const isDev = window.location.protocol !== 'file:' && window.location.port === '1420';
-    const port = isDev ? 1420 : 9002;
-    return `http://${host}:${port}/#/mobile`;
+    // In production: serve from the remote's HTTP server (accessible over LAN)
+    // In dev: use the Vite dev server this window was loaded from
+    const isDev = window.location.protocol !== 'file:' && !!window.location.port;
+    const port = isDev ? window.location.port : httpPort;
+    return mobileConnectionUrl(host, port, pairingToken, wsPort);
   }
 
   function getWebSocketUrl(ip?: string) {
     const host = ip || selectedIP || localIPs[0] || window.location.hostname;
-    return `ws://${host}:9001`;
+    if (!host) return '';
+    const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+    return `ws://${authority}:${wsPort}`;
+  }
+
+  // Reset asks first: it disconnects every phone, mid-set if that is when
+  // someone presses it.
+  let confirmingPairingReset = false;
+  let pairingResetBusy = false;
+
+  async function confirmPairingReset() {
+    pairingResetBusy = true;
+    try {
+      const info = await resetRemotePairing();
+      if (info) {
+        pairingToken = info.token;
+        // The server dropped every connection made with the old token, this
+        // window's included, so come back with the new one.
+        connectToServer();
+        await generateQRCode();
+      }
+    } catch (err) {
+      console.error('[Remote] Pairing reset failed:', err);
+      connectionError = 'Pairing could not be reset. The existing code is still active.';
+    } finally {
+      pairingResetBusy = false;
+      confirmingPairingReset = false;
+    }
   }
 
   // Generate QR code for the mobile URL
@@ -4017,6 +4811,8 @@
       selectedIP = localIPs[0];
     }
     const url = getMobileUrl(selectedIP);
+    qrCodeDataUrl = '';
+    if (!url) return;
     try {
       const QRCode = (await import('qrcode')).default;
       qrCodeDataUrl = await QRCode.toDataURL(url, {
@@ -4081,7 +4877,7 @@
     // Walk the project tree and clean up any runtime URLs we can't resolve
     // on reload. We do NOT copy any files. The user's folders are theirs;
     // the .gha just remembers paths.
-    const BLOB_FIELDS = ['src', 'modelData', 'filePath', 'texturePath', 'sourceUrl', 'url', 'thumbnail'] as const;
+    const BLOB_FIELDS = ['src', 'modelData', 'filePath', 'texturePath', 'sourceUrl', 'url', 'thumbnail', 'assetUrl'] as const;
     let kept = 0;        // assetRef-backed (originalPath, dataUrl, or url)
     let cleared = 0;     // blob: with no assetRef — runtime-only, can't recover
 
@@ -4111,7 +4907,8 @@
           (field === 'texturePath' && (node._textureAssetRef?.projectPath || node._textureAssetRef?.originalPath || node._textureAssetRef?.dataUrl)) ||
           (field === 'sourceUrl' && (node._sourceAssetRef?.projectPath || node._sourceAssetRef?.originalPath || node._sourceAssetRef?.dataUrl)) ||
           (field === 'url' && (node.assetRef?.projectPath || node.assetRef?.originalPath || node.assetRef?.dataUrl || node.assetRef?.url || node._assetRef?.projectPath || node._assetRef?.originalPath || node._assetRef?.dataUrl || node._assetRef?.url)) ||
-          (field === 'thumbnail' && (node._assetRef?.projectPath || node._assetRef?.originalPath || node._assetRef?.dataUrl || node._assetRef?.url));
+          (field === 'thumbnail' && (node._assetRef?.projectPath || node._assetRef?.originalPath || node._assetRef?.dataUrl || node._assetRef?.url)) ||
+          (field === 'assetUrl' && (node.assetRef?.projectPath || node.assetRef?.originalPath || node.assetRef?.dataUrl || node.assetRef?.url));
         if (hasRef) {
           // The reload resolver will rebuild the URL from assetRef, so the
           // dead blob in the runtime field is harmless — but blank it out
@@ -4153,7 +4950,23 @@
   // "saved and then immediately asked to save again, then dialog stopped
   // coming up". The mutex is the fix — second invocation no-ops while the
   // first is still in flight.
+  // The project is named after its file: nothing else names it, and the
+  // status bar showed "Untitled Project" for every saved show. Save As
+  // takes the chosen file's name; opening a file saved before that (still
+  // "Untitled Project") takes the file's name too.
+  const DEFAULT_PROJECT_NAME = 'Untitled Project';
+  function projectNameFromFile(fileName: string): string {
+    return fileName.replace(/^.*[\\/]/, '').replace(/\.gha$/i, '').trim();
+  }
+  function nameProjectAfterFile(fileName: string, onlyIfUntitled = false): void {
+    const name = projectNameFromFile(fileName);
+    const current = get(project).name;
+    if (!name || name === current || (onlyIfUntitled && current && current !== DEFAULT_PROJECT_NAME)) return;
+    project.setProjectName(name);
+  }
+
   async function saveComposition() {
+    await (await import('./lib/stores/settings')).flushSettings();
     if (saveInFlight) {
       console.log('[Save] suppressed — save already in flight');
       return;
@@ -4247,7 +5060,8 @@
   // The actual Save As work. Always shows a file picker. Caller owns the
   // mutex — split out so saveComposition can re-use it without lock thrash.
   async function saveCompositionAsInner() {
-    const jsonStr = await project.exportProjectJSONForSave();
+    await (await import('./lib/stores/settings')).flushSettings();
+    let jsonStr = await project.exportProjectJSONForSave();
     const suggestedName = `${$project.name.replace(/[^a-z0-9]/gi, '_')}_${new Date().toISOString().split('T')[0]}.gha`;
 
     // In Electron: use the native save dialog so we get a real filesystem
@@ -4265,6 +5079,8 @@
           });
           if (dialogResult?.canceled || !dialogResult?.filePath) return;
           const filePath: string = dialogResult.filePath;
+          nameProjectAfterFile(filePath);
+          jsonStr = await project.exportProjectJSONForSave();
           // Derive project dir from the chosen file path
           const sep = filePath.includes('\\') ? '\\' : '/';
           const projectDir = filePath.substring(0, filePath.lastIndexOf(sep) + 1);
@@ -4306,6 +5122,8 @@
             },
           ],
         });
+        nameProjectAfterFile(handle.name);
+        jsonStr = await project.exportProjectJSONForSave();
         const writable = await handle.createWritable();
         await writable.write(jsonStr);
         await writable.close();
@@ -4386,6 +5204,7 @@
           // Track the loaded path so Save (Ctrl+S) overwrites the same .gha
           // file instead of triggering a Save As dialog.
           currentProjectPath = electronPath;
+          nameProjectAfterFile(file.name, true);
           recentFiles.add(file.name, electronPath);
           markAsSaved();
         } else {
@@ -4423,6 +5242,21 @@
     macros.reset();
     // Same for snapshots — fresh project, empty 16-slot bank.
     snapshots.reset();
+    // DMX input bindings belong to the project; the listener stays as set.
+    dmxStore.reset();
+    // And show control: a new project must not inherit the last one's cue
+    // list, timecode chase, schedule or projectors (a schedule left armed
+    // would start firing cues into an empty project).
+    hydrateShowControl(null);
+    // Output settings are global rather than per-project, so without this a
+    // new project inherits the last one's screens (the project saves
+    // outputSlices and restores them, but a new project has none to overwrite
+    // them with) along with any latched dome, warp or blackout.
+    //
+    // A saved default setup takes priority: a permanent install's rig belongs
+    // to the room, not to whichever project happened to be open, and should
+    // not have to be rebuilt every time someone starts fresh.
+    settings.resetOutputStageForNewProject(screenSetups.defaultSnapshot());
     currentFileHandle = null; // Clear file handle for new project
     // Also clear the Electron path so Save doesn't accidentally overwrite
     // the previously-loaded .gha with a fresh empty project.
@@ -4438,26 +5272,44 @@
   // =========================================================================
   // OPEN RECENT FILE
   // =========================================================================
+  /** Open a .gha from disk by path (Electron). Throws when it cannot be
+   *  read; resolves false when it is not a valid project. Shared by Open
+   *  Recent and the show-mode startup. */
+  async function openProjectAtPath(path: string, name = path.split(/[\\/]/).pop() || path): Promise<boolean> {
+    const { invoke } = await import('$lib/bridge');
+    const result = await invoke<{ content: string; dir: string }>('read_project_file', { path });
+    try { synthVisionStore.reset(); } catch {}
+    try { sessionClipCache.clear(); } catch {}
+    try { isfShaderCache.clear(); } catch {}
+    try { modulationStore.clearAll(); } catch {}
+    const success = project.importProjectJSON(result.content, result.dir);
+    if (success) {
+      console.log('Project loaded:', path);
+      currentFileHandle = null;
+      // Track the loaded path so Save updates this file in place.
+      currentProjectPath = path;
+      nameProjectAfterFile(path, true);
+      recentFiles.add(name, path); // Bump to top
+      markAsSaved();
+    }
+    return success;
+  }
+
+  /** Open the outputs fullscreen unless they already are (show mode and
+   *  scheduled starts). */
+  async function ensureOutputsFullscreen(): Promise<void> {
+    if (outputIsOpen && outputMode === 'fullscreen') return;
+    await toggleFullscreen();
+  }
+
   async function openRecentFile(entry: { name: string; path: string | null; timestamp: number }) {
     fileMenuOpen = false;
 
     // Electron: read the file directly from disk via IPC
     if (isDesktopApp && entry.path) {
       try {
-        const { invoke } = await import('$lib/bridge');
-        const result = await invoke<{ content: string; dir: string }>('read_project_file', { path: entry.path });
-        try { synthVisionStore.reset(); } catch {}
-        try { sessionClipCache.clear(); } catch {}
-        try { isfShaderCache.clear(); } catch {}
-        try { modulationStore.clearAll(); } catch {}
-        const success = project.importProjectJSON(result.content, result.dir);
+        const success = await openProjectAtPath(entry.path, entry.name);
         if (success) {
-          console.log('Project loaded from recent:', entry.path);
-          currentFileHandle = null;
-          // Track the loaded path so Save updates this file in place.
-          currentProjectPath = entry.path;
-          recentFiles.add(entry.name, entry.path); // Bump to top
-          markAsSaved();
           return;
         }
         alert('Failed to load project. The file may be corrupted or invalid.');
@@ -4565,31 +5417,69 @@
   // Initialize history with first project state
   let historyInitialized = false;
   $: if ($project && !historyInitialized) {
-    history.init($project);
+    history.init($project, keyframeTimeline.exportAll(), settings.captureOutputHistory());
     historyInitialized = true;
   }
 
-  // Record a snapshot — call this AFTER discrete user actions (warp end, layer add/delete, etc.)
+  // Record a snapshot — call this AFTER discrete user actions (warp end, layer
+  // add/delete, keyframe edits, screen and mask edits, etc.). Keyframe
+  // timelines and the output stage (Screens, Master Warp) live in their own
+  // stores rather than inside Project, so they are captured alongside it
+  // here; this is the only place that can see all three. Nothing records on
+  // a store subscription, so live automation never lands in the history.
   function recordHistory() {
-    history.record(get(project));
+    history.record(get(project), keyframeTimeline.exportAll(), settings.captureOutputHistory());
+  }
+
+  /** Restore a snapshot into every store it spans. */
+  function applyHistorySnapshot(snapshot: HistorySnapshot) {
+    project.set(snapshot.project);
+    // beginHistoryRestore() stops importAll() from recording the state it is
+    // restoring as a fresh undo entry (which would poison the redo stack).
+    beginHistoryRestore();
+    try {
+      keyframeTimeline.importAll(Array.isArray(snapshot.keyframes) ? snapshot.keyframes as any : []);
+      // Only what this step changed goes back into the output stage.
+      const outputPatch = outputHistoryPatch(snapshot.output, snapshot.leavingOutput);
+      if (outputPatch) {
+        settings.applyOutputStage(outputPatch);
+        // An undone screen or mask may have been the selected one.
+        const slices = get(settings).output.slices ?? [];
+        const screenId = get(selectedScreenId);
+        const screen = slices.find((s) => s.id === screenId);
+        if (screenId && !screen) selectedScreenId.set(null);
+        const maskId = get(selectedScreenMaskId);
+        if (maskId && !screen?.masks?.some((m) => m.id === maskId)) {
+          selectedScreenMaskId.set(null);
+          screenMaskPlacing.set(false);
+        }
+      }
+    } finally {
+      endHistoryRestore();
+    }
   }
 
   function handleUndo() {
     fileMenuOpen = false;
+    // Commit any debounced-but-not-yet-recorded slider or keyframe edit first,
+    // so it becomes its own undo step instead of being silently lost or merged
+    // into whatever the undo below jumps back to.
+    flushPendingHistorySnapshot();
     history.suppress();
     const previousState = history.undo(get(project));
     if (previousState) {
-      project.set(previousState);
+      applyHistorySnapshot(previousState);
     }
     history.unsuppress();
   }
 
   function handleRedo() {
     fileMenuOpen = false;
+    flushPendingHistorySnapshot();
     history.suppress();
     const nextState = history.redo(get(project));
     if (nextState) {
-      project.set(nextState);
+      applyHistorySnapshot(nextState);
     }
     history.unsuppress();
   }
@@ -4948,6 +5838,8 @@
   function handleMaskMouseDown(e: MouseEvent) {
     if (e.button !== 0) return;
     if (!$selectedLayer?.mask?.enabled) return;
+    e.stopPropagation();
+    e.preventDefault();
     // Ignore clicks that originate on anchor / handle dots
     const target = e.target as Element | null;
     if (target && target.closest('.mask-anchor, .mask-handle, .mask-pen-toolbar')) return;
@@ -4957,7 +5849,8 @@
     // on closed shapes; empty-canvas clicks while in add mode and not over
     // any edge are intentionally a no-op so the user doesn't accidentally
     // start a new shape.
-    if (maskPenMode === 'add') {
+    const penMode = activeMaskPenMode();
+    if (penMode === 'add') {
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const svgX = e.clientX - rect.left;
       const svgY = e.clientY - rect.top;
@@ -4970,7 +5863,7 @@
     }
     // Remove mode: empty-canvas clicks are no-op; user must click an
     // anchor (handled by handleMaskAnchorMouseDown which checks the mode).
-    if (maskPenMode === 'remove') return;
+    if (penMode === 'remove') return;
 
     const norm = mouseToCanvasCoords(e);
     const clampedAnchor: Point2D = {
@@ -5080,7 +5973,7 @@
     // Remove mode: left-click on anchor deletes it. Match the
     // CustomShapeHandles behaviour where the toolbar shifts what a
     // click does without forcing the user to right-click.
-    if (maskPenMode === 'remove' && mask) {
+    if (activeMaskPenMode() === 'remove' && mask) {
       const shape = mask.shapes[shapeIndex];
       // Don't drop a closed shape below 3 anchors — that's the minimum
       // for a valid polygon. The store would otherwise nuke the whole
@@ -5106,7 +5999,7 @@
 
   // Track cursor over the mask overlay for add-mode hover feedback.
   function handleMaskOverlayMouseMove(e: MouseEvent) {
-    if (maskPenMode !== 'add' || !$selectedLayer?.mask?.enabled) {
+    if (activeMaskPenMode() !== 'add' || !$selectedLayer?.mask?.enabled) {
       if (maskHoverEdgeIdx !== -1) {
         maskHoverEdgeIdx = -1;
         maskHoverShapeIdx = -1;
@@ -5351,7 +6244,10 @@
 {#if isMobile}
   <MobileApp />
 {:else}
-  <div class="app">
+  <div data-help-page="interface" class="app" class:native-primary-presenter={nativePreviewGlassActive}>
+    {#if isDesktopApp && isMac}
+      <div class="mac-window-titlebar" aria-hidden="true"></div>
+    {/if}
     <!-- Integrated/software GPU warning banner. Surfaces ONCE per
          install when the detected renderer is integrated/software.
          Routes the user to Settings → Performance. -->
@@ -5381,19 +6277,36 @@
     {/if}
 
     <!-- Header / Toolbar -->
-    <header class="toolbar">
+    <header
+      class="toolbar"
+      use:fitToolbar
+      class:vj-native-hidden={vjNativeUnderlayActive}
+      class:stage-edit-toolbar-hidden={$vjStageEdit}
+      class:frameless-drag={isDesktopApp && !isMac}
+      onmousedown={(event) => {
+        // Caption drag: empty toolbar space moves the window. The main process
+        // follows the OS cursor while the button is held.
+        if (!isDesktopApp || isMac || event.button !== 0) return;
+        if (isToolbarControl(event.target as HTMLElement | null)) return;
+        void invoke('win_drag_start');
+        const end = () => {
+          void invoke('win_drag_end');
+          window.removeEventListener('mouseup', end, true);
+          window.removeEventListener('blur', end, true);
+        };
+        window.addEventListener('mouseup', end, true);
+        window.addEventListener('blur', end, true);
+      }}
+      ondblclick={(event) => {
+        // Caption double-click: maximize/restore, like a real title bar.
+        if (!isDesktopApp || isMac) return;
+        if (isToolbarControl(event.target as HTMLElement | null)) return;
+        void invoke('win_drag_end');
+        void invoke('win_maximize_toggle').then((v) => { winMaximized = !!v; });
+      }}
+    >
       <div class="toolbar-left">
-        <img src="{import.meta.env.BASE_URL}logo.png" alt="Ghost Arcade" class="header-logo" />
-        {#if gpuInfo}
-          <span
-            class="gpu-indicator"
-            class:integrated={gpuInfo.isIntegrated}
-            title="{gpuInfo.renderer} ({gpuInfo.vendor}){gpuInfo.isIntegrated ? ' — WARNING: Integrated GPU. Set this app to High Performance in Windows Graphics Settings.' : ''}"
-          >
-            <span class="gpu-dot"></span>
-            GPU
-          </span>
-        {/if}
+        <img src="{import.meta.env.BASE_URL}icon-new.png" alt="Ghost Arcade" class="header-logo" />
         <!-- Windows-style File Menu -->
         <div class="file-menu-container">
           <button
@@ -5498,6 +6411,11 @@
                 </span>
                 <span class="menu-label">Video Converter...</span>
               </button>
+              {#if isDesktopApp}
+                <button class="menu-item" onclick={() => { fileMenuOpen = false; showProjectMedia = true; }}>
+                  <span class="menu-icon">▣</span><span class="menu-label">Project Media...</span>
+                </button>
+              {/if}
               <div class="menu-separator"></div>
               <button class="menu-item" onclick={importPresetsFromFile}>
                 <span class="menu-icon">
@@ -5540,6 +6458,20 @@
                 <span class="menu-label">Redo</span>
                 <span class="menu-shortcut">Ctrl+Y</span>
               </button>
+              {#if isDesktopApp && !isMac}
+                <div class="menu-separator"></div>
+                <button class="menu-item" onclick={() => { fileMenuOpen = false; void invoke('win_minimize'); }}>
+                  <span class="menu-icon"></span><span class="menu-label">Minimize</span>
+                </button>
+                <button class="menu-item" onclick={async () => { fileMenuOpen = false; winMaximized = await invoke('win_maximize_toggle'); }}>
+                  <span class="menu-icon"></span><span class="menu-label">Maximize / Restore</span>
+                </button>
+                <div class="menu-separator"></div>
+                <button class="menu-item" onclick={() => { fileMenuOpen = false; void invoke('win_close'); }}>
+                  <span class="menu-icon"></span><span class="menu-label">Exit Ghost Arcade</span>
+                  <span class="menu-shortcut">Alt+F4</span>
+                </button>
+              {/if}
             </div>
           {/if}
         </div>
@@ -5560,13 +6492,16 @@
           class="output-btn"
           class:active={outputMode === 'window'}
           onclick={outputIsOpen ? closeOutputWindow : openOutputWindow}
+          title={outputIsOpen ? 'Close Output Window' : 'Open Output Window'}
         >
-          {outputIsOpen ? 'Close Output' : 'Output Window'}
+          <span class="tb-long">{outputIsOpen ? 'Close Output' : 'Output Window'}</span>
+          <span class="tb-short">{outputIsOpen ? 'Close Output' : 'Output'}</span>
         </button>
         <button
           class="output-btn"
           class:active={outputMode === 'fullscreen'}
           onclick={toggleFullscreen}
+          oncontextmenu={(e) => openDisplayMenu(e, 'liveOutput')}
         >
           Fullscreen
         </button>
@@ -5574,7 +6509,8 @@
           class="output-btn sim-launch-btn stage-sim-btn"
           class:active={showStage3D || stage3DWindowOpen}
           onclick={openStage3D}
-          title="Open Stage Simulator"
+          oncontextmenu={(e) => openDisplayMenu(e, 'stageSim')}
+          title="Open Stage Simulator — right-click to choose its display"
           aria-label="Open Stage Simulator"
         >
           <svg class="sim-launch-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -5583,13 +6519,14 @@
             <path d="M7.2 8.6 12 11.5l4.8-2.9" />
             <path d="M12 5.5v6" />
           </svg>
-          Stage Sim
+          <span class="tb-label">Stage Sim</span>
         </button>
         <button
           class="output-btn sim-launch-btn map-sim-btn"
           class:active={$workspace === 'projection-sim' || projectionSimWindowOpen}
           onclick={openProjectionSim}
-          title="Open Projection Mapping Simulator"
+          oncontextmenu={(e) => openDisplayMenu(e, 'mapSim')}
+          title="Open Projection Mapping Simulator — right-click to choose its display"
           aria-label="Open Projection Mapping Simulator"
         >
           <svg class="sim-launch-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -5599,9 +6536,46 @@
             <path d="M5.5 15.8v2.3" />
             <path d="M4.4 18.1h3.4" />
           </svg>
-          Map Sim
+          <span class="tb-label">Map Sim</span>
         </button>
       </div>
+
+      {#if displayMenu}
+        {@const _menu = displayMenu}
+        {@const _assigned = $settings.output.displayAssignments[_menu.surface]}
+        <!-- Display picker. Right-click lives on the button that launches the
+             surface, so the assignment is set where you look for it rather than
+             buried in Settings. -->
+        <div class="display-menu-backdrop" onclick={() => (displayMenu = null)} oncontextmenu={(e) => { e.preventDefault(); displayMenu = null; }} role="presentation"></div>
+        <div class="display-menu" style="left:{_menu.x}px; top:{_menu.y}px;" role="menu">
+          <div class="display-menu-title">{SURFACE_LABELS[_menu.surface]} — display</div>
+          <button class="display-menu-item" class:checked={_assigned == null}
+            onclick={() => chooseSurfaceTarget(_menu.surface, null)}>
+            <span class="display-menu-check">{_assigned == null ? '✓' : ''}</span>
+            Auto
+          </button>
+          {#each cachedDisplays as display}
+            <button class="display-menu-item" class:checked={_assigned === display.id}
+              onclick={() => chooseSurfaceTarget(_menu.surface, display.id)}>
+              <span class="display-menu-check">{_assigned === display.id ? '✓' : ''}</span>
+              {display.label}{display.isPrimary ? ' (main)' : ''}
+              <span class="display-menu-dim">{display.width}×{display.height}</span>
+            </button>
+          {/each}
+          {#if _menu.surface !== 'liveOutput'}
+            <div class="display-menu-sep"></div>
+            <button class="display-menu-item" class:checked={_assigned === 'windowed'}
+              onclick={() => chooseSurfaceTarget(_menu.surface, 'windowed')}>
+              <span class="display-menu-check">{_assigned === 'windowed' ? '✓' : ''}</span>
+              Open in window
+            </button>
+            <div class="display-menu-hint">
+              A floating window never gives up a screen, so this can stay open
+              while the show holds the projector.
+            </div>
+          {/if}
+        </div>
+      {/if}
 
       <div class="toolbar-right">
         <!-- Blackout Button -->
@@ -5668,11 +6642,19 @@
              mic toggle, device-picker chevron + popover, and system-audio
              toggle. State is wired through the global audioStore so toggling
              in one mode is reflected in every other mode. -->
-        <AudioInputPicker />
+        <AudioInputPicker showWaveform={false} />
 
-        <!-- TAP tempo + BPM readout. Auto-hides when audio is off so the
-             top bar stays clean for users who never use audio reactivity. -->
-        <BpmTapWidget />
+        <!-- Master output level for opt-in clip audio. Self-hides until at
+             least one clip has audio playback turned on, so a project that
+             never uses the feature sees no change here. -->
+        <ClipAudioMasterControl />
+
+        <!-- Live FFT meter + beat/kick/snare dots + TAP tempo + BPM, with the
+             audio-input tweaks popover (sensitivity, smoothing, per-band gain)
+             behind the meter. Same strip VJ mode uses, so tuning audio
+             reactivity doesn't require switching modes. Self-hides when no
+             audio is active. -->
+        <AudioMeterPanel />
 
         <!-- Screenshot Button -->
         <button class="screenshot-btn" onclick={takeScreenshot} title="Take Screenshot">
@@ -5693,9 +6675,12 @@
             Stop Rec
           </button>
         {:else}
-          <button class="rec-btn" onclick={startRecording} title="Record Output (with audio if active)">
-            ● REC
+          <button class="rec-btn" onclick={startRecording} aria-label="Record output" title="Record Output (with audio if active)">
+            ●
           </button>
+        {/if}
+        {#if nativePrimaryRenderer}
+          <RecordingSourcePicker disabled={isRecording} />
         {/if}
 
         <!-- VJ Mixer Button -->
@@ -5710,13 +6695,11 @@
           VJ
         </button>
 
-        <!-- Stage Designer Button — opens the SVG-import / polygon-slice
-             projection-mapping workspace. Mutually exclusive with VJ
-             mode via the activeWorkspace flag in the workspace store. -->
+        <!-- Mapping and VJ open the same live stage screen editor. -->
         <button
           class="stage-btn stage-edit-btn"
-          class:active={$workspace === 'stage'}
-          onclick={() => workspace.openStage()}
+          class:active={$vjStageEdit}
+          onclick={() => vjStageEdit.set(true)}
           title="Open Stage Editor"
           aria-label="Open Stage Editor"
         >
@@ -5726,7 +6709,7 @@
             <path d="M13.5 19.5h6" />
             <path d="M16.5 16.5v6" />
           </svg>
-          Stage
+          <span class="tb-label">Stage</span>
         </button>
 
         <!-- Settings Button -->
@@ -5742,9 +6725,12 @@
             class="connection-btn"
             class:connected={mobileConnected}
             class:error={!!connectionError}
+            title={mobileConnected ? `Mobile: ${clientCount - 1} connected` : 'Connect Mobile'}
             onclick={async () => {
               showMobileInfo = !showMobileInfo;
+              confirmingPairingReset = false;
               if (showMobileInfo) {
+                await loadRemotePairing();
                 await fetchLocalIPs();
                 await generateQRCode();
                 if (!wsServerReady && !ws) {
@@ -5755,9 +6741,11 @@
           >
             <span class="dot"></span>
             {#if mobileConnected}
-              Mobile: {clientCount - 1} connected
+              <span class="tb-long">Mobile: {clientCount - 1} connected</span>
+              <span class="tb-short">Mobile {clientCount - 1}</span>
             {:else}
-              Connect Mobile
+              <span class="tb-long">Connect Mobile</span>
+              <span class="tb-short">Mobile</span>
             {/if}
           </button>
 
@@ -5784,6 +6772,30 @@
                 <div class="qr-container">
                   <img src={qrCodeDataUrl} alt="QR Code for mobile connection" class="qr-code" />
                   <p class="qr-hint">Scan with your phone/iPad camera</p>
+                  {#if pairingToken}
+                    <!-- The QR link carries this already; it is shown for devices
+                         that cannot scan, such as the native app. -->
+                    <div class="pairing-code">
+                      <span class="pairing-code-label">Pairing code</span>
+                      <code class="pairing-code-value">{formatPairingCode(pairingToken)}</code>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+
+              {#if pairingToken}
+                <div class="pairing-reset">
+                  {#if confirmingPairingReset}
+                    <p>Every paired phone and tablet disconnects and has to scan the new code to connect again.</p>
+                    <div class="pairing-reset-actions">
+                      <button onclick={() => (confirmingPairingReset = false)} disabled={pairingResetBusy}>Cancel</button>
+                      <button class="pairing-reset-confirm" onclick={confirmPairingReset} disabled={pairingResetBusy}>
+                        Reset pairing
+                      </button>
+                    </div>
+                  {:else}
+                    <button onclick={() => (confirmingPairingReset = true)}>Reset pairing...</button>
+                  {/if}
                 </div>
               {/if}
 
@@ -5803,11 +6815,11 @@
               <div class="connection-details">
                 <div class="detail-row">
                   <span class="detail-label">URL:</span>
-                  <code class="detail-value">{getMobileUrl()}</code>
+                  <code class="detail-value">{getMobileUrl() || 'No network address available. Connect to Wi-Fi or Ethernet and reopen Connect Mobile.'}</code>
                 </div>
                 <div class="detail-row">
                   <span class="detail-label">WebSocket:</span>
-                  <code class="detail-value">{getWebSocketUrl()}</code>
+                  <code class="detail-value">{getWebSocketUrl() || 'Waiting for network address'}</code>
                 </div>
               </div>
 
@@ -5816,7 +6828,7 @@
                 <ol>
                   <li>Connect iPad to same WiFi/hotspot</li>
                   <li>Scan QR code or enter URL manually</li>
-                  <li>Enter WebSocket URL when prompted</li>
+                  <li>If asked, enter the WebSocket URL and pairing code</li>
                   <li>Tap Connect - drag corners to warp!</li>
                 </ol>
               </div>
@@ -5827,25 +6839,58 @@
           {/if}
         </div>
 
+        {#if isDesktopApp && !isMac}
+          <!-- Frameless window controls: the transparent BrowserWindow needed
+               for the native preview underlay has no OS title bar on Windows.
+               The inert strip beside them is the window drag handle. -->
+          <div class="win-controls">
+            <button class="win-ctl" title="Minimize" onclick={() => invoke('win_minimize')} aria-label="Minimize">
+              <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0" y="4.5" width="10" height="1" fill="currentColor"/></svg>
+            </button>
+            <button class="win-ctl" title="Maximize" onclick={async () => { winMaximized = await invoke('win_maximize_toggle'); }} aria-label="Maximize">
+              {#if winMaximized}
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="0.5" y="2.5" width="6" height="6"/><path d="M2.5 2.5V0.5H9.5V7.5H7.5"/></svg>
+              {:else}
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="0.5" y="0.5" width="9" height="9"/></svg>
+              {/if}
+            </button>
+            <button class="win-ctl win-close" title="Close" onclick={() => invoke('win_close')} aria-label="Close">
+              <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.2"><path d="M0.5 0.5L9.5 9.5M9.5 0.5L0.5 9.5"/></svg>
+            </button>
+          </div>
+        {/if}
+
       </div>
     </header>
+
+    {#if $vjStageEdit}
+      <StageEditorHeader onUndo={handleUndo} onRedo={handleRedo} onFit={resetViewportTransform} zoom={viewportZoom} />
+    {/if}
 
     <!-- Main Content -->
     <main
       class="main-content"
+      class:vj-native-hidden={vjNativeUnderlayActive}
+      class:native-primary-presenter={nativePreviewGlassActive}
       class:preset-tray-open={presetTrayOpen}
       class:seq-tray-open={$layerSequencer.isOpen}
       class:kf-tray-open={$keyframeTimeline.isOpen}
+      class:show-tray-open={$showTimeline.isOpen}
     >
       <!-- Left sidebar — Layers / Screens tabs.
            LeftSidebar swaps LayerPanel ↔ ScreenPanel based on the
            active tab (uiState.leftSidebarTab). Screens tab also
            enables the warp-handle overlay in the editor viewport. -->
-      <LeftSidebar />
+      {#if $vjStageEdit}
+        <VJStageEditPanel />
+      {:else}
+        <LeftSidebar />
+      {/if}
 
       <!-- Viewport with canvas and warp handles -->
       <div
         class="viewport"
+        class:native-primary-presenter={nativePreviewGlassActive}
         bind:this={viewportEl}
         onpointerdown={handleViewportPointerDown}
         onmousedown={handleViewportMouseDown}
@@ -5863,22 +6908,21 @@
         <!--
           Phase 3.0 (Bridge-A) of the editor renderer migration.
 
-          When experimental.editorWebGPU is OFF (default): mount
-          Canvas alone — the existing WebGL renderer path.
+          When the editor frame bridge is OFF: mount Canvas alone —
+          the existing WebGL renderer path.
 
-          When ON: mount BOTH:
+          When ON (default, only when the native core is not primary): mount BOTH:
             - Canvas in bridgeMode (its WebGL <canvas> is hidden via
               opacity:0 but still painted by Chromium each frame)
             - WebGPUCanvas overlaid on top, sourcing the WebGL canvas
               and presenting it via VideoFrame + importExternalTexture
               on a WebGPU canvas
 
-          Net effect: the editor visually renders identically to the
-          WebGL path, but the FINAL present surface (which captureStream
-          pulls from for the output presenter) is now WebGPU. This
-          unblocks Phase 3.x — per-layer WebGPU renderers can be
-          composited on top of the bridge surface incrementally,
-          eventually replacing it.
+          Native v2 is different: when outputNativeCore is enabled in
+          the desktop shell, nativePrimaryRenderer disables this bridge.
+          The browser canvas remains mounted for editor hit-testing and
+          state sync, but it no longer presents a competing graphics
+          interpretation. The Rust/wgpu renderer is the live source.
 
           canvasComponent is bound to the Canvas instance in BOTH
           cases so all downstream code that calls getEngine() etc.
@@ -5886,11 +6930,15 @@
 
           See docs/WEBGPU_MIGRATION.md for the full roadmap.
         -->
-        {#if editorWebGPUActive && !showStage3D}
+        {#if !nativePrimaryRenderer && editorWebGPUActive && !showStage3D}
           <Canvas bind:this={canvasComponent} bridgeMode={true} stage3DOutput={showStage3D} />
           <WebGPUCanvas bind:this={webgpuBridgeComponent} />
         {:else}
-          <Canvas bind:this={canvasComponent} stage3DOutput={showStage3D} />
+          <Canvas
+            bind:this={canvasComponent}
+            stage3DOutput={showStage3D}
+            nativePrimary={nativePrimaryRenderer && !showStage3D}
+          />
         {/if}
         <!-- Grid overlay — mounted at App.svelte level (sibling to
              Canvas + WebGPUCanvas) so it stays visible regardless of
@@ -5908,6 +6956,22 @@
             <GridOverlay />
           </div>
         {/if}
+        {#if $vjStageEdit}
+          <svg class="vj-stage-guides" style="left: {canvasOffsetX}px; top: {canvasOffsetY}px; width: {canvasWidth}px; height: {canvasHeight}px;" viewBox={`0 0 ${canvasWidth} ${canvasHeight}`} aria-label="Live VJ screen outlines">
+            <defs><pattern id="live-stage-grid" width={canvasWidth / 8} height={canvasHeight / 4} patternUnits="userSpaceOnUse"><path d={`M ${canvasWidth / 8} 0 L 0 0 0 ${canvasHeight / 4}`} fill="none" stroke="#6e819e" stroke-width="0.6" opacity="0.28" /></pattern></defs>
+            <rect width={canvasWidth} height={canvasHeight} fill="url(#live-stage-grid)" pointer-events="none" />
+            {#each $project.layers.filter(layer => layer.type === 'screen' && layer.visible) as screen, index (screen.id)}
+              <path
+                d={stageScreenGuidePath(screen, canvasWidth, canvasHeight)}
+                class:selected={screen.id === $project.selectedLayerId}
+                onclick={(event) => { event.stopPropagation(); project.selectLayer(screen.id); }}
+                role="button"
+                aria-label={`Select ${screen.name}`}
+              />
+              <text x={screen.corners.topLeft.x * canvasWidth + 8} y={(1 - screen.corners.topLeft.y) * canvasHeight - 9} class="vj-stage-screen-label">{index + 1} · {screen.name}</text>
+            {/each}
+          </svg>
+        {/if}
         <!-- Screen warp overlay (Screens tab only).
              Mounted at the same offset as the layer warp handles so
              normalized 0..1 master-canvas coords map onto pixel coords
@@ -5921,15 +6985,23 @@
             <MasterWarpHandles containerWidth={canvasWidth} containerHeight={canvasHeight} zoom={viewportZoom} />
           </div>
         {/if}
+        <div class="chase-badges-offset" style="position: absolute; pointer-events: none; left: {canvasOffsetX}px; top: {canvasOffsetY}px;">
+          <ChaseOrderBadges containerWidth={canvasWidth} containerHeight={canvasHeight} />
+        </div>
         {#if $selectedLayer && $selectedLayer.type !== 'mask' && $leftSidebarTab !== 'screens'}
           <!-- Warp handles positioned to match the aspect-ratio-constrained canvas -->
           <div class="warp-handles-offset" style="left: {canvasOffsetX}px; top: {canvasOffsetY}px;">
-            <WarpHandles containerWidth={canvasWidth} containerHeight={canvasHeight} zoom={viewportZoom} hideCorners={$selectedLayer.warpMode === 'mesh'} shapeWarpActive={shapeWarpModeEnabled} />
+            <WarpHandles containerWidth={canvasWidth} containerHeight={canvasHeight} zoom={viewportZoom} hideCorners={$selectedLayer.warpMode === 'mesh'} shapeWarpActive={shapeWarpModeEnabled} interactionOnly={nativePrimaryRenderer} />
             {#if $selectedLayer.type !== 'splat' || $selectedLayer.splatContent?.showTransformGizmo !== false}
               <Object3DTransformGizmo containerWidth={canvasWidth} containerHeight={canvasHeight} zoom={viewportZoom} />
             {/if}
             {#if $selectedLayer.warpMode === 'mesh'}
-              <MeshWarpHandles containerWidth={canvasWidth} containerHeight={canvasHeight} zoom={viewportZoom} />
+              <MeshWarpHandles containerWidth={canvasWidth} containerHeight={canvasHeight} zoom={viewportZoom} interactionOnly={nativePrimaryRenderer} />
+            {/if}
+
+            <!-- Painted-mask brush: owns the pointer while armed on this layer. -->
+            {#if $paintMaskLayerId === $selectedLayer.id}
+              <PaintMaskOverlay containerWidth={canvasWidth} containerHeight={canvasHeight} />
             {/if}
 
             {#if $selectedLayer.layerShape?.type === 'custom'}
@@ -5944,7 +7016,7 @@
                 style="width: {canvasWidth}px; height: {canvasHeight}px;"
                 class:editing={shapeWarpModeEnabled}
               >
-                {#if $selectedLayer.layerShape?.type === 'circle' && layerShapeControlPoints.length >= 5 && warpCorners}
+                {#if QUAD_WARP_SHAPE_TYPES.has($selectedLayer.layerShape?.type ?? '') && layerShapeControlPoints.length >= 5 && warpCorners}
                   {@const w0 = warpPointThroughCorners(warpCorners, layerShapeControlPoints[0].x, layerShapeControlPoints[0].y)}
                   {@const w1 = warpPointThroughCorners(warpCorners, layerShapeControlPoints[1].x, layerShapeControlPoints[1].y)}
                   {@const w2 = warpPointThroughCorners(warpCorners, layerShapeControlPoints[2].x, layerShapeControlPoints[2].y)}
@@ -5956,9 +7028,9 @@
                   <line x1={wc.x * canvasWidth} y1={(1 - wc.y) * canvasHeight} x2={w1.x * canvasWidth} y2={(1 - w1.y) * canvasHeight} stroke="#67E8F9" stroke-width="1" opacity="0.55" />
                   <line x1={wc.x * canvasWidth} y1={(1 - wc.y) * canvasHeight} x2={w2.x * canvasWidth} y2={(1 - w2.y) * canvasHeight} stroke="#67E8F9" stroke-width="1" opacity="0.55" />
                   <line x1={wc.x * canvasWidth} y1={(1 - wc.y) * canvasHeight} x2={w3.x * canvasWidth} y2={(1 - w3.y) * canvasHeight} stroke="#67E8F9" stroke-width="1" opacity="0.55" />
-                {:else if $selectedLayer.layerShape?.type === 'triangle' && layerShapeControlPoints.length >= 3 && warpCorners}
+                {:else if ($selectedLayer.layerShape?.type === 'triangle' || $selectedLayer.layerShape?.type === 'polygon') && layerShapeControlPoints.length >= 3 && warpCorners}
                   <polygon
-                    points={layerShapeControlPoints.slice(0, 3).map((p) => { const w = warpPointThroughCorners(warpCorners, p.x, p.y); return `${w.x * canvasWidth},${(1 - w.y) * canvasHeight}`; }).join(' ')}
+                    points={layerShapeControlPoints.map((p) => { const w = warpPointThroughCorners(warpCorners, p.x, p.y); return `${w.x * canvasWidth},${(1 - w.y) * canvasHeight}`; }).join(' ')}
                     fill="none"
                     stroke="#67E8F9"
                     stroke-width="2"
@@ -5968,7 +7040,7 @@
 
                 {#if shapeWarpModeEnabled && warpCorners}
                   {#each layerShapeControlPoints as point, i}
-                    {@const isCircleCenter = $selectedLayer.layerShape?.type === 'circle' && i === 4}
+                    {@const isCircleCenter = QUAD_WARP_SHAPE_TYPES.has($selectedLayer.layerShape?.type ?? '') && i === 4}
                     {@const warped = warpPointThroughCorners(warpCorners, point.x, point.y)}
                     <circle
                       cx={warped.x * canvasWidth}
@@ -6121,7 +7193,12 @@
                     <div xmlns="http://www.w3.org/1999/xhtml" style="width: 100%; height: 100%;">
                       <button
                         class="warp-mode-btn"
-                        onclick={() => { warpModeEnabled = !warpModeEnabled; }}
+                        onmousedown={(e) => e.stopPropagation()}
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          warpModeEnabled = !warpModeEnabled;
+                          window.dispatchEvent(new CustomEvent('lines-mode-change', { detail: { mode: 'select' } }));
+                        }}
                         style="
                           background: {warpModeEnabled ? 'rgba(0, 255, 255, 0.3)' : 'rgba(60, 60, 60, 0.9)'};
                           border: 1px solid {warpModeEnabled ? '#00ffff' : '#666'};
@@ -6287,8 +7364,8 @@
           {@const maskHasClosedShape = maskShapes.some(s => s.closed)}
           <div
             class="mask-overlay"
-            class:add-mode={maskPenMode === 'add'}
-            class:remove-mode={maskPenMode === 'remove'}
+            class:add-mode={maskHasClosedShape && maskPenMode === 'add'}
+            class:remove-mode={maskHasClosedShape && maskPenMode === 'remove'}
             onmousedown={handleMaskMouseDown}
             onmousemove={handleMaskOverlayMouseMove}
             oncontextmenu={handleMaskOverlayContextMenu}
@@ -6566,6 +7643,9 @@
       </div>
 
       <!-- Right sidebar panel (always present to keep viewport size stable) -->
+      {#if $vjStageEdit}
+        <VJStageInspector />
+      {:else}
       <div class="right-sidebar">
         {#if $selectedLinesLayer}
           <LinesPanel />
@@ -6642,15 +7722,26 @@
           {/if}
         {/if}
       </div>
+      {/if}
 
     </main>
 
-    <!-- Preset Tray at bottom (only in map mode) -->
+    <!-- Preset Tray at bottom. In VJ MAP sub-mode it floats above the
+         VJ overlay (auto-opened) so mapping presets drag into deck cells. -->
     <PresetTray
       bind:isOpen={presetTrayOpen}
-      onBeforeLoad={(duration, type) => {
-        const engine = canvasComponent?.getEngine();
-        if (engine) engine.startTransition(duration, type);
+      vjDragMode={vjMapPresetDragActive}
+      onBeforeLoad={(duration, style, toCompositionId) => {
+        // Same native crossfade the show timeline uses, on a wall clock —
+        // a tray click has no timeline behind it to derive progress from.
+        // Called while the OUTGOING composition is still the loaded one, so
+        // `activeCompositionId` here is the side that fades away.
+        compositionTransition.beginTimed(
+          $project.vjMode?.activeCompositionId ?? null,
+          toCompositionId,
+          style,
+          duration,
+        );
       }}
     />
 
@@ -6660,15 +7751,19 @@
     <!-- Keyframe Timeline (slide-up panel) -->
     <KeyframeTimeline />
 
+    <!-- Show Timeline (slide-up panel) — audio tracks + preset arrangement -->
+    <ShowTimeline />
+
     <!-- Bottom dock pills (Presets / Sequencer / Keyframes) — coral-active. -->
-    <BottomDock
-      presetsOpen={presetTrayOpen}
-      onTogglePresets={() => presetTrayOpen = !presetTrayOpen}
-    />
+    {#if !vjNativeUnderlayActive && !$vjStageEdit}
+      <BottomDock
+        presetsOpen={presetTrayOpen}
+        onTogglePresets={() => presetTrayOpen = !presetTrayOpen}
+      />
+    {/if}
 
     <!-- VJ Mode Panel (full screen overlay) -->
     <VJModePanel
-      renderEngine={canvasComponent?.getEngine() ?? null}
       onFileAction={(action) => {
         if (action === 'new') newComposition();
         else if (action === 'open') loadComposition();
@@ -6688,15 +7783,16 @@
       </button>
     {/if}
 
-    <!-- Stage Designer overlay (fullscreen, z=999 — same pattern as
-         VJModePanel). Mutual exclusion guaranteed by activeWorkspace
-         setter in workspace.ts. -->
-    {#if $workspace === 'stage'}
-      <StageDesignerPanel />
-    {/if}
-
+    <!-- Projection simulator remains a separate workspace. -->
     {#if $workspace === 'projection-sim'}
-      <ProjectionSimulatorPanel sourceCanvas={canvasComponent?.getCanvas?.() ?? null} />
+      <!-- Native mode: the browser canvas is a cleared underlay, so the sim
+           projects the composite mirror instead — the true native output,
+           including live capture sources the WebGL path could never show. -->
+      <ProjectionSimulatorPanel
+        sourceCanvas={nativePrimaryRenderer
+          ? (projectionSimMirror?.canvas ?? null)
+          : (canvasComponent?.getCanvas?.() ?? null)}
+      />
     {/if}
 
 
@@ -6711,6 +7807,10 @@
       isOpen={showVideoConverter}
       onClose={() => showVideoConverter = false}
     />
+    {#if showProjectMedia}
+      <ProjectMediaModal projectPath={currentProjectPath} exportProject={() => project.exportProjectJSONForSave()}
+        applyProject={applyMediaRelinks} onClose={() => showProjectMedia = false} />
+    {/if}
 
     <!-- Welcome Modal (first run) — EULA gate removed in OSS build. -->
     {#if showWelcome}
@@ -6735,8 +7835,7 @@
       onClose={() => showSettings = false}
     />
 
-    <!-- Browser fallback: the main Canvas switches to stage3DOutput
-         and this component supplies only the floating authoring UI. -->
+    <!-- Stage designer authoring UI; Canvas owns the render viewport. -->
     {#if showStage3D}
       <Stage3DDesigner
         renderViewport={false}
@@ -6752,7 +7851,7 @@
     <MediaPipeLearnHUD />
 
     <!-- Footer / Status bar -->
-    <footer class="statusbar">
+    <footer class="statusbar" class:stage-edit-status-hidden={$vjStageEdit}>
       <span>Project: {$project.name}</span>
       <span>Layers: {$project.layers.length}</span>
       {#if $selectedLayer}
@@ -6853,9 +7952,29 @@
         </svg>
         Keyframes
       </button>
+      <button
+        class="status-pill"
+        class:on={$showTimeline.isOpen}
+        onclick={() => showTimeline.toggleOpen()}
+        title="Show Timeline — audio tracks + preset arrangement"
+      >
+        <svg class="status-pill-icon show-icon" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
+          <path class="ga-neon-fill" d="M2.8 4.4h8v5.2h-8zM13.2 4.4h8v5.2h-8z"/>
+          <path class="ga-neon-stroke" d="M2.8 4.4h8v5.2h-8zM13.2 4.4h8v5.2h-8z"/>
+          <path class="ga-neon-stroke ga-neon-thin" d="M2.8 16.4h2.4l1.4-3.4 1.8 7 1.6-5 1.2 3.2h2.2l1.3-3 1.5 5.4 1.4-4.2h2.2"/>
+        </svg>
+        Show
+      </button>
 
       <span class="spacer"></span>
-      <span class="fps-counter" class:fps-good={$fpsStore > 50} class:fps-warn={$fpsStore >= 30 && $fpsStore <= 50} class:fps-bad={$fpsStore < 30 && $fpsStore > 0}>{$fpsStore} FPS</span>
+      <span
+        class="fps-counter"
+        class:native={nativePrimaryRenderer || $nativeRendererRuntime.driverMode !== 'offline'}
+        class:fps-good={$fpsStore > 50}
+        class:fps-warn={$fpsStore >= 30 && $fpsStore <= 50}
+        class:fps-bad={$fpsStore < 30 && $fpsStore > 0}
+        title={fpsCounterTitle($nativeRendererRuntime)}
+      >{fpsCounterLabel($nativeRendererRuntime, $fpsStore)}</span>
       {#if versionInfo?.hasUpdate && versionInfo.releaseUrl}
         <!-- Update available — clickable badge that opens the download page. -->
         <a
@@ -6892,7 +8011,7 @@
 
 <!-- Close Confirmation Modal -->
 {#if showNewProjectModal}
-  <div class="close-modal-backdrop" onclick={newProjectCancel}>
+  <div data-help-page="interface" class="close-modal-backdrop" onclick={newProjectCancel}>
     <div class="close-modal" onclick={(e) => e.stopPropagation()}>
       <div class="close-modal-icon">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--warning)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -6921,7 +8040,7 @@
 {/if}
 
 {#if showCloseModal}
-  <div class="close-modal-backdrop" onclick={closeModalCancel}>
+  <div data-help-page="interface" class="close-modal-backdrop" onclick={closeModalCancel}>
     <div class="close-modal" onclick={(e) => e.stopPropagation()}>
       <div class="close-modal-icon">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--warning)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -6956,9 +8075,12 @@
   </div>
 {/if}
 
-<!-- Crash Recovery Modal -->
+<!-- Crash Recovery Modal. The backdrop deliberately does nothing: a stray
+     click outside the dialog (easy while the app is still coming up) used to
+     call discardAutosave and delete the only copy of the unsaved project.
+     Only the Discard button throws it away. -->
 {#if showRecoveryModal}
-  <div class="close-modal-backdrop" onclick={discardAutosave}>
+  <div data-help-page="interface" class="close-modal-backdrop recovery-backdrop">
     <div class="close-modal" onclick={(e) => e.stopPropagation()}>
       <div class="close-modal-icon">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4ecdc4" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -7305,10 +8427,61 @@
     font-size: 15px;
     -webkit-font-smoothing: antialiased;
   }
+  .app.native-primary-presenter {
+    background: transparent;
+  }
+
+  .mac-window-titlebar {
+    flex: 0 0 30px;
+    width: 100%;
+    background: #20262a;
+    border-bottom: 1px solid #30373c;
+    -webkit-app-region: drag;
+    user-select: none;
+    position: relative;
+    z-index: 2000;
+  }
 
   /* Toolbar — uses theme tokens with the legacy accent vars as
      fallback so existing component CSS keeps working before each
      panel is migrated to the new system. */
+  /* Frameless (transparent underlay) window: the toolbar acts as the title bar.
+     Deliberately NOT `-webkit-app-region: drag` — Chromium handles input over
+     drag regions in the browser process, which makes the window un-double-
+     clickable (the renderer never sees the event). The move is driven from the
+     main process instead, so drag AND double-click-to-maximize both work. */
+  .toolbar.frameless-drag {
+    cursor: default;
+    user-select: none;
+  }
+
+  .win-controls {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 6px;
+  }
+  .win-ctl {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 30px;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary, #b8bcc4);
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .win-ctl:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+  }
+  .win-ctl.win-close:hover {
+    background: #e81123;
+    color: #fff;
+  }
+
   .toolbar {
     display: flex;
     align-items: center;
@@ -7329,10 +8502,67 @@
     gap: 10px;
   }
 
+  /* Compact levels, stepped through by fitToolbar (lib/utils/toolbarFit.ts)
+     only as far as the window needs. Each level adds to the one before.
+     Gaps and paddings carry !important because studio-skin.css sets them
+     that way. Buttons that lose their label keep a title, and the Sim and
+     Stage buttons keep their aria-label. */
+  .tb-short {
+    display: none;
+  }
+
+  /* 1: tighter spacing. */
+  .toolbar:global(.tb-compact-1) {
+    padding: 0 10px !important;
+    gap: 6px !important;
+  }
+  .toolbar:global(.tb-compact-1) :is(.toolbar-left, .toolbar-center, .toolbar-right) {
+    gap: 6px !important;
+  }
+  .toolbar:global(.tb-compact-1) .header-logo {
+    margin-right: 2px !important;
+  }
+  .toolbar:global(.tb-compact-1) :is(.output-btn, .connection-btn, .file-menu-btn) {
+    padding: 0 9px !important;
+  }
+  .toolbar:global(.tb-compact-1) :is(.vj-btn, .stage-btn) {
+    padding: 0 12px !important;
+  }
+
+  /* 2: short labels, and the Sim and Stage buttons show only their icons. */
+  .toolbar:global(.tb-compact-2) .tb-long {
+    display: none;
+  }
+  .toolbar:global(.tb-compact-2) .tb-short {
+    display: inline;
+  }
+  .toolbar:global(.tb-compact-2) :is(.sim-launch-btn, .stage-btn) .tb-label {
+    display: none;
+  }
+  .toolbar:global(.tb-compact-2) :is(.sim-launch-btn, .stage-btn) {
+    padding: 0 8px !important;
+  }
+
+  /* 4: last resort. The centre group scrolls sideways instead of pushing
+     Settings and the right-hand controls out of the window. */
+  .toolbar:global(.tb-compact-4) .toolbar-center {
+    min-width: 0;
+    overflow-x: auto;
+    justify-content: flex-start;
+    scrollbar-width: none;
+  }
+  .toolbar:global(.tb-compact-4) .toolbar-center::-webkit-scrollbar {
+    display: none;
+  }
+  .toolbar:global(.tb-compact-4) .toolbar-center > * {
+    flex-shrink: 0;
+  }
+
   .header-logo {
     height: 28px;
     width: auto;
     margin-right: 12px;
+    border-radius: 6px;
   }
 
   .version {
@@ -7360,7 +8590,7 @@
   .gpu-warning-body strong { color: #fef3c7; }
   .gpu-warning-detail { color: #fde68a; opacity: 0.9; }
   .gpu-warning-detail code {
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 12px;
     background: rgba(0, 0, 0, 0.25);
     padding: 1px 5px;
@@ -7406,6 +8636,32 @@
     background: rgba(245, 158, 11, 0.10);
     border-color: rgba(245, 158, 11, 0.35);
   }
+  .gpu-indicator.native {
+    color: var(--ga-neon-cyan, #5ce1e6);
+    background: rgba(92, 225, 230, 0.08);
+    border-color: rgba(92, 225, 230, 0.32);
+  }
+  .gpu-indicator.native-ready {
+    color: var(--ga-green, #46d18a);
+    background: rgba(70, 209, 138, 0.09);
+    border-color: rgba(70, 209, 138, 0.36);
+  }
+  .gpu-indicator.native-active {
+    color: #061014;
+    background: linear-gradient(90deg, #46d18a, #5ce1e6);
+    border-color: rgba(92, 225, 230, 0.70);
+    box-shadow: 0 0 14px rgba(92, 225, 230, 0.22);
+  }
+  .gpu-indicator.native-blocked {
+    color: #ffd36e;
+    background: rgba(255, 211, 110, 0.10);
+    border-color: rgba(255, 211, 110, 0.38);
+  }
+  .gpu-indicator.native-diagnostic {
+    color: #ffd36e;
+    background: rgba(255, 211, 110, 0.10);
+    border-color: rgba(255, 211, 110, 0.38);
+  }
   .gpu-dot {
     width: 7px;
     height: 7px;
@@ -7417,6 +8673,10 @@
   .gpu-indicator.integrated .gpu-dot {
     background: #ff9800;
     animation: gpu-pulse 1.5s ease-in-out infinite;
+  }
+  .gpu-indicator.native .gpu-dot {
+    background: currentColor;
+    box-shadow: 0 0 8px currentColor;
   }
   @keyframes gpu-pulse {
     0%, 100% { opacity: 1; }
@@ -7610,6 +8870,66 @@
     position: relative;
     flex: 1;
     justify-content: center;
+  }
+
+  /* Display picker (right-click on the output buttons). */
+  .display-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 9998;
+  }
+  .display-menu {
+    position: fixed;
+    z-index: 9999;
+    min-width: 230px;
+    padding: 6px;
+    background: #14161c;
+    border: 1px solid #2c313d;
+    border-radius: 6px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    font-size: 12px;
+  }
+  .display-menu-title {
+    padding: 5px 8px 7px;
+    color: #7d8595;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .display-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 8px;
+    background: none;
+    border: 0;
+    border-radius: 4px;
+    color: #d7dbe4;
+    text-align: left;
+    cursor: pointer;
+  }
+  .display-menu-item:hover { background: #232734; }
+  .display-menu-item.checked { color: #fff; }
+  .display-menu-check {
+    width: 10px;
+    color: #4f8cff;
+  }
+  .display-menu-dim {
+    margin-left: auto;
+    color: #6c7484;
+    font-size: 10px;
+  }
+  .display-menu-sep {
+    height: 1px;
+    margin: 5px 4px;
+    background: #262b36;
+  }
+  .display-menu-hint {
+    padding: 4px 8px 6px;
+    color: #6c7484;
+    font-size: 10px;
+    line-height: 1.4;
   }
 
   .output-btn {
@@ -7820,17 +9140,21 @@
   }
 
   /* Recording button in header */
+  /* Icon-only record button — the dot alone reads as "record" and keeps
+     the header tight next to VJ / STAGE. */
   .rec-btn {
     display: flex;
     align-items: center;
-    gap: 6px;
+    justify-content: center;
+    width: 32px;
     height: 32px;
     background: transparent;
     border: 1px solid rgba(255, 68, 56, 0.4);
     color: var(--ga-rec, #ff4438);
-    padding: 0 12px;
+    padding: 0;
     border-radius: var(--ga-r-hard, 2px);
-    font-size: 13px;
+    font-size: 15px;
+    line-height: 1;
     font-weight: 600;
     cursor: pointer;
     transition: all 0.15s;
@@ -8490,13 +9814,83 @@
     background: #FF6B6B;
   }
 
+  /* Pairing code beside the QR, and the reset under it */
+  .pairing-code {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    margin-top: 12px;
+  }
+
+  .pairing-code-label {
+    font-size: 11px;
+    color: #777;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .pairing-code-value {
+    font-size: 17px;
+    letter-spacing: 0.08em;
+    color: var(--accent-primary);
+    background: transparent;
+    padding: 0;
+    user-select: all;
+  }
+
+  .pairing-reset {
+    margin-bottom: 12px;
+  }
+
+  .pairing-reset p {
+    font-size: 12px;
+    color: #999;
+    margin: 0 0 8px;
+  }
+
+  .pairing-reset button {
+    margin-top: 0;
+  }
+
+  .pairing-reset-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .mobile-info-popup .pairing-reset-confirm {
+    background: rgba(255, 68, 68, 0.18);
+    color: #FF8888;
+  }
+
+  .mobile-info-popup .pairing-reset-confirm:hover {
+    background: rgba(255, 68, 68, 0.28);
+  }
+
   /* Main Content */
+  .main-content.vj-native-hidden,
+  .toolbar.vj-native-hidden,
+  :global(.bottom-dock.vj-native-hidden) {
+    /* visibility (not display): layout must survive so the native sync and
+       geometry publishing keep running while VJ mode owns the screen. */
+    visibility: hidden;
+  }
+  .toolbar.stage-edit-toolbar-hidden { display: none !important; }
+  .statusbar.stage-edit-status-hidden { display: none !important; }
+  .vj-stage-guides { position: absolute; z-index: 11; overflow: visible; pointer-events: none; }
+  .vj-stage-guides path { fill: rgba(35, 75, 125, 0.025); stroke: #7fb4f9; stroke-width: 1.5; stroke-dasharray: 7 5; vector-effect: non-scaling-stroke; pointer-events: visiblePainted; cursor: pointer; }
+  .vj-stage-guides path.selected { stroke: #e6f2ff; stroke-width: 2; stroke-dasharray: none; }
+  .vj-stage-screen-label { fill: #c6dbf7; font: 600 11px Inter, system-ui, sans-serif; paint-order: stroke; stroke: #0d1119; stroke-width: 3px; pointer-events: none; }
+
   .main-content {
     flex: 1;
     display: flex;
     overflow: hidden;
     background: var(--ga-void, #070809);
     transition: margin-bottom 0.2s ease-out;
+  }
+  .main-content.native-primary-presenter {
+    background: transparent;
   }
   .main-content.preset-tray-open {
     margin-bottom: calc(180px + var(--ga-bottom-rail-offset, 74px));
@@ -8507,6 +9901,13 @@
   .main-content.kf-tray-open {
     margin-bottom: calc(300px + var(--ga-bottom-rail-offset, 74px));
   }
+  /* The show tray is the only one of the four whose height is not a
+     constant — it fits its own content and is drag-resizable — so it
+     publishes `--ga-show-tray-height` from ShowTimeline.svelte instead of
+     hard-coding a number here. */
+  .main-content.show-tray-open {
+    margin-bottom: calc(var(--ga-show-tray-height, 220px) + var(--ga-bottom-rail-offset, 74px));
+  }
 
   .viewport {
     flex: 1;
@@ -8515,6 +9916,9 @@
     overflow: hidden;
     user-select: none;
     touch-action: none;
+  }
+  .viewport.native-primary-presenter {
+    background: transparent;
   }
 
   .viewport.panning {
@@ -8744,20 +10148,23 @@
   }
   .status-pill:hover {
     color: var(--ga-ink-0, #eef0f4);
-    background: var(--ga-coral-soft, rgba(255, 111, 94, 0.11));
-    border-color: var(--ga-coral-line, rgba(255, 111, 94, 0.4)) !important;
+    background: rgba(206, 222, 236, 0.10);
+    border-color: rgba(206, 222, 236, 0.42) !important;
   }
+  /* Active toggles wear the ghost-chrome accent: ice-white fill, cold dark
+     ink, and a cool halo — the same language as the VJ button and the other
+     filled accent controls. */
   .status-pill.on {
-    color: #23110c;
-    background: var(--ga-coral, #ff6f5e);
-    border-color: var(--ga-coral, #ff6f5e) !important;
-    box-shadow: 0 0 12px color-mix(in srgb, var(--ga-coral, #ff6f5e) 30%, transparent);
+    color: #16202b;
+    background: linear-gradient(180deg, #f4f9fd, #cfdde9);
+    border-color: rgba(214, 228, 240, 0.72) !important;
+    box-shadow: 0 0 12px rgba(176, 200, 222, 0.32);
   }
-  .status-pill.on:hover { filter: brightness(1.06); }
+  .status-pill.on:hover { filter: brightness(1.04); }
   .status-pill-icon {
     flex: none;
-    color: var(--ga-neon-green, #39ff14);
-    filter: drop-shadow(0 0 5px rgba(57, 255, 20, .62)) drop-shadow(0 0 12px rgba(57, 255, 20, .24));
+    color: var(--ga-ink-1, #9aa0ac);
+    filter: none;
   }
   .status-pill-icon .ga-neon-stroke {
     fill: none;
@@ -8774,21 +10181,14 @@
     fill: currentColor;
     opacity: 0.18;
   }
+  /* On an ice-white pill the icon reads as dark ink, not a glowing neon
+     stroke — the glow was fighting the fill and looked muddy. */
   .status-pill.on .status-pill-icon {
-    color: var(--ga-neon-green, #39ff14);
-    filter: drop-shadow(0 0 7px rgba(57, 255, 20, .75)) drop-shadow(0 0 14px rgba(57, 255, 20, .34));
+    color: #16202b;
+    filter: none;
   }
   .map-tool-pill {
     margin-right: 2px;
-  }
-  .map-tool-pill.on {
-    background: var(--ga-coral, #ff6f5e);
-  }
-  .snap-pill.on {
-    color: #061418;
-    background: var(--ga-neon-cyan, #5ce1e6);
-    border-color: var(--ga-neon-cyan, #5ce1e6) !important;
-    box-shadow: 0 0 12px rgba(92, 225, 230, 0.38);
   }
   .status-grid-select {
     height: 24px;
@@ -8818,7 +10218,8 @@
      visible and the user can always click the pill again to close. */
   :global(.preset-tray),
   :global(.seq-tray),
-  :global(.kf-tray) {
+  :global(.kf-tray),
+  :global(.show-tray) {
     bottom: 30px !important;
   }
 
@@ -9188,6 +10589,7 @@
     overflow-y: auto;
     overflow-x: hidden;
   }
+  .right-sidebar.stage-edit-hidden { display: none; }
 
   /* ─── Close Confirmation Modal ─── */
   .close-modal-backdrop {

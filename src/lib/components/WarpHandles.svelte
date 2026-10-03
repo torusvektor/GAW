@@ -1,12 +1,13 @@
 <script lang="ts">
-  import { selectedLayer, project, layers, selectedLayerIds } from '../stores/layers';
-  import { history } from '../stores/history';
+  import { selectedLayer, project, layers, selectedLayerIds, recordDiscreteAction } from '../stores/layers';
   import { settings } from '../stores/settings';
   import { get } from 'svelte/store';
   import type { WarpCorners, Point2D, Layer } from '../types';
   import { onMount, onDestroy } from 'svelte';
   import { findSnapTarget, getOtherLayerOutlines, type SnapTarget } from '../utils/snapUtils';
   import { normalizedWarpNudge, warpNudgeStepPixels } from '../utils/warpNudge';
+  import { releaseFormControlFocus } from '../utils/formFocus';
+  import { insetEdgeHandle } from '../utils/warpHandleLayout';
   import {
     scaleWarpCornersFromSelectionEdge,
     type SelectionBounds,
@@ -25,6 +26,12 @@
 
   // When true, shape warp editing is active — offset move handle to avoid blocking center focus handle
   export let shapeWarpActive: boolean = false;
+
+  // Native-primary mode draws the visible controls in the Metal presenter.
+  // Keep these DOM elements as invisible hit targets so the established
+  // interaction, snapping, history, keyboard, and multi-select logic remains
+  // the single input authority.
+  export let interactionOnly: boolean = false;
 
   let dragging: 'corner' | 'edge' | 'move' | 'rotate' | 'scale' | null = null;
   let dragTarget: keyof WarpCorners | 'top' | 'bottom' | 'left' | 'right' | 'center' | 'rotate' | 'scale' | null = null;
@@ -79,6 +86,9 @@
     }
   }
 
+  // Stretch every selected layer from a shared selection edge — dragging the
+  // top edge of a multi-selection scales all layers vertically from the
+  // selection's bottom edge, preserving relative placement.
   function applyBatchEdgeScale(edge: SelectionEdge, deltaX: number, deltaY: number) {
     if (!batchEdgeBounds) return;
     for (const [layerId, initial] of batchInitialCorners) {
@@ -150,6 +160,10 @@
       ? { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 }
       : null;
   }
+
+  // Movement delta for arrow keys (normalized coordinates)
+  const MOVE_DELTA = 0.005;  // Small step
+  const MOVE_DELTA_LARGE = 0.02;  // Large step with Shift
 
   // Edge snap threshold (normalized coords, ~2% of canvas)
   const SNAP_THRESHOLD = 0.02;
@@ -265,6 +279,7 @@
     if ($selectedLayer?.locked) return;
     e.preventDefault();
     e.stopPropagation();
+    releaseFormControlFocus();
     dragging = 'corner';
     dragTarget = corner;
     selectedCorner = corner;  // Set selected corner for keyboard navigation
@@ -288,7 +303,8 @@
       active?.isContentEditable
     ) return;
 
-    // Resolve project-pixel step from settings.
+    // Resolve project-pixel step from settings — one shared helper so
+    // arrow-key nudges everywhere use the same sensitivity.
     const proj = get(project);
     const step = normalizedWarpNudge(
       proj.width,
@@ -330,9 +346,15 @@
         x: currentPos.x + dx,
         y: currentPos.y + dy,
       });
-      history.record(get(project));
+      recordDiscreteAction();
       return;
     }
+
+    // In mesh mode the corners are hidden and the mesh points are the shape;
+    // MeshWarpHandles nudges the selected point. Shifting the hidden corners
+    // here changed nothing on screen and left the layer offset once it went
+    // back to corner warp.
+    if ($selectedLayer.warpMode === 'mesh') return;
 
     const ids = get(selectedLayerIds);
     const selectedIds = ids.length ? ids : [$selectedLayer.id];
@@ -344,7 +366,7 @@
       project.setCorner(layer.id, 'bottomLeft', { x: layer.corners.bottomLeft.x + dx, y: layer.corners.bottomLeft.y + dy });
       project.setCorner(layer.id, 'bottomRight', { x: layer.corners.bottomRight.x + dx, y: layer.corners.bottomRight.y + dy });
     }
-    if (movable.length > 0) history.record(get(project));
+    if (movable.length > 0) recordDiscreteAction();
   }
 
   // Set up keyboard event listener
@@ -389,6 +411,7 @@
     if ($selectedLayer?.locked) return;
     e.preventDefault();
     e.stopPropagation();
+    releaseFormControlFocus();
     dragging = 'move';
     dragTarget = 'center';
 
@@ -591,7 +614,7 @@
   }
 
   function handleMouseUp() {
-    if (dragging) history.record(get(project));
+    if (dragging) recordDiscreteAction();
     dragging = null;
     dragTarget = null;
     dragStartPos = null;
@@ -733,22 +756,28 @@
   }
 
   function handleTouchEnd() {
-    if (dragging) history.record(get(project));
+    if (dragging) recordDiscreteAction();
     dragging = null;
     dragTarget = null;
     dragStartPos = null;
     initialCorners = null;
     activeSnapTarget = null;
     batchScaleCenter = null;
-    batchEdgeBounds = null;
     batchInitialCorners.clear();
     window.removeEventListener('touchmove', handleTouchMove);
     window.removeEventListener('touchend', handleTouchEnd);
   }
 
-  // Corner handle positions
+  // Corner handle positions.
+  //
+  // containerWidth/Height are named in each expression on purpose: toPixel()
+  // reads them from its closure, which Svelte's dependency tracking cannot
+  // see, so these blocks only recomputed when `corners` changed. Any pure
+  // resize of the editor canvas — opening/closing the keyframe panel, resizing
+  // the window — left the handles and outline at their previous pixel
+  // positions until a click on the layer happened to change `corners`.
   $: corners = $selectedLayer?.corners;
-  $: handlePositions = corners
+  $: handlePositions = corners && containerWidth > 0 && containerHeight > 0
     ? {
         topLeft: toPixel(corners.topLeft),
         topRight: toPixel(corners.topRight),
@@ -758,7 +787,7 @@
     : null;
 
   // Edge midpoint positions
-  $: edgePositions = corners && handlePositions
+  $: edgePositions = corners && handlePositions && containerWidth > 0 && containerHeight > 0
     ? {
         top: toPixel(getEdgeMidpoint(corners, 'top')),
         bottom: toPixel(getEdgeMidpoint(corners, 'bottom')),
@@ -768,7 +797,9 @@
     : null;
 
   // Center position for move handle
-  $: centerPosition = corners ? toPixel(getCenter(corners)) : null;
+  $: centerPosition = corners && containerWidth > 0 && containerHeight > 0
+    ? toPixel(getCenter(corners))
+    : null;
 
   // Rotation handle position (above top edge)
   $: rotatePosition = edgePositions
@@ -796,6 +827,12 @@
         bottom: (1 - selectionBounds.minY) * containerHeight,
       }
     : null;
+  $: groupScalePosition = selectionBoundsPx
+    ? { x: selectionBoundsPx.right + 26, y: selectionBoundsPx.bottom + 26 }
+    : null;
+  $: visibleScalePosition = groupScalePosition ?? scalePosition;
+  // Multi-select: edge handles sit on the shared selection bounds so a
+  // drag stretches the whole selection from that edge.
   $: selectionEdgePositions = selectionBoundsPx
     ? {
         top: {
@@ -817,10 +854,6 @@
       }
     : null;
   $: visibleEdgePositions = selectionEdgePositions ?? edgePositions;
-  $: groupScalePosition = selectionBoundsPx
-    ? { x: selectionBoundsPx.right + 26, y: selectionBoundsPx.bottom + 26 }
-    : null;
-  $: visibleScalePosition = groupScalePosition ?? scalePosition;
 
   // Draw the dashed bounding rectangle connecting the four corner
   // warp handles. We HIDE this rectangle whenever the layer has a
@@ -854,8 +887,9 @@
     : [];
 </script>
 
-<div
+<div data-help-page="projection-mapping"
   class="warp-handles"
+  class:interaction-only={interactionOnly}
   bind:this={containerEl}
   style="width: {containerWidth}px; height: {containerHeight}px;"
 >
@@ -924,8 +958,8 @@
           y={selectionBoundsPx.top}
           width={selectionBoundsPx.right - selectionBoundsPx.left}
           height={selectionBoundsPx.bottom - selectionBoundsPx.top}
-          fill="rgba(255, 111, 94, 0.04)"
-          stroke="#ff6f5e"
+          fill="color-mix(in srgb, var(--ga-coral, #ff6f5e) 4%, transparent)"
+          stroke="var(--ga-coral, #ff6f5e)"
           stroke-width="2"
           stroke-dasharray="7,4"
         />
@@ -943,6 +977,9 @@
       {/if}
     </svg>
 
+    <!-- Handles on the canvas edge are drawn whole inside it (half would
+         be under a side panel); their points and outlines keep their true
+         positions. See utils/warpHandleLayout.ts. -->
     <!-- Corner handles — hidden in mesh mode (overlap with mesh-grid
          corner handles) AND when the layer carries a non-rectangle
          shape (the polygon's own vertex handles in CustomShapeHandles
@@ -954,7 +991,7 @@
           class:dragging={dragging === 'corner' && dragTarget === corner}
           class:selected={selectedCorner === corner && dragging !== 'corner'}
           class:locked={$selectedLayer.locked}
-          style="left: {pos.x}px; top: {pos.y}px;"
+          style="left: {insetEdgeHandle(pos.x, containerWidth, 10)}px; top: {insetEdgeHandle(pos.y, containerHeight, 10)}px;"
           onmousedown={(e) => handleCornerMouseDown(corner as keyof WarpCorners, e)}
           ontouchstart={(e) => handleCornerTouchStart(corner as keyof WarpCorners, e)}
           role="button"
@@ -973,7 +1010,7 @@
         class="handle edge-handle edge-{edge}"
         class:dragging={dragging === 'edge' && dragTarget === edge}
         class:locked={$selectedLayer.locked}
-        style="left: {pos.x}px; top: {pos.y}px;"
+        style="left: {insetEdgeHandle(pos.x, containerWidth, edge === 'left' || edge === 'right' ? 6 : 20)}px; top: {insetEdgeHandle(pos.y, containerHeight, edge === 'left' || edge === 'right' ? 20 : 6)}px;"
         onmousedown={(e) => handleEdgeMouseDown(edge as 'top' | 'bottom' | 'left' | 'right', e)}
         role="button"
         tabindex="0"
@@ -1082,6 +1119,7 @@
     top: 0;
     left: 0;
     pointer-events: none;
+    overflow: visible;
   }
 
   .handle {
@@ -1089,6 +1127,14 @@
     pointer-events: auto;
     transition: transform 0.1s ease, background 0.1s ease;
     z-index: 50;
+  }
+
+  /* In native mode, the opaque canvas-sized Metal presenter naturally hides
+     this DOM chrome inside the project canvas. Overflow stays visible in the
+     surrounding workspace, so handles retain their true off-canvas position
+     instead of being clamped or disappearing. */
+  .warp-handles.interaction-only .handle {
+    transition: none;
   }
 
   /* Corner handles (circles) */

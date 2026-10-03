@@ -8,6 +8,43 @@ export interface AppReleaseNotes {
 }
 
 const RELEASE_NOTES: Record<string, AppReleaseNotes> = {
+  '2.0.13': {
+    title: 'Looks, live mapping, show control and refreshed venues',
+    summary: [
+      'Beat-synced Looks and crisp Edge Effects dress mapped surfaces.',
+      'Live mapping, Art-Net and sACN, cues and timecode expand show control.',
+      'Stage Sim gains detailed venues, dark lighting and clear camera views.',
+    ],
+    highlights: [
+      'Apply beat-synced Looks and palettes across mapped surfaces, with vector Edge Effects drawn at output resolution.',
+      'Perform mapping presets and live VJ sources on a shared map, with transitions, dual decks and the crossfader.',
+      'Art-Net and sACN input and output join cues, timecode, scheduling and PJLink projector control.',
+      'Painted masks, curved screen masks and Bezier warps expand surface editing with undo support.',
+      'Recording gains layer and screen targeting, alpha formats and native recording paths.',
+      'Modulation adds explicit Min/Max ranges and fixes stale base values.',
+      'Refreshed Stage Sim venues include a detailed arena, curved auditorium seating, interior speaker hangs, subdued room reflections and checked starting camera sightlines.',
+    ],
+  },
+  '2.0.1': {
+    title: 'Keyframing, undo, and point-cloud materials',
+    summary: [
+      'The transform gizmo on point cloud and 3D model layers is now keyframeable.',
+      'Keyframes apply while scrubbing, and rendered video finally honors them.',
+      'Undo and redo now cover layer property and keyframe edits, not just adding and removing layers.',
+    ],
+    highlights: [
+      'Point cloud and 3D model layers can keyframe the on-canvas gizmo, so position, rotation and scale animate into camera-style moves.',
+      'Scrubbing the keyframe timeline shows the interpolated pose instead of the last value set, so in-between keyframes can be judged by eye.',
+      'Rendered video honors keyframes — export seeks the timeline, and that path previously skipped every keyframe and exported a static frame.',
+      'Undo and redo record layer property edits across the app; previously only structural actions were tracked, so one undo could discard a whole layer of work.',
+      'Undo and redo also cover keyframe edits — add, delete, move, retime, value and easing — restored together with the project.',
+      'Point cloud layers gain a Material and Glow section: shininess, metallic, fresnel, emissive, specular and rim tints, and a per-point glow.',
+      'Point cloud specular highlights now track the camera instead of a fixed view direction, so they move as the cloud is orbited.',
+      'Datamosh gains a flicker-speed control, and Constellation gains speed, a blend mode, and a travelling wave mode.',
+      'Point cloud mouse interaction is stronger by default with a much wider usable range.',
+      'New Quotron generator: a 1970s quote terminal with eleven programs, six phosphors and seven glyph ROMs, rolled from a seed with a Generate button, adapting its character grid to the composition resolution.',
+    ],
+  },
   '1.9.992': {
     title: 'Reliable OSC, trimmed playback, and portable media',
     summary: [
@@ -165,7 +202,7 @@ const RELEASE_NOTES: Record<string, AppReleaseNotes> = {
       'Map Sim top controls are reorganized for real work: New, Save, Load, Copy, Paste, Delete, transform tools, view controls, sync, fullscreen, and record are grouped with clearer iconography.',
       'New effect-library visuals include phase/magnification-inspired tools and the recent experimental visuals as reusable effects, so they can be applied to any source instead of living as isolated shader layers.',
       'SRC webcam feeds now mirror by default for natural performer-facing camera control.',
-      'The UI typography pass moves Ghost Arcade onto a consistent Space Grotesk + IBM Plex Mono system, trims front-facing UI type by 1px, and normalizes mixed font weights/casing across panels.',
+      'The UI typography pass moves Ghost Arcade onto a consistent Geist + Geist Mono system, trims front-facing UI type by 1px, and normalizes mixed font weights/casing across panels.',
       'The website download flow now starts the download immediately and then asks users to follow the project/community accounts, keeping the app free while helping the community grow.',
     ],
   },

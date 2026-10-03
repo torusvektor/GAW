@@ -14,6 +14,7 @@ const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
 function threejsBundlesPlugin(): Plugin {
   const virtualId = 'virtual:threejs-bundles';
   const resolvedId = '\0' + virtualId;
+  let assetBase = './';
   const scan = () => {
     const dir = resolve(__dirname, 'public/threejs');
     if (!existsSync(dir)) return [];
@@ -26,6 +27,7 @@ function threejsBundlesPlugin(): Plugin {
   };
   return {
     name: 'ghost-arcade-threejs-bundles',
+    configResolved(config) { assetBase = config.base; },
     resolveId(id) { if (id === virtualId) return resolvedId; return null; },
     load(id) {
       if (id !== resolvedId) return null;
@@ -36,7 +38,7 @@ function threejsBundlesPlugin(): Plugin {
         id: `builtin-threejs-${name}`,
         folder: name,
         name: name.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-        url: `/threejs/${name}/index.html`,
+        url: `${assetBase}threejs/${encodeURIComponent(name)}/index.html`,
       }));
       return `export default ${JSON.stringify(items, null, 2)};`;
     },
@@ -77,7 +79,8 @@ export default defineConfig({
     strictPort: true,
     host: true, // Listen on all network interfaces for mobile access
     watch: {
-      ignored: ['**/src-tauri/**'],
+      // Native builds and isolated Electron profiles change continuously during playback.
+      ignored: ['**/src-tauri/**', '**/native-renderer/target/**', '**/scratchpad/**', '**/reports/**', '**/*.log'],
     },
     // Required headers for FFmpeg.wasm (SharedArrayBuffer support)
     // Note: Using 'credentialless' instead of 'require-corp' for COEP

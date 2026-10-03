@@ -1,13 +1,60 @@
+# Unreleased — hosted web build
+
+New `npm run build:web`: one URL opens the full editor on laptops and the touch VJ surface on phones, installs as a PWA on macOS, iOS and Android, works offline after the first visit, and deploys to GitHub Pages via `.github/workflows/pages.yml`.
+
+# Ghost Arcade 2.0.16 — October 2, 2026
+
+Fix Windows Screen output routing so projector calibration, source warp and overlap blending reach the projector. See [release notes](docs/releases/v2.0.16.md).
+
+# Ghost Arcade 2.0.15 — October 1, 2026
+
+Independent projector calibration, paired angled overlap blending, the optional Neo Industrial skin, and expanded GhostFX/HandFX. See [release notes](docs/releases/v2.0.15.md). Physical projector acceptance remains pending.
+
+# Ghost Arcade 2.0.14 — September 30, 2026
+
+Fix Connect Mobile QR rendering before network discovery in packaged desktop builds. See [release notes](docs/releases/v2.0.14.md).
+
+# Ghost Arcade 2.0.13 — September 29, 2026
+
+See [the full 2.0.13 release notes](docs/releases/v2.0.13.md) for Looks, mapping,
+show control, recording, modulation and refreshed 3D stage venues.
+
 # Ghost Arcade - Development Changelog
 
 ---
 
-## Unreleased
+## v2.0.1 - Keyframing, Undo, and Point-Cloud Materials (August 2026)
 
-- New hosted web build (`npm run build:web`): one URL opens the full editor on
-  laptops and the touch VJ surface on phones, installs as a PWA on macOS, iOS
-  and Android, works offline after the first visit, and deploys to GitHub
-  Pages via `.github/workflows/pages.yml`.
+- The on-canvas transform gizmo is now keyframeable on point cloud and 3D
+  model layers, so object position, rotation and scale can be animated to
+  build camera-style moves.
+- Keyframes apply while you scrub the timeline, not only during playback.
+  Setting a start and end pose and then adjusting the middle no longer means
+  working blind.
+- Rendered video honors keyframes. Export drives the timeline by seeking, and
+  that path previously skipped every keyframe, so exports came out static.
+- Undo and redo now cover layer property edits across the app. Previously only
+  structural actions (adding, removing and grouping layers) were recorded, so
+  a single undo after editing a layer discarded the whole layer.
+- Undo and redo now cover keyframe edits — adding, deleting, moving, retiming,
+  value and easing changes — restored together with the project state.
+- Point cloud layers gain a Material and Glow section: shininess, metallic,
+  fresnel power, emissive, independent specular and rim tints, and a per-point
+  glow with threshold and radius.
+- Point cloud specular highlights now track the camera. They were computed
+  against a fixed view direction and did not move when the cloud was orbited.
+- Point cloud Datamosh gains a flicker-speed control, previously fixed at a
+  hardcoded rate. Constellation gains speed, a per-effect blend mode, and a
+  travelling wave mode.
+- Point cloud mouse interaction is stronger by default with a wider usable
+  range; the previous defaults were nearly invisible.
+- New Quotron ISF generator: a 1970s stock-quote terminal with eleven live
+  programs, six phosphors, seven glyph ROMs and seven screen aberrations,
+  rolled from a seed with a Generate button. The character grid adapts to the
+  composition resolution.
+- ISF `event` inputs now render as action buttons instead of sliders.
+
+---
 
 ## v1.9.99 - Live Performance and Control Polish (July 2026)
 

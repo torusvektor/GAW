@@ -1,46 +1,94 @@
 <script lang="ts">
   import { project, compositions, activeCompositionId } from '../stores/layers';
+  import { showTimelineIsPlaying } from '../stores/showTimeline';
+  import { presetTransition, TRANSITION_OPTIONS } from '../stores/presetTransition';
   import { audioStore } from '../stores/audio';
-  import type { Composition } from '../types';
-  import type { TransitionType } from '../renderer/engine';
+  import type { Composition, CompositionTransitionStyle } from '../types';
   import { showLoading, hideLoading } from '../stores/loading';
+  import { invoke, isDesktopApp } from '$lib/bridge';
+  import { NATIVE_ENGINE_ONLY } from '../stores/settings';
   import { startRecording as startRec, formatRecordingDuration, type RecorderHandle } from '../recording/recorder';
   import { onDestroy, onMount } from 'svelte';
 
   export let isOpen = false;
 
-  // Callback before loading a preset (for triggering transitions)
-  export let onBeforeLoad: ((durationSeconds: number, type: TransitionType) => void) | null = null;
+  // VJ MAP sub-mode: the tray floats above the VJ overlay so mapping
+  // presets can be dragged straight into the deck cells. Cards become
+  // draggable and publish the same payload the VJ media tray uses.
+  export let vjDragMode = false;
 
-  // Transition settings — restored from localStorage in onMount.
-  let transitionEnabled = true;
-  let transitionDuration = 2; // seconds
-  let transitionType: TransitionType = 'dissolve';
+  // Reorder-drag state (non-VJ mode): drag a card over another to
+  // reorder the compositions list in place.
+  let draggedPresetIndex: number | null = null;
+  let dragOverPresetIndex: number | null = null;
 
-  const TRANSITION_OPTIONS: { value: TransitionType; label: string }[] = [
-    { value: 'dissolve',  label: 'Dissolve' },
-    { value: 'wave',      label: 'Wave (Disney)' },
-    { value: 'wipeUp',    label: 'Wipe Up' },
-    { value: 'wipeDown',  label: 'Wipe Down' },
-    { value: 'wipeLeft',  label: 'Wipe Left' },
-    { value: 'wipeRight', label: 'Wipe Right' },
-    { value: 'iris',      label: 'Iris' },
-    { value: 'voxelize',  label: 'Voxelize' },
-    { value: 'warp',      label: 'Warp' },
-    { value: 'explode',   label: 'Explode' },
-    { value: 'pixelMelt', label: 'Pixel Melt' },
-  ];
+  function handlePresetDragStart(e: DragEvent, comp: Composition, compIdx: number) {
+    if (vjDragMode) {
+      // VJ MAP sub-mode: drags feed the VJ deck, not reordering.
+      if (!e.dataTransfer) return;
+      const payload = { id: comp.id, type: 'preset', name: comp.name };
+      e.dataTransfer.setData('application/x-ghost-media-source', JSON.stringify(payload));
+      e.dataTransfer.effectAllowed = 'copy';
+      (window as any).__ghostVJMediaTrayDragPayload = payload;
+      return;
+    }
+    if (editingId) {
+      e.preventDefault();
+      return;
+    }
+    draggedPresetIndex = compIdx;
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('application/x-ghost-mapping-preset', String(compIdx));
+    }
+  }
+
+  function handlePresetDragOver(e: DragEvent, compIdx: number) {
+    if (vjDragMode) return;
+    if (draggedPresetIndex === null) return;
+    e.preventDefault();
+    dragOverPresetIndex = compIdx;
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  }
+
+  function handlePresetDrop(e: DragEvent, compIdx: number) {
+    if (vjDragMode) return;
+    e.preventDefault();
+    const rawIndex = e.dataTransfer?.getData('application/x-ghost-mapping-preset');
+    const fromIndex = draggedPresetIndex ?? (rawIndex ? Number(rawIndex) : NaN);
+    if (Number.isFinite(fromIndex)) {
+      project.reorderComposition(fromIndex, compIdx);
+    }
+    draggedPresetIndex = null;
+    dragOverPresetIndex = null;
+  }
+
+  function handlePresetDragEnd() {
+    if ((window as any).__ghostVJMediaTrayDragPayload?.type === 'preset') {
+      (window as any).__ghostVJMediaTrayDragPayload = undefined;
+    }
+    draggedPresetIndex = null;
+    dragOverPresetIndex = null;
+  }
+
+  // Callback before loading a preset (for triggering transitions). Fired
+  // while the OUTGOING composition is still the loaded one — the native
+  // crossfade needs both ids, and only the caller can read the outgoing one
+  // before `project.loadComposition` replaces it.
+  export let onBeforeLoad:
+    | ((durationSeconds: number, style: CompositionTransitionStyle, toCompositionId: string) => void)
+    | null = null;
+
+  // Transition settings live in `stores/presetTransition.ts` (loaded from,
+  // and written back to, the same three localStorage keys they always used).
+  // They are shared state now: the show timeline seeds every preset clip it
+  // creates from these, so a crossfade set here is the crossfade a programmed
+  // show uses.
+  $: transitionEnabled = $presetTransition.enabled;
+  $: transitionDuration = $presetTransition.duration;
+  $: transitionType = $presetTransition.style;
 
   onMount(() => {
-    try {
-      const t = localStorage.getItem('ghostarcade-transition-type');
-      if (t && TRANSITION_OPTIONS.some(o => o.value === t)) transitionType = t as TransitionType;
-      const d = parseFloat(localStorage.getItem('ghostarcade-transition-duration') || '');
-      if (!isNaN(d) && d > 0) transitionDuration = d;
-      const e = localStorage.getItem('ghostarcade-transition-enabled');
-      if (e !== null) transitionEnabled = e === '1';
-    } catch {}
-
     // MIDI: bridge map:preset:<index> triggers into loadPreset(). The router
     // dispatches the event but had no listener until this hook — bound notes
     // appeared to do nothing. Index is into the *current* $compositions list,
@@ -53,12 +101,20 @@
       if (comp) loadPreset(comp.id);
     };
     window.addEventListener('midi-mapping-preset', handler);
-    return () => window.removeEventListener('midi-mapping-preset', handler);
+    // Cue list preset recall: by id, with the tray's transition. Marks the
+    // event handled so the cue runtime does not also hard-cut to it.
+    const cueHandler = (e: Event) => {
+      const detail = (e as CustomEvent<{ compositionId: string; handled: boolean }>).detail;
+      if (!detail?.compositionId || !$compositions.some((c) => c.id === detail.compositionId)) return;
+      detail.handled = true;
+      loadPreset(detail.compositionId, false);
+    };
+    window.addEventListener('show-recall-preset', cueHandler);
+    return () => {
+      window.removeEventListener('midi-mapping-preset', handler);
+      window.removeEventListener('show-recall-preset', cueHandler);
+    };
   });
-  $: try { localStorage.setItem('ghostarcade-transition-type', transitionType); } catch {}
-  $: try { localStorage.setItem('ghostarcade-transition-duration', String(transitionDuration)); } catch {}
-  $: try { localStorage.setItem('ghostarcade-transition-enabled', transitionEnabled ? '1' : '0'); } catch {}
-
   // Recording state (shared recorder)
   let recorderHandle: RecorderHandle | null = null;
   let isRecording = false;
@@ -68,8 +124,6 @@
   let editingId: string | null = null;
   let editingName = '';
   let newPresetName = '';
-  let draggedPresetIndex: number | null = null;
-  let dragOverPresetIndex: number | null = null;
 
   // ─── Auto-Play Engine ──────────────────────────────────────────────
   type TimingMode = 'fixed' | 'beat';
@@ -102,6 +156,9 @@
 
   function autoPlayStart() {
     if ($compositions.length < 2) return;
+    // The show timeline owns scheduled preset changes while it runs — two
+    // schedulers firing loadComposition would fight over the layer stack.
+    if ($showTimelineIsPlaying) return;
     autoPlaying = true;
     autoPaused = false;
     autoElapsed = 0;
@@ -154,6 +211,14 @@
     autoAnimFrame = requestAnimationFrame(autoTick);
   }
 
+  // ── Show-timeline handover ──────────────────────────────────────────
+  // Exactly one scheduler may drive presets. The show timeline is the
+  // programmed one, so it wins: starting it stops tray auto-play, and the
+  // tray's play button stays disabled for the duration. Manual preset
+  // CLICKS still work as an operator punch-in — the show takes back over at
+  // its next clip boundary.
+  $: if ($showTimelineIsPlaying && autoPlaying) autoPlayStop();
+
   /** Reactive: pick up live BPM from audio store when in beat mode */
   $: if (autoTimingMode === 'beat' && $audioStore.bpm > 0) {
     autoBpm = $audioStore.bpm;
@@ -174,11 +239,15 @@
   // Load a preset with optional transition.
   // When a transition is active, suppress the "Loading Composition..." overlay —
   // the transition itself provides visual feedback and the white text just covers it.
-  function loadPreset(compId: string) {
-    const useTransition = transitionEnabled && transitionDuration > 0 && !!onBeforeLoad;
+  // Cue-list recalls are automated playback, not an undoable edit.
+  function loadPreset(compId: string, recordHistory = true) {
+    // A composition crossfading into itself is a no-op that would only cost
+    // a doubled scene layer count, so re-clicking the live preset cuts.
+    const useTransition =
+      transitionEnabled && transitionDuration > 0 && !!onBeforeLoad && compId !== $activeCompositionId;
     if (!useTransition) showLoading('Loading Composition...');
-    if (useTransition) onBeforeLoad!(transitionDuration, transitionType);
-    project.loadComposition(compId);
+    if (useTransition) onBeforeLoad!(transitionDuration, transitionType, compId);
+    project.loadComposition(compId, { recordHistory });
     if (!useTransition) requestAnimationFrame(() => hideLoading());
   }
 
@@ -198,46 +267,64 @@
     editingName = '';
   }
 
-  function handlePresetDragStart(e: DragEvent, compIdx: number) {
-    if (editingId) {
-      e.preventDefault();
-      return;
-    }
-    draggedPresetIndex = compIdx;
-    if (e.dataTransfer) {
-      e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('application/x-ghost-mapping-preset', String(compIdx));
-    }
-  }
-
-  function handlePresetDragOver(e: DragEvent, compIdx: number) {
-    if (draggedPresetIndex === null) return;
-    e.preventDefault();
-    dragOverPresetIndex = compIdx;
-    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-  }
-
-  function handlePresetDrop(e: DragEvent, compIdx: number) {
-    e.preventDefault();
-    const rawIndex = e.dataTransfer?.getData('application/x-ghost-mapping-preset');
-    const fromIndex = draggedPresetIndex ?? (rawIndex ? Number(rawIndex) : NaN);
-    if (Number.isFinite(fromIndex)) {
-      project.reorderComposition(fromIndex, compIdx);
-    }
-    draggedPresetIndex = null;
-    dragOverPresetIndex = null;
-  }
-
-  function handlePresetDragEnd() {
-    draggedPresetIndex = null;
-    dragOverPresetIndex = null;
-  }
-
   // Delete preset
   function deletePreset(id: string, e: Event) {
     e.stopPropagation();
     if (confirm('Delete this preset?')) {
       project.deleteComposition(id);
+    }
+  }
+
+  // Native mode: the WebGL canvas is a cleared underlay (the core owns
+  // the pixels), so grab a one-shot frame snapshot from the render core
+  // and scale it down. Falls back to the canvas capture when the core
+  // has nothing to give.
+  async function captureNativeThumbnail(): Promise<string | undefined> {
+    if (!(isDesktopApp && NATIVE_ENGINE_ONLY)) return undefined;
+    try {
+      const snap = await invoke('native_renderer_get_frame_snapshot', { include_pixels: true }) as {
+        rgba_b64?: string;
+        width?: number;
+        height?: number;
+        format?: string;
+        bytes_per_row?: number;
+        padded_bytes_per_row?: number;
+        dark_frame?: boolean;
+      } | null;
+      if (!snap?.rgba_b64 || !snap.width || !snap.height) return undefined;
+      const raw = atob(snap.rgba_b64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      const w = snap.width;
+      const h = snap.height;
+      const rowBytes = snap.bytes_per_row || w * 4;
+      const stride = snap.padded_bytes_per_row || rowBytes;
+      const bgra = String(snap.format ?? '').toLowerCase().includes('bgra');
+      const img = new ImageData(w, h);
+      for (let y = 0; y < h; y++) {
+        const src = y * stride;
+        const dst = y * w * 4;
+        for (let x = 0; x < w; x++) {
+          const si = src + x * 4;
+          const di = dst + x * 4;
+          img.data[di]     = bytes[bgra ? si + 2 : si];
+          img.data[di + 1] = bytes[si + 1];
+          img.data[di + 2] = bytes[bgra ? si : si + 2];
+          img.data[di + 3] = 255;
+        }
+      }
+      const full = document.createElement('canvas');
+      full.width = w;
+      full.height = h;
+      full.getContext('2d')!.putImageData(img, 0, 0);
+      const thumb = document.createElement('canvas');
+      thumb.width = 120;
+      thumb.height = 68;
+      thumb.getContext('2d')!.drawImage(full, 0, 0, 120, 68);
+      return thumb.toDataURL('image/jpeg', 0.7);
+    } catch (e) {
+      console.warn('[PresetTray] native thumbnail failed:', e);
+      return undefined;
     }
   }
 
@@ -277,10 +364,10 @@
   // project state — layers, sub-store snapshots, fresh thumbnail.
   // Targets the right-clicked preset when targetId is supplied; falls
   // back to the active preset for the "Update current" header button.
-  function updateCurrentPreset(targetId?: string) {
+  async function updateCurrentPreset(targetId?: string) {
     const id = targetId ?? $activeCompositionId;
     if (!id) return;
-    const thumbnail = captureThumbnail();
+    const thumbnail = (await captureNativeThumbnail()) ?? captureThumbnail();
     const ok = project.updateComposition(id, { thumbnail });
     if (!ok) console.warn('[PresetTray] update failed for', id);
   }
@@ -289,25 +376,9 @@
   async function saveNewPreset() {
     const name = newPresetName.trim() || `Preset ${$compositions.length + 1}`;
 
-    // Capture thumbnail
-    let thumbnail: string | undefined;
-    try {
-      const canvas = document.querySelector('canvas.main-canvas') as HTMLCanvasElement ||
-                     document.querySelector('.canvas-container canvas') as HTMLCanvasElement ||
-                     document.querySelector('canvas') as HTMLCanvasElement;
-      if (canvas) {
-        const thumbCanvas = document.createElement('canvas');
-        thumbCanvas.width = 120;
-        thumbCanvas.height = 68;
-        const ctx = thumbCanvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(canvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
-          thumbnail = thumbCanvas.toDataURL('image/jpeg', 0.7);
-        }
-      }
-    } catch (e) {
-      console.warn('Failed to capture thumbnail:', e);
-    }
+    // Capture thumbnail — native core snapshot first, canvas fallback.
+    let thumbnail: string | undefined = await captureNativeThumbnail();
+    if (!thumbnail) thumbnail = captureThumbnail();
 
     project.saveComposition(name, thumbnail);
     newPresetName = '';
@@ -343,7 +414,7 @@
 </script>
 
 <!-- Preset Tray Toggle Button -->
-<button class="tray-toggle" class:open={isOpen} onclick={toggleTray}>
+<button data-help-page="projects" class="tray-toggle" class:open={isOpen} class:vj-drag={vjDragMode} onclick={toggleTray}>
   <span class="toggle-icon">{isOpen ? '▼' : '▲'}</span>
   <span class="toggle-label">Presets</span>
   {#if $compositions.length > 0}
@@ -353,22 +424,36 @@
 
 <!-- Preset Tray Content -->
 {#if isOpen}
-  <div class="preset-tray">
+  <div data-help-page="projects" class="preset-tray" class:vj-drag={vjDragMode}>
     <div class="tray-header">
       <div class="header-left">
         <span class="tray-title">MAPPING PRESETS</span>
         <div class="transition-controls">
           <label class="transition-toggle" title="Enable transition between presets">
-            <input type="checkbox" bind:checked={transitionEnabled} />
+            <input
+              type="checkbox"
+              checked={transitionEnabled}
+              onchange={(e) => presetTransition.patch({ enabled: (e.currentTarget as HTMLInputElement).checked })}
+            />
             <span class="transition-label">Transition</span>
           </label>
           {#if transitionEnabled}
-            <select class="transition-duration" bind:value={transitionType} title="Transition style">
+            <select
+              class="transition-duration"
+              value={transitionType}
+              onchange={(e) => presetTransition.patch({ style: (e.currentTarget as HTMLSelectElement).value as CompositionTransitionStyle })}
+              title="Transition style"
+            >
               {#each TRANSITION_OPTIONS as opt}
                 <option value={opt.value}>{opt.label}</option>
               {/each}
             </select>
-            <select class="transition-duration" bind:value={transitionDuration} title="Transition duration">
+            <select
+              class="transition-duration"
+              value={transitionDuration}
+              onchange={(e) => presetTransition.patch({ duration: Number((e.currentTarget as HTMLSelectElement).value) })}
+              title="Transition duration"
+            >
               <option value={0.5}>0.5s</option>
               <option value={1}>1s</option>
               <option value={2}>2s</option>
@@ -410,7 +495,14 @@
         <!-- Auto-Play Controls -->
         <div class="auto-play-controls">
           {#if !autoPlaying}
-            <button class="ap-btn play" onclick={autoPlayStart} title="Auto-play presets" disabled={$compositions.length < 2}>
+            <button
+              class="ap-btn play"
+              onclick={autoPlayStart}
+              title={$showTimelineIsPlaying
+                ? 'The show timeline is driving presets — stop it to use tray auto-play'
+                : 'Auto-play presets'}
+              disabled={$compositions.length < 2 || $showTimelineIsPlaying}
+            >
               ▶
             </button>
           {:else}
@@ -458,6 +550,11 @@
       </div>
 
       <div class="header-right">
+        {#if vjDragMode}
+          <button class="tray-minimize-btn" onclick={() => isOpen = false} title="Minimize preset tray">
+            ▼ Minimize
+          </button>
+        {/if}
         <!-- Recording controls -->
         {#if isRecording}
           <div class="recording-indicator">
@@ -519,14 +616,14 @@
           <div
             class="preset-item"
             class:active={$activeCompositionId === comp.id}
-            class:dragover={dragOverPresetIndex === compIdx}
-            draggable={editingId !== comp.id}
-            onclick={() => loadPreset(comp.id)}
-            oncontextmenu={(e) => openCtxMenu(e, comp)}
-            ondragstart={(e) => handlePresetDragStart(e, compIdx)}
+            class:dragover={!vjDragMode && dragOverPresetIndex === compIdx}
+            draggable={vjDragMode || editingId !== comp.id}
+            ondragstart={(e) => handlePresetDragStart(e, comp, compIdx)}
             ondragover={(e) => handlePresetDragOver(e, compIdx)}
             ondrop={(e) => handlePresetDrop(e, compIdx)}
             ondragend={handlePresetDragEnd}
+            onclick={() => loadPreset(comp.id)}
+            oncontextmenu={(e) => openCtxMenu(e, comp)}
             role="button"
             tabindex="0"
             onkeydown={(e) => e.key === 'Enter' && loadPreset(comp.id)}
@@ -641,6 +738,33 @@
     font-size: 11px;
     font-weight: 700;
   }
+
+  .tray-toggle.vj-drag {
+    z-index: 1205;
+    bottom: 10px;
+    left: 14px;
+    transform: none;
+  }
+  .preset-tray.vj-drag {
+    z-index: 1204;
+    bottom: 0;
+    height: 172px;
+    border-top: 1px solid var(--ga-coral-line, rgba(206,222,236,.45));
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.55);
+  }
+  .tray-minimize-btn {
+    background: var(--bg-tertiary, #14141a);
+    border: 1px solid #2a2a30;
+    color: var(--text-primary, #ddd);
+    padding: 5px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .tray-minimize-btn:hover { border-color: var(--ga-coral, #ff6f5e); }
+  .preset-tray.vj-drag .preset-item { cursor: grab; }
+  .preset-tray.vj-drag .preset-item:active { cursor: grabbing; }
 
   .preset-tray {
     position: fixed;
@@ -780,7 +904,7 @@
   .ap-bpm {
     font-size: 11px;
     color: var(--text-muted, #888);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .ap-progress {
     width: 60px;
@@ -973,7 +1097,7 @@
     font-size: 12px;
     font-weight: 600;
     color: #ff4444;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
 
   /* Preset list */

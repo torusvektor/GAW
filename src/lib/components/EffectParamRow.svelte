@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { macros } from '../stores/macros';
+  import { macroTargetKey, type MacroTarget } from '../stores/macroAssignments';
+  import { numericExpression } from '../utils/numericExpression';
   /**
    * EffectParamRow — every effect parameter renders as a three-row
    * block matching the shader-param UI:
@@ -19,7 +22,7 @@
    * in both editor and projector output windows (the engine ticks in
    * both via modulationBroadcast).
    */
-  import { modulationStore, registerEffectParamRange, registerEdgeEffectParamRange, registerGPUParamRange, registerSplatParamRange, type ModSource, type ParamModulation } from '../audio/modulation';
+  import { modKeyCompositionEffect, modKeyClipEffect, modulationStore, registerEffectParamRange, registerEdgeEffectParamRange, registerGPUParamRange, registerSplatParamRange, defaultModRange, hasModRange, rangeWithRestAt, setModulationBase, getModulationBase, type ModSource, type ParamModulation } from '../audio/modulation';
   import { project, layers } from '../stores/layers';
   import { vjClipLauncher } from '../stores/vjClipLauncher';
   import { defaultAutoFor } from '../audio/autoEngine';
@@ -55,6 +58,8 @@
   export let target: 'mapping' | 'vj' = 'mapping';
   /** Bank for VJ target. Ignored when target='mapping'. */
   export let vjBank: 'A' | 'B' = 'A';
+  export let mappingComposition = false;
+  export let vjEffectScope: 'layer' | 'clip' | 'composition' = 'layer';
   export let onChange: (v: number) => void = () => {};
   export let displayValue: ((v: number) => string) | undefined = undefined;
   /** Render only the compact modulation button. This lets panels keep
@@ -91,13 +96,33 @@
   } else if (effectKind === 'splat') {
     registerSplatParamRange(layerIndex, paramName, min, max);
   } else {
-    registerEffectParamRange(layerIndex, effectId, paramName, min, max);
+    registerEffectParamRange(layerIndex, effectId, paramName, min, max, target === 'vj' && vjEffectScope === 'clip' ? currentVjLayerState?.activeClip?.id : undefined);
+  }
+
+  $: macroTarget = effectKind === 'edge'
+    ? (target === 'mapping' && currentMappingLayer ? { scope: 'mapping-edge', layerId: currentMappingLayer.id, effectId, param: paramName } as MacroTarget : null)
+    : effectKind !== 'fx' ? null : (
+    target === 'mapping'
+      ? mappingComposition ? { scope: 'mapping-composition', effectId, param: paramName }
+        : currentMappingLayer ? { scope: 'mapping-layer', layerId: currentMappingLayer.id, effectId, param: paramName } : null
+      : vjEffectScope === 'composition' ? { scope: 'vj-composition', effectId, param: paramName }
+        : vjEffectScope === 'clip' ? currentVjLayerState?.activeClip
+          ? { scope: 'vj-clip', bank: vjBank, clipId: currentVjLayerState.activeClip.id, effectId, param: paramName } : null
+          : { scope: 'vj-layer', bank: vjBank, effectId, param: paramName }
+  ) as MacroTarget | null;
+  $: assignedMacro = macroTarget ? $macros.macros.find(m => m.assignments?.some(a => macroTargetKey(a.target) === macroTargetKey(macroTarget!))) : undefined;
+  function assignMacro(id: string) {
+    if (!macroTarget) return;
+    if (!id) { macros.unassignParameter(macroTarget); return; }
+    setSource('manual');
+    macros.assignParameter(id, { target: macroTarget, label: `${target === 'mapping' ? mappingComposition ? 'Mapping composition' : currentMappingLayer?.name ?? 'Mapping layer' : vjEffectScope === 'composition' ? 'VJ composition' : `Deck ${vjBank} · ${vjEffectScope === 'clip' ? currentVjLayerState?.activeClip?.name ?? 'Clip' : `Layer ${layerIndex + 1}`}`} · ${effectKind === 'edge' ? 'Edge effect' : currentEffect?.type ?? 'Effect'} · ${label}`, min, max, from: min, to: max });
   }
 
   // ---- Click-to-type editor for the value chip ----
   let editing = false;
   let editEl: HTMLInputElement | null = null;
   let editBuffer = '';
+  let editError = '';
 
   function decimalsFromStep(s: number): number {
     if (s >= 1) return 0;
@@ -109,18 +134,28 @@
   $: shown = displayValue ? displayValue(value) : value.toFixed(decimalsFromStep(step));
 
   async function startEdit() {
+    editError = "";
     editBuffer = String(value);
     editing = true;
     await tick();
     editEl?.focus();
     editEl?.select();
   }
-  function commit() {
-    const parsed = parseFloat(editBuffer);
-    if (!Number.isNaN(parsed)) onChange(Math.max(min, Math.min(max, parsed)));
+  function commit(blurred = false) {
+    if (!editing) return;
+    const parsed = numericExpression(editBuffer);
+    if (parsed === null) {
+      editError = 'Use numbers, +, −, *, / and parentheses. Value unchanged.';
+      if (blurred) editing = false;
+      return;
+    }
+    const clamped = Math.max(min, Math.min(max, parsed));
     editing = false;
+    editError = '';
+    userSet(clamped);
   }
-  function cancel() { editing = false; }
+
+  function cancel() { editing = false; editError = ''; }
   function onEditKey(e: KeyboardEvent) {
     if (e.key === 'Enter') { e.preventDefault(); commit(); }
     else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
@@ -137,7 +172,11 @@
   //   - 'mapping' reads/writes project.layers (and uses 'map:' modKey prefix)
   //   - 'vj'      reads/writes vjClipLauncher.layerStates (uses bank-prefixed key)
   $: vjLauncherState = $vjClipLauncher;
-  $: modKey = effectKind === 'edge'
+  $: modKey = mappingComposition || (target === 'vj' && vjEffectScope === 'composition')
+    ? modKeyCompositionEffect(target, effectId, paramName)
+    : target === 'vj' && vjEffectScope === 'clip' && currentVjLayerState?.activeClip
+    ? modKeyClipEffect(currentVjLayerState.activeClip.id, effectId, paramName, vjBank)
+    : effectKind === 'edge'
     ? `map:${layerIndex}:edge:${effectId}:${paramName}`
     : effectKind === 'gpu'
       ? `map:${layerIndex}:gpu:${paramName}`
@@ -157,7 +196,8 @@
   $: currentEffect = effectKind === 'gpu' || effectKind === 'splat'
     ? null
     : target === 'vj'
-      ? currentVjLayerState?.effects.find(e => e.id === effectId)
+      ? (vjEffectScope === 'composition' ? vjLauncherState.compositionEffects : vjEffectScope === 'clip' ? currentVjLayerState?.activeClip?.effects : currentVjLayerState?.effects)?.find(e => e.id === effectId)
+      : mappingComposition ? $project.mappingComposition?.effects.find(e => e.id === effectId)
       : effectKind === 'edge'
         ? (currentMappingLayer?.edgeEffects?.effects.find(e => e.id === effectId) as any)
         : currentMappingLayer?.effects.find(e => e.id === effectId);
@@ -175,6 +215,14 @@
   $: isModulated = isAuto || (currentSource !== 'manual');
 
   function writeMod(mod: ParamModulation) {
+    if (mappingComposition || (target === 'vj' && vjEffectScope === 'composition')) {
+      modulationStore.setCompositionEffectModulation(target, effectId, paramName, mod, { base: value, min, max });
+      return;
+    }
+    if (target === 'vj' && vjEffectScope === 'clip') {
+      if (currentVjLayerState?.activeClip) modulationStore.setClipEffectModulation(currentVjLayerState.activeClip.id, effectId, paramName, mod, vjBank);
+      return;
+    }
     if (effectKind === 'edge') {
       modulationStore.setEdgeEffectModulation(layerIndex, effectId, paramName, mod, 'mapping');
     } else if (effectKind === 'gpu') {
@@ -188,6 +236,10 @@
     }
   }
   function writeAuto(auto: AutoConfig | null) {
+    if (target === 'mapping' && mappingComposition) {
+      project.setMappingCompositionEffectParamAuto(effectId, paramName, auto);
+      return;
+    }
     if (effectKind === 'edge') {
       // Edge effect — paramName is a dotted path like `stroke.width`.
       // The auto map keys by the same string so writes from this row
@@ -210,12 +262,15 @@
       return;
     }
     if (target === 'vj') {
-      vjClipLauncher.setLayerEffectParamAuto(layerIndex, effectId, paramName, auto, vjBank);
+      if (vjEffectScope === 'composition') vjClipLauncher.setCompositionEffectParamAuto(effectId, paramName, auto);
+      else if (vjEffectScope === 'clip') vjClipLauncher.setActiveClipEffectParamAuto(layerIndex, effectId, paramName, auto, vjBank);
+      else vjClipLauncher.setLayerEffectParamAuto(layerIndex, effectId, paramName, auto, vjBank);
     } else if (currentMappingLayer) {
       project.setEffectParamAuto(currentMappingLayer.id, effectId, paramName, auto);
     }
   }
   function setSource(source: ModSource) {
+    if (macroTarget) macros.unassignParameter(macroTarget);
     if (source === 'auto') {
       // Switching TO auto. Clear any audio modulation (mutually
       // exclusive) and seed a fresh AutoConfig spanning the param's
@@ -235,8 +290,30 @@
       const spd = existingMod?.speed ?? 1.0;
       const inv = existingMod?.invert ?? false;
       const sync = existingMod?.bpmSync ?? false;
-      writeMod({ source, amount: amt, speed: spd, invert: inv, bpmSync: sync });
+      // A brand-new modulation gets a visible Min / Max range (Min at the
+      // slider, Max at the top). Changing band / shape keeps whatever the
+      // param already had — including no range on older saved projects.
+      const fresh = !existingMod || existingMod.source === 'manual';
+      const range = fresh
+        ? defaultModRange(value, min, max)
+        : hasModRange(existingMod) ? { rangeMin: existingMod!.rangeMin, rangeMax: existingMod!.rangeMax } : {};
+      writeMod({ source, amount: amt, speed: spd, invert: inv, bpmSync: sync, ...range });
     }
+  }
+
+  /** The user moved the slider (or typed a value). While an audio / LFO
+   *  modulation drives the param the slider sets where it rests: the
+   *  base it modulates from, and in range mode the Min end (Max when
+   *  inverted). Then the value is written as usual. */
+  function userSet(v: number) {
+    if (!isAuto && existingMod && existingMod.source !== 'manual' && Number.isFinite(v)) {
+      setModulationBase(modKey, v);
+      if (hasModRange(existingMod)) {
+        const span = max - min;
+        patchMod(rangeWithRestAt(existingMod, span > 0 ? (v - min) / span : 0));
+      }
+    }
+    onChange(v);
   }
   function setAutoField<K extends keyof AutoConfig>(field: K, value: AutoConfig[K]) {
     if (!existingAuto) return;
@@ -256,12 +333,13 @@
   }
 </script>
 
-<div bind:this={rootEl} class="epr" class:modulated={isModulated} class:button-only={buttonOnly}>
+<div data-help-page="effects" bind:this={rootEl} class="epr" class:modulated={isModulated} class:button-only={buttonOnly}>
   {#if buttonOnly}
     <div class="epr-compact-track">
       <div class="epr-track-wrap">
         <input
           class="epr-slider"
+          aria-label={label}
           type="range"
           {min}
           {max}
@@ -272,7 +350,7 @@
           data-midi-min={min}
           data-midi-max={max}
           data-midi-step={step}
-          oninput={(e) => onChange(parseFloat((e.target as HTMLInputElement).value))}
+          oninput={(e) => userSet(parseFloat((e.target as HTMLInputElement).value))}
         />
         {#if isAuto && existingAuto}
           {@const _rSpan = (max - min) || 1}
@@ -297,6 +375,13 @@
             }} />
         {/if}
       </div>
+      {#if macroTarget}
+        <select class="epr-macro" aria-label={`Assign ${label} to macro`} title="Assign to a macro; edit its range in the macro editor"
+          value={assignedMacro?.id ?? ''} onchange={(event) => assignMacro(event.currentTarget.value)}>
+          <option value="">Macro</option>
+          {#each $macros.macros as macro}<option value={macro.id}>{macro.name}</option>{/each}
+        </select>
+      {/if}
       <button
         bind:this={chipEl}
         type="button"
@@ -311,6 +396,13 @@
     <!-- Row 1: label · source dropdown · value -->
     <div class="epr-head">
       <span class="epr-label" title={label}>{label}</span>
+      {#if macroTarget}
+        <select class="epr-macro" aria-label={`Assign ${label} to macro`} title="Assign to a macro; edit its range in the macro editor"
+          value={assignedMacro?.id ?? ''} onchange={(event) => assignMacro(event.currentTarget.value)}>
+          <option value="">Macro</option>
+          {#each $macros.macros as macro}<option value={macro.id}>{macro.name}</option>{/each}
+        </select>
+      {/if}
       <button
         bind:this={chipEl}
         type="button"
@@ -326,22 +418,29 @@
           bind:value={editBuffer}
           class="epr-edit"
           type="text"
-          inputmode="decimal"
-          onblur={commit}
+          inputmode="text"
+          onblur={() => commit(true)}
+          aria-invalid={!!editError}
+          aria-label={`${label}: number or arithmetic expression`}
+          title={editError || 'Number or expression, e.g. 120/2'}
+          oninput={() => editError = ''}
           onkeydown={onEditKey}
         />
       {:else}
-        <button type="button" class="epr-value" title="Click to type a precise value" onclick={startEdit} ondblclick={startEdit}>
+        <button type="button" class="epr-value" title="Type a number or expression, e.g. 120/2" onclick={startEdit} ondblclick={startEdit}>
           {shown}
         </button>
       {/if}
     </div>
+
+    {#if editError}<span class="expression-error" role="status">{editError}</span>{/if}
 
     <!-- Row 2: the actual param slider (+ optional Auto-mode slippers
          overlaid on the same track when source='auto'). -->
     <div class="epr-track-wrap">
       <input
         class="epr-slider"
+          aria-label={label}
         type="range"
         {min}
         {max}
@@ -352,7 +451,7 @@
         data-midi-min={min}
         data-midi-max={max}
         data-midi-step={step}
-        oninput={(e) => onChange(parseFloat((e.target as HTMLInputElement).value))}
+        oninput={(e) => userSet(parseFloat((e.target as HTMLInputElement).value))}
       />
       <!-- Slippers — two range inputs overlaid on the main slider so
            their 0..1 axis lines up 1:1 with min..max above. Same
@@ -393,15 +492,24 @@
       source={currentSource === 'auto' ? 'manual' : currentSource as ModSource}
       mod={existingMod}
       auto={existingAuto}
+      supportsClipPosition={!mappingComposition && !(target === 'vj' && vjEffectScope === 'composition')}
       onClose={() => trayOpen = false}
       onSetSource={setSource}
       onPatchMod={patchMod}
       onPatchAuto={patchAuto}
+      paramMin={min}
+      paramMax={max}
+      paramValue={getModulationBase(modKey) ?? value}
+      formatValue={displayValue}
     />
   {/if}
 </div>
 
 <style>
+  .epr-macro { max-width: 85px; min-width: 0; border: 1px solid #344467; border-radius: 5px; background: #172747; color: #cbd9f5; font-size: 10px; padding: 2px; }
+
+  .expression-error { font-size: 11px; line-height: 1.4; color: #e0b29d; }
+  input[aria-invalid="true"] { border-color: #c88d74; }
   .epr {
     display: flex;
     flex-direction: column;

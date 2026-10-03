@@ -12,7 +12,9 @@ export function getLastRawAnalysis(): AudioAnalysis | null {
 }
 
 // Audio input source configuration
-export type AudioInputType = 'none' | 'microphone' | 'file' | 'system';
+/** 'clips' = no live input; the analyser follows the app's own clip audio
+ *  (MIX layers, show timeline tracks, the native VJ clip mix). */
+export type AudioInputType = 'none' | 'microphone' | 'file' | 'system' | 'clips';
 
 /** Minimal shape we need from MediaDeviceInfo, kept separate so the store
  *  doesn't leak the full DOM type to consumers that don't want it. */
@@ -138,7 +140,7 @@ function createAudioStore() {
   // kick or cut harsh treble independently). The legacy `high` band is
   // re-derived as the average of the gained treble+air+presence so old
   // shaders that read `bands.high` reflect the user's tuning.
-  audioAnalyzer.setCallback((analysis: AudioAnalysis) => {
+  const applyAnalysis = (analysis: AudioAnalysis) => {
     _lastRawAnalysis = analysis; // Cache for audio texture manager
     update(state => {
       const sens = state.sensitivity;
@@ -177,10 +179,29 @@ function createAudioStore() {
         spectralCentroid: analysis.spectralCentroid,
       };
     });
-  });
+  };
+
+  audioAnalyzer.setCallback(applyAnalysis);
 
   return {
     subscribe,
+
+    /**
+     * Publish an analysis frame the app produced itself rather than one the
+     * live analyser's RAF delivered.
+     *
+     * The offline render uses this for file audio: it decodes the source
+     * once and computes each exported frame's spectrum at the export's
+     * VIRTUAL time, so a 10 s export contains 10 s of audio content no
+     * matter how long the capture takes in wall time. Runs through the same
+     * sensitivity + per-band gain path as the live callback, so the user's
+     * EQ tweaks apply identically, and refreshes `_lastRawAnalysis` so the
+     * audio-texture upload sees the virtual-time FFT too.
+     */
+    injectAnalysisFrame(analysis: AudioAnalysis, isActive = true) {
+      applyAnalysis(analysis);
+      update(state => (state.isActive === isActive ? state : { ...state, isActive }));
+    },
 
     /** Start listening to microphone. Uses the store's preferredInputDeviceId
      *  if set; pass `null` to force the system default, or a specific id to
@@ -272,6 +293,20 @@ function createAudioStore() {
       } catch (err: any) {
         update(s => ({ ...s, error: err.message || 'System audio capture failed', isActive: false, inputType: 'none' }));
       }
+    },
+
+    /** Follow clip audio while no live input runs (see clipAudioFollow.ts). */
+    startClipFollow() {
+      if (get({ subscribe }).inputType !== 'none') return;
+      audioAnalyzer.startClipFollow();
+      if (!audioAnalyzer.isFollowingClips()) return;
+      update(s => ({ ...s, error: null, inputType: 'clips', isActive: true }));
+    },
+
+    /** Stop following clip audio; a live input, if one took over, is left alone. */
+    async stopClipFollow() {
+      if (get({ subscribe }).inputType !== 'clips') return;
+      await this.stop();
     },
 
     /** Stop audio analysis */

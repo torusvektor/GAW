@@ -1,3 +1,14 @@
+import { getDefaultEffectParams } from '../renderer/effects';
+import { NATIVE_EFFECT_PASS_LIMIT } from '../renderer/nativeEffectChainPolicy';
+import { normalizeVJGroups, removeVJGroupRow, type VJGroup } from './vjGroups';
+import { showToast } from './errorToast';
+import { createNativeQueuedLaunches, type LaunchReceipt } from '../renderer/nativeQueuedLaunch';
+import { vjClipTransitionInputId, vjClipTransitionSourceId } from '../renderer/vjClipTransitionNative';
+import { nativeRendererRuntime } from './nativeRenderer';
+import { nativeClipAudioMix, nativeAudioMaster, nativeClipAudioAudible } from '../audio/nativeClipAudio';
+import { VideoBeatPhase } from '../media/videoBeatPhase';
+import { scheduleNativeLaunch, cancelNativeLaunch, getNativeLaunchStatus, getNativeRendererCapabilities, getNativeRendererLayersSnapshot, getNativeSourceFrameReadiness, getNativeLayerSourceReadiness, submitNativeRendererCommands, type RendererCommand } from '../api/native-renderer';
+import { videoBeatFit } from '../media/videoBeatFit';
 // VJ Clip Launcher Store
 // Manages the clip grid state for the VJ clip launcher workflow
 // Works with shaders and videos directly (not compositions)
@@ -5,12 +16,28 @@
 import { writable, derived, get } from 'svelte/store';
 import type { BlendMode, Layer, MediaSource, Effect, JSAnimationSource, IntegratedEffectSource, SplatContent, Model3DContent, GPULayerContent, TextContent, ISFInputDef } from '../types';
 import { createDefaultSplatContent, createDefaultModel3DContent, createDefaultGPULayerContent, createDefaultTextContent } from '../types';
-import { createThreeJSIframeContext, getThreeJSIframeContext, createJSAnimationContext, createVideoTexture } from '../renderer/engine';
-import { hasDecodedVideoFrame } from '../renderer/videoReadiness';
+import { createThreeJSIframeContext, getThreeJSIframeContext, createJSAnimationContext, updateJSAnimationParams } from '../renderer/engine';
+import { launchClock, launchClockPosition, launchClockTempo, launchClockFollowsLink, nextLaunchBoundary, onLaunchClockResync, releaseTempoNudgeInputs } from './launchClock';
+import { normalizeCuePoints, validCueIndex, VJ_CUE_POINT_COUNT } from './vjCuePoints';
+import { seekNativeVideoImmediately } from '../renderer/nativeVideoScrubber';
+import { VJAutopilotClock, normalizeAutopilot, type VJAutopilot, type AutopilotSample } from './vjAutopilot';
 import { keyframeTimeline } from './keyframeTimeline';
 import { parseISF } from '../isf/parser';
-import { vjLayerSequencer } from './vjLayerSequencer';
-import { syncTrimmedVideoPlayback } from '../utils/videoTrimPlayback';
+import { vjLayerSequencer, type VJLayerSequencerState } from './vjLayerSequencer';
+import { effectiveClipTransition, normalizedTransitionDuration, normalizedTransitionStyle, vjClipTransitions } from './vjClipTransitions';
+import { isNativeSelectableEffect } from '../renderer/nativeEffectCoverage';
+import { NATIVE_ENGINE_ONLY } from './settings';
+import { isDesktopApp } from '../bridge';
+import { getActiveNativeRendererSync, armNativeLibraryVideo } from '../sync/nativeRendererSync';
+import { clipAudioBus, type ClipAudioTransport } from '../audio/clipAudioBus';
+import {
+  nativeVideoLaunchTime,
+  NATIVE_POSITION_DRIFT_SECONDS,
+  buildNativeAnchor,
+  needsNativeReanchor,
+  predictNativePlayheadSeconds,
+  nativeVideoTransportSnapshot, nativeVideoAnchorDirection, nativeVideoLoopProgress,
+} from '../media/nativeTransport';
 
 // Cache parsed ISF shader inputs per shader code to avoid re-parsing every
 // frame. Bounded: keys are entire shader source strings, so an unbounded
@@ -20,6 +47,11 @@ import { syncTrimmedVideoPlayback } from '../utils/videoTrimPlayback';
 // miss is cheap next to leaking sources for a whole show.
 const vjShaderInputCache = new Map<string, ISFInputDef[]>();
 const VJ_SHADER_INPUT_CACHE_MAX = 128;
+function allowNativeOnlyEffect(effect: Effect, scope: string): boolean {
+  if (!NATIVE_ENGINE_ONLY || isNativeSelectableEffect(effect.type)) return true;
+  console.warn(`[vjClipLauncher] blocked non-native ${scope} effect in native-only mode: ${effect.type}`);
+  return false;
+}
 function getShaderInputs(shaderCode: string | undefined): ISFInputDef[] | undefined {
   if (!shaderCode) return undefined;
   const cached = vjShaderInputCache.get(shaderCode);
@@ -49,13 +81,25 @@ export const NUM_VJ_LAYERS = DEFAULT_VJ_LAYERS;
 export const NUM_VJ_COLUMNS = DEFAULT_VJ_COLUMNS;
 
 // A clip in the grid - can be a shader, video, image, three.js HTML, AI-generated JS animation, Spout source, integrated effect, point cloud, 3D model, or mapping preset (loads a saved composition on fire)
+export type VJTriggerStyle = 'normal' | 'toggle' | 'piano';
+
 export interface VJClip {
+  cuePoints?: (number | null)[];
+  autopilot?: VJAutopilot;
+  _launchGeneration?: number;
+  triggerStyle?: VJTriggerStyle;
+  /** Undefined inherits the layer; false is an explicit override. */
+  faderStart?: boolean;
+  ignoreColumnTrigger?: boolean;
+  /** Undefined inherits the layer setting; zero launches immediately. */
+  transitionDuration?: number;
+  transitionStyle?: CrossfaderTransition;
   id: string;
   type: 'shader' | 'video' | 'image' | 'threejs' | 'p5js' | 'jsanimation' | 'synthvision' | 'spout' | 'effect' | 'splat' | 'model3d' | 'gpu' | 'text' | 'preset';
   /** For type='preset' clips: id of the saved Composition (mapping preset)
-   *  this cell loads when fired. Firing a preset clip calls
-   *  project.loadComposition() — a side effect on the mapping layers —
-   *  rather than feeding content into a VJ layer like the other types. */
+   *  this cell shows when fired. In MAP the row renders the preset over the
+   *  shared map and project.layers is left alone; in MIX / STAGE firing it
+   *  calls project.loadComposition(), a side effect on the mapping layers. */
   presetId?: string;
   name: string;
   src: string;
@@ -72,19 +116,26 @@ export interface VJClip {
   // The other fields control playback the same way MediaSource does for
   // mapping-mode video layers — exposed in the right-side panel that
   // opens when a video clip is selected (mirrors the shader-params panel).
-  // Defaults: Ghost-owned trim-aware looping, playbackRate=1, trim full
-  // range, isPlaying=true on first trigger.
+  // Defaults: native loop=true (set on the element at create time),
+  // playbackRate=1, trim full range, isPlaying=true on first trigger.
   videoElement?: HTMLVideoElement;
-  /** Runtime-only GPU texture, created while the clip is armed so firing it
-   *  never inserts a black placeholder while Canvas creates a texture. */
-  videoTexture?: MediaSource['texture'];
-  /** 'loop' | 'once'. Ghost owns trim-aware loop boundaries; native
-   *  browser looping stays disabled on active playback elements. */
-  playbackMode?: 'loop' | 'once';
-  /** 0.25 / 0.5 / 1 / 1.5 / 2 / 4. Maps to `videoElement.playbackRate`. */
+  /** 'loop' | 'once'. Loop is the historical default and matches the
+   *  hardcoded `videoEl.loop = true` set at clip-element creation. */
+  playbackMode?: 'loop' | 'once' | 'bounce';
+  /** Signed native speed; negative values play backwards. */
   playbackRate?: number;
-  /** If set, the trimmed clip span is fit to this many beats at master BPM. */
+  /** Beat/bar playback sync — if set, the trim span is rate-locked to this
+   *  many beats of the master BPM (1 / 2 / 4 / 8 / 16). Null/undefined =
+   *  free-running at playbackRate. The store-side sync engine below
+   *  recomputes playbackRate whenever BPM or the clip changes. */
   playbackSyncBeats?: number | null;
+  durationSeconds?: number;
+  videoWidth?: number;
+  videoHeight?: number;
+  _nativePlaybackDirection?: number;
+  _nativePlaybackTimeSeconds?: number;
+  _nativePlaybackUpdatedAtMs?: number;
+  _nativePlaybackSeekSeq?: number;
   /** 0..1 fraction of duration. Out-of-trim playback is clamped on the
    *  next per-frame update. Default 0 (start of source). */
   trimStart?: number;
@@ -93,6 +144,17 @@ export interface VJClip {
   /** Live play/pause flag. Toggle from the VJ video-controls panel.
    *  Default true (clip auto-plays on first trigger, same as today). */
   isPlaying?: boolean;
+
+  // Native desktop playback is audible by default; explicit false is preserved.
+  // The browser fallback retains its opt-in WebAudio route.
+  audioPlayback?: boolean;
+  /** Per-clip output level, 0..1. Default 1. Only meaningful when
+   *  `audioPlayback` is true. */
+  audioVolume?: number;
+  audioPan?: number;
+  /** Per-clip mute that survives independently of `audioPlayback`, so a user
+   *  can duck a clip without losing its volume setting. Default false. */
+  audioMuted?: boolean;
 
   // ── Per-clip transform (applied at composite time) ──
   // These let the user fit a video into a layer's quad with full
@@ -150,6 +212,11 @@ export interface VJClip {
   textContent?: TextContent;
   // Per-clip effects
   effects?: Effect[];
+  /** Set on clips Performer launches onto its layer. Their shader params are
+   *  edited inside Performer's SHADER tab, so VJ mode hides its own clip
+   *  params panel for them instead of showing a second, competing copy that
+   *  writes to a grid cell the transient clip does not occupy. */
+  _performerOwned?: boolean;
 }
 
 // A block contains a named collection of clips (8 columns x 4 layers).
@@ -165,15 +232,21 @@ export interface VJBlock {
   bankBClipGrid?: (VJClip | null)[][];
 }
 
-type VJTransformableClip = VJClip & { type: 'video' | 'image' };
-type VJTransformProps = Pick<VJTransformableClip, 'zoom' | 'fit' | 'anchorX' | 'anchorY' | 'rotation' | 'opacity' | 'mirrorX'>;
-type VJVideoPlaybackProps = Pick<VJClip, 'playbackMode' | 'playbackRate' | 'playbackSyncBeats' | 'trimStart' | 'trimEnd' | 'isPlaying'>;
-
 // VJ Layer state (per layer). Bank A and Bank B each get their own parallel
 // VJLayerState array — see `layerStates` (Bank A) and `bankBLayerStates`
 // (Bank B) on the launcher state. Per-deck independence is total: opacity,
 // solo, mute, blend, effects, and the active clip are all separate.
 export interface VJLayerState {
+  audioVolume?: number;
+  audioPan?: number;
+  autopilotPaused?: boolean;
+  autopilot?: VJAutopilot;
+  /** Restart the current video at trim-in when opacity rises from zero. */
+  faderStart?: boolean;
+  ignoreColumnTrigger?: boolean;
+  locked?: boolean;
+  transitionDuration?: number;
+  transitionStyle?: CrossfaderTransition;
   opacity: number;
   blendMode: BlendMode;
   solo: boolean;
@@ -236,9 +309,16 @@ export type QuantizationGrid = 'off' | '1/4' | '1/2' | '1bar' | '2bar' | '4bar';
 // reaches `fireAt`, the launcher pops it and fires immediately.
 export interface PendingTrigger {
   id: string;
+  kind?: 'clip' | 'column';
+  groupId?: string;
+  blockId?: string;
+  clipIds?: (string | null)[];
+  autopilotSource?: string;
+  layerIndices?: number[]; // Column participants captured when queued.
   layerIndex: number;
   columnIndex: number;
   bank: VJDeck;
+  fireBeat?: number;
   fireAt: number;        // performance.now() target (ms)
   queuedAt: number;      // performance.now() when queued (for UI countdown)
 }
@@ -276,13 +356,14 @@ export interface VJClipLauncherState {
   isLive: boolean;
   // Composition-level effects (applied to final composite output)
   compositionEffects: Effect[];
+  groups?: VJGroup[];
   // Stage mode: bridge VJ layers to mapping layers
   stageMode: boolean;
   stagePresetId: string | null;
-  // Map mode: VJ layer slots hold mapping presets; output is a stack of
-  // their full composition layers, modulated by per-VJ-layer opacity +
-  // blendMode. When mapMode is true, MIX/STAGE rendering paths are
-  // bypassed and the Maps tab is the only visible source in the tray.
+  // Map mode: VJ layer slots hold mapping presets or ordinary clips. The
+  // output stacks each preset row's layers (per-row opacity + blendMode)
+  // over the shared map; rows playing clips feed any mapped surface whose
+  // Source is that row, the deck mix or a VJ group.
   // Mutually exclusive with stageMode (setters clear the other).
   mapMode: boolean;
   // Stop-all blackout: when true, all VJ output is suppressed (black)
@@ -349,6 +430,8 @@ function createNewBlock(name: string = 'Block 1', numLayers: number = DEFAULT_VJ
 // Create a default layer state
 function createDefaultLayerState(): VJLayerState {
   return {
+    transitionDuration: 0,
+    transitionStyle: 'dissolve',
     opacity: 1,
     blendMode: 'normal' as BlendMode,
     solo: false,
@@ -379,6 +462,7 @@ function createDefaultState(): VJClipLauncherState {
     isOpen: false,
     isLive: false,
     compositionEffects: [],
+    groups: [],
     stageMode: false,
     mapMode: false,
     stagePresetId: null,
@@ -448,7 +532,14 @@ function blocksWithDeckGrid(
 
 // ─── Quantization clock helpers ──────────────────────────────────────────
 //
-// Two ground truths for "where are we in the bar":
+// Three ground truths for "where are we in the bar", in priority order:
+//   0) Ableton Link is in a session → anchor to the session's beat phase.
+//      Link carries the phase as well as the tempo, and it is the phase
+//      the other apps on the network are already agreeing on, so it beats
+//      anything derived locally. Without this the app locked to Link's
+//      TEMPO but kept its own downbeat: a Traktor user would see the BPM
+//      match exactly while clips fired off the beat, with no way to tell
+//      whether the phase, the quantum or the offset was at fault.
 //   1) Audio is active + has detected beats → anchor to the most recent
 //      detected beat using audioStore.beat.timeSinceLastBeat. This stays
 //      tight even if BPM drifts because we measure against a real beat.
@@ -462,8 +553,24 @@ function blocksWithDeckGrid(
 
 import { get as getStore } from 'svelte/store';
 import { audioStore } from './audio';
+import { abletonLink } from '../sync/abletonLink';
 
-const QUANT_CLOCK_EPOCH = performance.now();
+
+/**
+ * Clip kinds that accept the per-clip transform (zoom / anchor / rotation /
+ * opacity / fit / mirror).
+ *
+ * The transform is baked into the layer's warp-quad corners, which is media
+ * agnostic — but it was gated on 'video' in three separate places, so an
+ * image clip could not be resized or repositioned at all. Video and image are
+ * both plain 2D media in the quad and behave identically here. The richer
+ * types are deliberately left out: splat, model3d and gpu carry their own
+ * position/scale controls, and stacking a second transform on top of those
+ * would double-apply.
+ */
+function clipSupportsTransform(clip: { type?: string } | null | undefined): boolean {
+  return clip?.type === 'video' || clip?.type === 'image';
+}
 
 /** Convert a quantization grid label to its size in beats (4/4 assumed). */
 function gridToBeats(grid: QuantizationGrid): number {
@@ -482,46 +589,19 @@ function gridToBeats(grid: QuantizationGrid): number {
  * the requested grid. Returns the current time if grid is 'off' so callers
  * can use the same code path for unscheduled triggers.
  */
-function nextQuantumWallTime(grid: QuantizationGrid): number {
+export function nextQuantumWallTime(grid: QuantizationGrid): number {
+  return nextLaunchBoundary(gridToBeats(grid));
+}
+function launchDeadline(grid: QuantizationGrid) {
   const now = performance.now();
-  const beats = gridToBeats(grid);
-  if (beats === 0) return now;
-
-  const audio = getStore(audioStore);
-  // Resolve BPM with manual override > auto-detected > fallback 120
-  const bpm = audio.manualBPM || audio.bpm || 120;
-  if (bpm <= 0) return now;
-  const beatMs = 60000 / bpm;
-
-  // Anchor approach: find the wall-clock time of "beat 0" (the reference
-  // downbeat the clock counts from), then forward to the next boundary.
-  let anchorMs: number;
-  let anchorBeatPos: number;
-
-  if (audio.isActive && audio.beat.beatCount > 0 && audio.beat.timeSinceLastBeat >= 0) {
-    // Snap anchor to the most recent detected beat. timeSinceLastBeat is
-    // in seconds; convert to ms.
-    anchorMs = now - audio.beat.timeSinceLastBeat * 1000;
-    anchorBeatPos = audio.beat.beatCount;  // integer beat at anchorMs
-  } else {
-    // Virtual clock: anchor at the launcher's epoch, beat 0.
-    anchorMs = QUANT_CLOCK_EPOCH;
-    anchorBeatPos = 0;
-  }
-
-  // How many beats have elapsed since the anchor (float)?
-  const elapsedBeats = (now - anchorMs) / beatMs;
-  const currentBeatPos = anchorBeatPos + elapsedBeats;
-
-  // +epsilon so triggers fired exactly on the boundary don't get
-  // re-scheduled to the SAME boundary (would fire instantly, defeating
-  // the point of quantization).
-  const targetBeatPos = Math.ceil((currentBeatPos + 0.001) / beats) * beats;
-  const fireMs = anchorMs + (targetBeatPos - anchorBeatPos) * beatMs;
-  return fireMs;
+  const { beat, beatMs } = launchClockPosition(now);
+  const size = gridToBeats(grid);
+  const fireBeat = size > 0 ? Math.ceil((beat + 0.001) / size) * size : beat;
+  return { fireBeat, fireAt: now + (fireBeat - beat) * beatMs };
 }
 
 // rAF tick state — only runs when there are pending triggers
+let nativeOwnsQueuedTrigger: (id: string) => boolean = () => false;
 let quantTickHandle: number | null = null;
 function ensureQuantTickRunning(launcher: { update: any }) {
   if (quantTickHandle !== null) return;
@@ -534,11 +614,14 @@ function ensureQuantTickRunning(launcher: { update: any }) {
       const now = performance.now();
       const due: PendingTrigger[] = [];
       const remaining: PendingTrigger[] = [];
+      const clock = launchClockPosition(now);
       for (const p of s.pendingTriggers) {
-        if (p.fireAt <= now) due.push(p);
-        else remaining.push(p);
+        if (nativeOwnsQueuedTrigger(p.id)) { remaining.push(p); continue; }
+        const entry = p.fireBeat === undefined ? p : { ...p, fireAt: now + Math.max(0, p.fireBeat - clock.beat) * clock.beatMs };
+        if (entry.fireAt <= now + 0.00001) due.push(entry);
+        else remaining.push(entry);
       }
-      if (due.length === 0) return s;
+      if (due.length === 0) return { ...s, pendingTriggers: remaining };
       didFire = true;
       firedTriggers = due;
       return { ...s, pendingTriggers: remaining };
@@ -547,7 +630,10 @@ function ensureQuantTickRunning(launcher: { update: any }) {
     // (which itself calls update) doesn't recurse mid-mutation.
     if (didFire) {
       for (const t of firedTriggers) {
-        immediateTriggerClip(t.layerIndex, t.columnIndex, t.bank);
+        const current = getStore(vjClipLauncher);
+        if (!queuedTriggerStillMatches(t, current)) continue;
+        if (t.kind === 'column') vjClipLauncher.triggerColumnNow(t.columnIndex, t.bank, t.layerIndices);
+        else immediateTriggerClip(t.layerIndex, t.columnIndex, t.bank, true);
       }
     }
     // Continue ticking if anything is still queued
@@ -560,75 +646,140 @@ function ensureQuantTickRunning(launcher: { update: any }) {
 }
 
 /** Forward decl — populated below by createVJClipLauncherStore. */
-let immediateTriggerClip: (layerIndex: number, columnIndex: number, deck: VJDeck) => void = () => {};
+let immediateTriggerClip: (layerIndex: number, columnIndex: number, deck: VJDeck, preserveHold?: boolean) => void = () => {};
 
 // Cache for video elements to persist playback
 const videoElementCache = new Map<string, HTMLVideoElement>();
 
-// VideoTexture creation is part of arming a clip, not triggering it. Keeping
-// one stable texture per clip also prevents Three.js from sampling a newly
-// constructed (and not-yet-uploadable) texture on the trigger frame.
-const videoTextureCache = new Map<string, MediaSource['texture']>();
-type ArmedVideoState = {
-  key: string;
-  ready: boolean;
-  promise?: Promise<HTMLVideoElement>;
-};
-const armedVideoStates = new Map<string, ArmedVideoState>();
+/**
+ * Dedicated element cache for clips that opted into audio playback.
+ *
+ * ELEMENT POLICY — audio-enabled clips NEVER use `videoElementCache`.
+ *
+ * `AudioContext.createMediaElementSource(el)` is permanent and one-shot: it
+ * removes `el` from the default audio output for the rest of its life, and a
+ * second call on the same element throws InvalidStateError. Meanwhile
+ * `videoElementCache` is a *pool* — `ensureClipVideoElement()` re-`src`s a
+ * cached element in place whenever a clip's source changes. Handing a
+ * WebAudio-wired element back to that pool would silently route a different
+ * file through a gain node the user thinks belongs to the old clip, and any
+ * code path that tried to re-wire it would throw.
+ *
+ * So: audible clips get their own map, their own elements, and an explicit
+ * teardown (`releaseAudibleClipElement`) that detaches the bus first. The
+ * price is one extra decoder per audible clip, which is exactly the cost of
+ * the feature — the native core decodes with `-an` and cannot supply audio.
+ */
+const audibleVideoElementCache = new Map<string, HTMLVideoElement>();
+
+/** True when this clip has explicitly opted into audio playback. */
+function clipWantsAudio(clip: VJClip | null | undefined): boolean {
+  return !isDesktopApp && !!clip && clip.type === 'video' && clip.audioPlayback === true;
+}
+
+/** Transport snapshot the clip audio bus chases. Mirrors the wrapped
+ *  playhead time the VJ panel shows, computed from the same native anchors
+ *  the render authority uses. */
+function clipAudioTransport(clip: VJClip): ClipAudioTransport | null {
+  const duration = Number(clip.durationSeconds ?? clip.videoElement?.duration);
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+  const nativeTime = Number(clip._nativePlaybackTimeSeconds);
+  const elementTime = Number(clip.videoElement?.currentTime);
+  let time = Number.isFinite(nativeTime) && nativeTime >= 0
+    ? nativeTime
+    : Number.isFinite(elementTime) && elementTime >= 0
+      ? elementTime
+      : 0;
+  const anchorMs = Number(clip._nativePlaybackUpdatedAtMs);
+  const rate = Number(clip.playbackRate) || 1;
+  const paused = clip.isPlaying === false;
+  if (!paused && Number.isFinite(anchorMs)) {
+    time += Math.max(0, performance.now() - anchorMs) / 1000 * rate;
+  }
+  const trimStart = hasDuration ? duration * Math.max(0, Math.min(1, clip.trimStart ?? 0)) : 0;
+  const trimEnd = hasDuration ? duration * Math.max(0, Math.min(1, clip.trimEnd ?? 1)) : 0;
+  const loop = (clip.playbackMode ?? 'loop') !== 'once';
+  if (hasDuration) {
+    const range = Math.max(0.001, trimEnd - trimStart);
+    time = loop
+      ? trimStart + (((time - trimStart) % range) + range) % range
+      : Math.max(trimStart, Math.min(trimEnd, time));
+  }
+  return {
+    timeSeconds: nativeVideoTransportSnapshot(clip).timeSeconds,
+    playbackRate: rate,
+    paused: paused || clip.playbackMode === 'bounce',
+    loop,
+    trimStartSeconds: trimStart,
+    trimEndSeconds: trimEnd,
+    seekGeneration: Math.max(0, Math.round(Number(clip._nativePlaybackSeekSeq ?? 0))),
+    durationSeconds: hasDuration ? duration : undefined,
+  };
+}
+
+/** Build (once) and wire the dedicated audible element for a clip. */
+function ensureAudibleClipElement(clip: VJClip): HTMLVideoElement | undefined {
+  if (!clipWantsAudio(clip) || !clip.src || clip.src.startsWith('live://')) return undefined;
+
+  let el = audibleVideoElementCache.get(clip.id);
+  if (el && el.src !== clip.src) {
+    // Source swap: the old element is permanently bound to WebAudio, so it
+    // can never be reused for a different file. Retire it outright.
+    releaseAudibleClipElement(clip.id);
+    el = undefined;
+  }
+
+  if (!el) {
+    el = document.createElement('video');
+    if (!shouldSkipVideoCors(clip.src)) el.crossOrigin = 'anonymous';
+    // The bus owns wrapping (element `loop` would wrap to 0, not to trimStart)
+    // and owns un-muting. It starts muted like every other element in the app.
+    el.loop = false;
+    el.muted = true;
+    el.playsInline = true;
+    el.preload = 'auto';
+    el.src = clip.src;
+    audibleVideoElementCache.set(clip.id, el);
+  }
+
+  const id = clip.id;
+  clipAudioBus.attachClip(id, el, {
+    volume: clip.audioVolume ?? 1,
+    muted: clip.audioMuted === true,
+    provider: () => {
+      const current = latestClipById(id);
+      return current ? clipAudioTransport(current) : null;
+    },
+  });
+  return el;
+}
+
+/** Tear down a clip's audible element (bus first, then the element). */
+function releaseAudibleClipElement(clipId: string): void {
+  clipAudioBus.detachClip(clipId);
+  const el = audibleVideoElementCache.get(clipId);
+  if (!el) return;
+  try { el.pause(); } catch { /* ignore */ }
+  el.removeAttribute('src');
+  try { el.load(); } catch { /* ignore */ }
+  audibleVideoElementCache.delete(clipId);
+}
+
+/** Latest store copy of a clip by id — the transport provider must read
+ *  through to current state, not the snapshot captured at attach time
+ *  (the store replaces clip objects on every prop update). */
+let latestClipById: (id: string) => VJClip | null = () => null;
 
 // Cache for VJ source objects (keeps textures persistent)
 const vjSourceCache = new Map<string, MediaSource>();
 
 function releaseVJSourceCacheEntry(key: string): void {
   const source = vjSourceCache.get(key);
-  const armedVideoTexture = source?.type === 'video'
-    ? videoTextureCache.get(source.id)
-    : undefined;
-  if (source?.texture && source.texture !== armedVideoTexture) {
+  if (source?.texture) {
     try { source.texture.dispose?.(); } catch { /* ignore */ }
     source.texture = undefined;
   }
   vjSourceCache.delete(key);
-}
-
-function ensureClipVideoTexture(clip: VJClip, videoEl: HTMLVideoElement): MediaSource['texture'] {
-  let texture = videoTextureCache.get(clip.id);
-  if (texture && texture.image !== videoEl) {
-    try { texture.dispose?.(); } catch { /* ignore */ }
-    videoTextureCache.delete(clip.id);
-    texture = undefined;
-  }
-  if (!texture) {
-    texture = createVideoTexture(videoEl);
-    videoTextureCache.set(clip.id, texture);
-  }
-  clip.videoTexture = texture;
-  return texture;
-}
-
-function waitForDecodedClipFrame(clip: VJClip, videoEl: HTMLVideoElement): Promise<void> {
-  if (hasDecodedVideoFrame(videoEl)) return Promise.resolve();
-
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      videoEl.removeEventListener('loadeddata', onReady);
-      videoEl.removeEventListener('canplay', onReady);
-      videoEl.removeEventListener('error', onError);
-    };
-    const onReady = () => {
-      if (!hasDecodedVideoFrame(videoEl)) return;
-      cleanup();
-      ensureClipVideoTexture(clip, videoEl);
-      resolve();
-    };
-    const onError = () => {
-      cleanup();
-      reject(new Error(`Video clip failed to decode: ${clip.name}`));
-    };
-    videoEl.addEventListener('loadeddata', onReady);
-    videoEl.addEventListener('canplay', onReady);
-    videoEl.addEventListener('error', onError, { once: true });
-  });
 }
 
 function clearVJSourceCache(): void {
@@ -657,16 +808,37 @@ function mediaTypeForClip(clip: VJClip): 'shader' | 'video' | 'image' | 'threejs
   return 'image';
 }
 
-function isTransformableMediaClip(clip: VJClip | null | undefined): clip is VJTransformableClip {
-  return !!clip && (clip.type === 'video' || clip.type === 'image');
-}
-
 function ensureClipVideoElement(clip: VJClip): HTMLVideoElement | undefined {
   if (!clip || clip.type !== 'video') return clip.videoElement;
 
+  // Audio-enabled clips live in their own cache and are the ONLY elements in
+  // the app that ever get un-muted. See `audibleVideoElementCache` above for
+  // why they must not share the pooled cache.
+  if (clipWantsAudio(clip)) {
+    const audible = ensureAudibleClipElement(clip);
+    if (audible) {
+      // Retire any pooled element this clip previously used so we never keep
+      // two decoders of the same file alive.
+      const pooled = videoElementCache.get(clip.id);
+      if (pooled && pooled !== audible) {
+        try { pooled.pause(); } catch { /* ignore */ }
+        pooled.removeAttribute('src');
+        try { pooled.load(); } catch { /* ignore */ }
+        videoElementCache.delete(clip.id);
+      }
+      clip.isPlaying = clip.isPlaying ?? true;
+      clip.videoElement = audible;
+      return audible;
+    }
+  } else if (audibleVideoElementCache.has(clip.id)) {
+    // Audio was turned off — drop the audible element entirely and fall back
+    // to the normal pooled path below.
+    releaseAudibleClipElement(clip.id);
+    clip.videoElement = undefined;
+  }
+
   if (clip.videoElement && (clip.src?.startsWith('live://') || clip.videoElement.srcObject)) {
     videoElementCache.set(clip.id, clip.videoElement);
-    ensureClipVideoTexture(clip, clip.videoElement);
     clip.isPlaying = clip.isPlaying ?? true;
     return clip.videoElement;
   }
@@ -678,10 +850,6 @@ function ensureClipVideoElement(clip: VJClip): HTMLVideoElement | undefined {
     try { videoEl.pause(); } catch { /* ignore */ }
     videoEl.removeAttribute('src');
     videoElementCache.delete(clip.id);
-    const staleTexture = videoTextureCache.get(clip.id);
-    try { staleTexture?.dispose?.(); } catch { /* ignore */ }
-    videoTextureCache.delete(clip.id);
-    clip.videoTexture = undefined;
     videoEl = undefined;
   }
 
@@ -690,7 +858,7 @@ function ensureClipVideoElement(clip: VJClip): HTMLVideoElement | undefined {
     if (!shouldSkipVideoCors(clip.src)) {
       videoEl.crossOrigin = 'anonymous';
     }
-    videoEl.loop = false;
+    videoEl.loop = true;
     videoEl.muted = true;
     videoEl.playsInline = true;
     videoEl.preload = 'auto';
@@ -699,7 +867,7 @@ function ensureClipVideoElement(clip: VJClip): HTMLVideoElement | undefined {
 
     const v = videoEl;
     const tryPlay = () => {
-      if (clip.isPlaying === false) return;
+      if (clip.isPlaying === false || clip.playbackMode === 'bounce' || (clip.playbackRate ?? 1) < 0) return;
       v.play().catch(e => console.warn('[vjClipLauncher] video autoplay failed:', e));
     };
     if (v.readyState >= 2) tryPlay();
@@ -708,145 +876,148 @@ function ensureClipVideoElement(clip: VJClip): HTMLVideoElement | undefined {
   }
 
   clip.videoElement = videoEl;
-  syncTrimmedVideoPlayback(videoEl, clip);
-  ensureClipVideoTexture(clip, videoEl);
   return videoEl;
 }
 
-function videoArmKey(clip: VJClip): string {
-  return `${clip.src}|${Math.max(0, Math.min(1, clip.trimStart ?? 0)).toFixed(6)}`;
+const pendingNativeVideoMetadataArms = new Set<string>();
+
+function knownClipDurationSeconds(
+  clip: VJClip,
+  video = clip.videoElement,
+): number | undefined {
+  const candidate = Number(clip.durationSeconds ?? video?.duration);
+  return Number.isFinite(candidate) && candidate > 0 ? candidate : undefined;
 }
 
-function waitForVideoEvent(
-  videoEl: HTMLVideoElement,
-  eventName: 'loadedmetadata' | 'seeked',
-  timeoutMs = 1500,
-): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      videoEl.removeEventListener(eventName, finish);
-      clearTimeout(timeout);
-      resolve();
-    };
-    const timeout = window.setTimeout(finish, timeoutMs);
-    videoEl.addEventListener(eventName, finish, { once: true });
-  });
+function clipLaunchTimeSeconds(
+  clip: VJClip,
+  duration = knownClipDurationSeconds(clip),
+): number {
+  return nativeVideoLaunchTime(clip, duration);
 }
 
-function waitForPresentedVideoFrame(videoEl: HTMLVideoElement, timeoutMs = 500): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let frameHandle: number | undefined;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (frameHandle !== undefined && typeof videoEl.cancelVideoFrameCallback === 'function') {
-        videoEl.cancelVideoFrameCallback(frameHandle);
-      }
-      resolve();
-    };
-    const timeout = window.setTimeout(finish, timeoutMs);
-    if (typeof videoEl.requestVideoFrameCallback === 'function') {
-      frameHandle = videoEl.requestVideoFrameCallback(finish);
-    } else {
-      requestAnimationFrame(() => requestAnimationFrame(finish));
-    }
-  });
-}
-
-function isVideoArmedAtTrimStart(clip: VJClip, videoEl: HTMLVideoElement): boolean {
-  const state = armedVideoStates.get(clip.id);
-  if (!state?.ready || state.key !== videoArmKey(clip)) return false;
-  if (!hasDecodedVideoFrame(videoEl) || !videoEl.paused) return false;
-  const duration = videoEl.duration;
-  if (!Number.isFinite(duration) || duration <= 0) return false;
-  const target = Math.max(0, Math.min(1, clip.trimStart ?? 0)) * duration;
-  return Math.abs(videoEl.currentTime - target) <= Math.max(1 / 120, duration * 0.00001);
-}
-
-/**
- * Decode and park the exact first visible frame while the clip is inactive.
- * Triggering then becomes play + reveal; no seek or decoder wait occurs in
- * the frame where the active clip changes.
- */
-function armVideoClipForTrigger(clip: VJClip): Promise<HTMLVideoElement> {
-  const videoEl = ensureClipVideoElement(clip);
-  if (!videoEl) return Promise.reject(new Error(`Video clip has no source: ${clip.name}`));
-
-  const key = videoArmKey(clip);
-  const current = armedVideoStates.get(clip.id);
-  if (current?.key === key) {
-    if (current.ready && isVideoArmedAtTrimStart(clip, videoEl)) return Promise.resolve(videoEl);
-    if (current.promise) return current.promise;
+function armVJVideoClip(clip: VJClip, force = false): HTMLVideoElement | undefined {
+  if (clip.type !== 'video' || !clip.src || clip.src.startsWith('live://')) {
+    return ensureClipVideoElement(clip);
   }
 
-  const state: ArmedVideoState = { key, ready: false };
-  const promise = (async () => {
-    clip.isPlaying = false;
-    try { videoEl.pause(); } catch { /* ignore */ }
+  const video = ensureClipVideoElement(clip);
+  const duration = knownClipDurationSeconds(clip, video);
+  if (duration) clip.durationSeconds = duration;
+  const currentSeekGeneration = Number(clip._nativePlaybackSeekSeq);
+  const nextSeekGeneration = Number.isFinite(currentSeekGeneration)
+    ? Math.max(0, Math.floor(currentSeekGeneration)) + 1
+    : 1;
 
-    if (!Number.isFinite(videoEl.duration) || videoEl.duration <= 0) {
-      await waitForVideoEvent(videoEl, 'loadedmetadata');
-    }
+  armNativeLibraryVideo({
+    id: clip.id,
+    src: clip.src,
+    assetRef: clip._assetRef,
+    videoElement: video,
+    seekGeneration: nextSeekGeneration,
+    playbackRate: clip.playbackRate ?? 1,
+    playbackMode: clip.playbackMode ?? 'loop',
+    durationSeconds: duration,
+    videoWidth: clip.videoWidth, videoHeight: clip.videoHeight,
+    trimStart: clip.trimStart ?? 0,
+    trimEnd: clip.trimEnd ?? 1,
+  }, force);
 
-    const duration = videoEl.duration;
-    if (!Number.isFinite(duration) || duration <= 0) {
-      throw new Error(`Video duration is unavailable: ${clip.name}`);
-    }
+  if (!duration && video && !pendingNativeVideoMetadataArms.has(clip.id)) {
+    pendingNativeVideoMetadataArms.add(clip.id);
+    video.addEventListener('loadedmetadata', () => {
+      pendingNativeVideoMetadataArms.delete(clip.id);
+      const nextDuration = knownClipDurationSeconds(clip, video);
+      if (nextDuration) clip.durationSeconds = nextDuration;
+      armVJVideoClip(clip);
+    }, { once: true });
+  }
 
-    const target = Math.max(0, Math.min(1, clip.trimStart ?? 0)) * duration;
-    if (!hasDecodedVideoFrame(videoEl) ||
-        Math.abs(videoEl.currentTime - target) > Math.max(1 / 120, duration * 0.00001)) {
-      const seeked = waitForVideoEvent(videoEl, 'seeked');
-      videoEl.currentTime = target;
-      await seeked;
-      // `seeked` means the media timeline moved; it does not guarantee the
-      // corresponding frame has reached Chromium's presentation queue yet.
-      // Waiting for rVFC prevents activation from winning that race by one
-      // compositor frame.
-      await waitForPresentedVideoFrame(videoEl);
-    }
-
-    await waitForDecodedClipFrame(clip, videoEl);
-    const texture = ensureClipVideoTexture(clip, videoEl);
-    if (texture) texture.needsUpdate = true;
-    state.ready = true;
-    state.promise = undefined;
-    return videoEl;
-  })().catch((error) => {
-    if (armedVideoStates.get(clip.id) === state) armedVideoStates.delete(clip.id);
-    throw error;
-  });
-
-  state.promise = promise;
-  armedVideoStates.set(clip.id, state);
-  return promise;
+  return video;
 }
 
 /**
- * Put an already-armed video into motion before publishing it as active.
- *
- * Svelte store subscribers render synchronously during update(). If the
- * activation happens after that update, videos visibly trail shaders.
+ * Re-exported so callers that already reach for these keep working; the rule
+ * itself lives in nativeTransport, shared with mapping mode so the two cannot
+ * drift apart.
  */
-function prepareVideoClipForTrigger(clip: VJClip): HTMLVideoElement | undefined {
-  if (clip.type !== 'video') return undefined;
-  const videoEl = ensureClipVideoElement(clip);
-  if (!videoEl) return undefined;
+export const CLIP_POSITION_SYNC_DRIFT_SECONDS = NATIVE_POSITION_DRIFT_SECONDS;
 
+/** Where this clip's playhead is right now, predicted from the native anchor. */
+export function predictedClipPlayheadSeconds(clip: VJClip, nowMs = performance.now()): number {
+  return predictNativePlayheadSeconds(clip, nowMs);
+}
+
+function triggerNativeVJVideoClip(clip: VJClip, nowMs = performance.now()): number {
+  // Trigger is a pure handoff to an already-armed native decoder. Never call
+  // ensure/arm here: creating browser media or issuing a prefetch RPC on the
+  // click path lets decoder setup race ahead of the urgent native bind.
+  const video = clip.videoElement || videoElementCache.get(clip.id);
+  const duration = knownClipDurationSeconds(clip, video);
+  const timeSeconds = clipLaunchTimeSeconds(clip, duration);
+  if (duration) clip.durationSeconds = duration;
   clip.isPlaying = true;
-  armedVideoStates.delete(clip.id);
-  if (videoEl.paused) {
-    videoEl.play().catch(() => { /* AbortError on rapid retrigger is fine */ });
-  }
-  if (clip.videoTexture) {
-    clip.videoTexture.needsUpdate = true;
-  }
-  return videoEl;
+  clip._nativePlaybackDirection = (clip.playbackRate ?? 1) < 0 ? -1 : 1;
+  clip._nativePlaybackTimeSeconds = timeSeconds;
+  clip._nativePlaybackUpdatedAtMs = nowMs;
+  clip._nativePlaybackSeekSeq = Number.isFinite(Number(clip._nativePlaybackSeekSeq))
+    ? Math.floor(Number(clip._nativePlaybackSeekSeq)) + 1
+    : 1;
+  return timeSeconds;
+}
+
+function requestImmediateNativeVJSync(clips: Array<VJClip | null | undefined> = []): void {
+  if (typeof window === 'undefined') return;
+  const videoSourceIds = Array.from(new Set(
+    clips
+      .filter((clip): clip is VJClip => !!clip && clip.type === 'video')
+      .map((clip) => clip.id),
+  ));
+  window.dispatchEvent(new CustomEvent('ghost:native-vj-layers-sync', {
+    detail: {
+      urgent: true,
+      videoSourceIds,
+      triggeredAtMs: performance.now(),
+      // Start preparing the next trigger as soon as the core has claimed
+      // this one. A fixed 75 ms timer wasted most of a sixteenth note and
+      // could also reap the warm session before a delayed handoff claimed it.
+      onVideoHandoff: () => {
+        for (const clip of clips) {
+          if (clip?.type === 'video') armVJVideoClip(clip);
+        }
+      },
+    },
+  }));
+}
+
+function syncBrowserVideoAfterNativeTrigger(
+  incoming: VJClip | null | undefined,
+  outgoing: VJClip | null | undefined,
+  startSeconds: number,
+): void {
+  // Browser video elements support metadata and transport UI only in the
+  // native build. Keep their seek/play work behind the native handoff so it
+  // can never add latency to visible output.
+  queueMicrotask(() => {
+    const incomingVideo = incoming?.type === 'video'
+      ? (incoming.videoElement || videoElementCache.get(incoming.id))
+      : undefined;
+    if (incomingVideo) {
+      try { incomingVideo.currentTime = startSeconds; } catch { /* media may still be loading */ }
+      incoming!.isPlaying = true;
+      if (incoming!.playbackMode === 'bounce' || (incoming!.playbackRate ?? 1) < 0) incomingVideo.pause();
+      else if (incomingVideo.paused) {
+        incomingVideo.play().catch(() => { /* rapid retriggers can abort play */ });
+      }
+    }
+
+    if (outgoing?.type === 'video' && !vjClipTransitions.referencesClip(outgoing.id)) {
+      const outgoingVideo = outgoing.videoElement || videoElementCache.get(outgoing.id);
+      if (outgoingVideo && outgoingVideo !== incomingVideo) {
+        try { outgoingVideo.pause(); } catch { /* ignore */ }
+      }
+    }
+  });
 }
 
 function pauseClipRuntime(clip: VJClip | null | undefined): void {
@@ -855,9 +1026,6 @@ function pauseClipRuntime(clip: VJClip | null | undefined): void {
   if (!videoEl) return;
   try { videoEl.pause(); } catch { /* ignore */ }
   clip.isPlaying = false;
-  void armVideoClipForTrigger(clip).catch((error) => {
-    console.warn('[vjClipLauncher] video re-arm failed:', error);
-  });
 }
 
 /** Release a removed clip's cached video element unless the same clip id
@@ -868,7 +1036,8 @@ function pauseClipRuntime(clip: VJClip | null | undefined): void {
  *  the rest of the session. Checked against the NEXT state so the cell
  *  being cleared doesn't count as a reference. */
 function releaseClipRuntimeIfOrphaned(nextState: any, clipId: string): void {
-  if (!clipId || !videoElementCache.has(clipId)) return;
+  if (!clipId || vjClipTransitions.referencesClip(clipId)) return;
+  if (!videoElementCache.has(clipId) && !audibleVideoElementCache.has(clipId)) return;
   const gridHasClip = (grid: any) =>
     Array.isArray(grid) && grid.some((row: any) => Array.isArray(row) && row.some((c: any) => c?.id === clipId));
   const statesHaveClip = (ls: any) =>
@@ -878,39 +1047,153 @@ function releaseClipRuntimeIfOrphaned(nextState: any, clipId: string): void {
   for (const block of nextState.blocks ?? []) {
     if (gridHasClip(block.clipGrid) || gridHasClip(block.bankBClipGrid)) return;
   }
-  const video = videoElementCache.get(clipId)!;
+  // Audible clips: detach from the bus BEFORE dropping the element, so the
+  // gain node and MediaElementAudioSourceNode go with it.
+  releaseAudibleClipElement(clipId);
+  const video = videoElementCache.get(clipId);
+  if (!video) return;
   try { video.pause(); } catch { /* ignore */ }
   video.removeAttribute('src');
   try { video.load(); } catch { /* ignore */ }
   videoElementCache.delete(clipId);
-  armedVideoStates.delete(clipId);
-  const texture = videoTextureCache.get(clipId);
-  try { texture?.dispose?.(); } catch { /* ignore */ }
-  videoTextureCache.delete(clipId);
+}
+
+function vjTransitionRowIsVisible(state: VJClipLauncherState, deck: VJDeck, layerIndex: number): boolean {
+  // MAP rows play ordinary clips too (surfaces bound to a row show them),
+  // so their clip transitions run exactly as in MIX and STAGE.
+  if (!state.isLive || (deck === 'B' && !state.crossfaderEnabled)) return false;
+  const states = pickLayerStates(state, deck);
+  const layer = states[layerIndex];
+  return !!layer && !layer.mute && (!states.some(entry => entry.solo) || layer.solo);
+}
+
+function cancelHiddenVJClipTransitions(state: VJClipLauncherState, deck: VJDeck): void {
+  for (const transition of get(vjClipTransitions).values()) {
+    if (transition.deck === deck && !vjTransitionRowIsVisible(state, deck, transition.layerIndex)) {
+      vjClipTransitions.cancel(deck, transition.layerIndex, transition.token);
+    }
+  }
+}
+
+function beginVJClipTransition(state: VJClipLauncherState, deck: VJDeck, layerIndex: number, incoming: VJClip, launchGroup?: number): void {
+  const layer = pickLayerStates(state, deck)[layerIndex];
+  if (!layer) return;
+  const config = effectiveClipTransition(layer, incoming);
+  vjClipTransitions.begin(deck, layerIndex, layer.activeClip, incoming,
+    vjTransitionRowIsVisible(state, deck, layerIndex) ? config.duration : 0, config.style, undefined, undefined, launchGroup);
+}
+
+// Capture queued content identity, not mutable clip objects. Grid edits and
+// block changes must never turn a queued button into a different launch.
+function queuedClipIds(state: VJClipLauncherState, bank: VJDeck, column: number, layer?: number): (string | null)[] {
+  const grid = pickGrid(state, bank);
+  return layer === undefined ? grid.map(row => row[column]?.id ?? null) : [grid[layer]?.[column]?.id ?? null];
+}
+function queuedTriggerStillMatches(trigger: PendingTrigger, state: VJClipLauncherState): boolean {
+  if (trigger.blockId !== undefined && trigger.blockId !== state.activeBlockId) return false;
+  if (trigger.columnIndex < 0 || trigger.columnIndex >= state.numColumns) return false;
+  if (trigger.kind !== 'column' && (trigger.layerIndex < 0 || trigger.layerIndex >= state.numLayers)) return false;
+  if (trigger.kind !== 'column' && pickLayerStates(state, trigger.bank)[trigger.layerIndex]?.locked) return false;
+  if (trigger.autopilotSource) {
+    if (pickLayerStates(state, trigger.bank)[trigger.layerIndex]?.autopilotPaused) return false;
+    const clip = pickLayerStates(state, trigger.bank)[trigger.layerIndex]?.activeClip;
+    if (!clip || clip.isPlaying === false || autopilotSourceToken(clip, pickLayerStates(state, trigger.bank)[trigger.layerIndex]?.autopilot) !== trigger.autopilotSource) return false;
+  }
+  if (!trigger.clipIds) return true;
+  const current = queuedClipIds(state, trigger.bank, trigger.columnIndex, trigger.kind === 'column' ? undefined : trigger.layerIndex);
+  return current.length === trigger.clipIds.length && current.every((id, index) =>
+    (trigger.kind === 'column' && trigger.layerIndices && !trigger.layerIndices.includes(index)) || id === trigger.clipIds![index]);
+}
+
+function autopilotSourceToken(clip: VJClip, config?: VJAutopilot): string {
+  return JSON.stringify([clip.id, clip._launchGeneration ?? 0, clip._nativePlaybackSeekSeq ?? 0, config, clip.trimStart, clip.trimEnd]);
+}
+let launchGeneration = 0;
+
+/** Protect the currently playing clip, including empty destination columns. */
+function ignoresColumn(row: VJLayerState): boolean {
+  return row.activeClip?.ignoreColumnTrigger ?? row.ignoreColumnTrigger ?? false;
 }
 
 // Create the store
 function createVJClipLauncherStore() {
-  const { subscribe, set, update } = writable<VJClipLauncherState>(createDefaultState());
+  const { subscribe, set, update: updateStore } = writable<VJClipLauncherState>(createDefaultState());
+  const holds = new Map<string, { clipId: string; column: number; inputs: Set<string> }>();
+  const rowKey = (deck: VJDeck, row: number) => `${deck}:${row}`;
+  const update = (change: (state: VJClipLauncherState) => VJClipLauncherState) => updateStore(before => {
+    let next = change(before);
+    if (next.pendingTriggers.some(p => p.kind === 'column')) {
+      next = { ...next, pendingTriggers: next.pendingTriggers.flatMap(p => {
+        if (p.kind !== 'column') return [p];
+        const rows = pickLayerStates(next, p.bank);
+        const layerIndices = (p.layerIndices ?? rows.map((_, i) => i))
+          .filter(i => rows[i] && !rows[i].locked && !ignoresColumn(rows[i]));
+        return layerIndices.length ? [{ ...p, layerIndices }] : [];
+      }) };
+    }
+    if (before.activeBlockId !== next.activeBlockId || before.mapMode !== next.mapMode
+      || (before.isLive && !next.isLive) || (before.isOpen && !next.isOpen)) holds.clear();
+    for (const [key, hold] of holds) {
+      const [deck, row] = key.split(':');
+      if (pickGrid(next, deck as VJDeck)[Number(row)]?.[hold.column]?.id !== hold.clipId
+        || (deck === 'B' && before.crossfaderEnabled && !next.crossfaderEnabled)) holds.delete(key);
+    }
+    if (!next.pendingTriggers.length) return next;
+    const leaveLive = (before.isLive && !next.isLive) || (before.isOpen && !next.isOpen);
+    const changedContext = before.activeBlockId !== next.activeBlockId || before.mapMode !== next.mapMode;
+    const pendingTriggers = leaveLive || changedContext ? [] : next.pendingTriggers.filter(trigger =>
+      !(trigger.bank === 'B' && before.crossfaderEnabled && !next.crossfaderEnabled)
+      && queuedTriggerStillMatches(trigger, next));
+    return pendingTriggers.length === next.pendingTriggers.length ? next : { ...next, pendingTriggers };
+  });
+
+  // Patch the playing video and its original grid cells even while another
+  // block is browsed. Keep each block's other clip settings intact.
+  const patchActiveVideo = (layerIndex: number, deck: VJDeck, patch: Partial<VJClip>) => update(state => {
+    const rows = pickLayerStates(state, deck);
+    const clip = rows[layerIndex]?.activeClip;
+    if (!clip || clip.type !== 'video') return state;
+    const next = [...rows];
+    next[layerIndex] = { ...rows[layerIndex], activeClip: { ...clip, ...patch } };
+    const mapGrid = (grid: (VJClip | null)[][]) => grid.map((row, index) => index === layerIndex
+      ? row.map(cell => cell?.id === clip.id ? { ...cell, ...patch } : cell) : row);
+    const grid = mapGrid(pickGrid(state, deck));
+    const blocks = state.blocks.map(block => deck === 'A'
+      ? { ...block, clipGrid: mapGrid(block.clipGrid) }
+      : { ...block, bankBClipGrid: block.bankBClipGrid ? mapGrid(block.bankBClipGrid) : undefined });
+    return { ...withDeck(state, deck, next, grid), blocks };
+  });
+
+  // Wire the module-level clip lookup used by the clip-audio transport
+  // provider. The store replaces clip OBJECTS on every prop update, so the
+  // provider must resolve by id on each tick rather than close over the
+  // snapshot it was attached with — otherwise trim/rate/seek edits would
+  // never reach the audio element.
+  latestClipById = (id: string): VJClip | null => {
+    if (!id) return null;
+    const state = get({ subscribe });
+    for (const states of [state.layerStates, state.bankBLayerStates]) {
+      if (!Array.isArray(states)) continue;
+      for (const layerState of states) {
+        const clip = layerState?.activeClip;
+        if (clip && clip.id === id) return clip;
+      }
+    }
+    return null;
+  };
 
   // Wire the module-level immediateTriggerClip closure so triggerClip() can
   // delegate to it AND so the rAF tick can fire queued triggers without
   // needing access to the store closure scope.
-  const commitImmediateTriggerClip = (layerIndex: number, columnIndex: number, deck: VJDeck) => {
+  immediateTriggerClip = (layerIndex, columnIndex, deck, preserveHold = false) => {
+    if (pickLayerStates(get({ subscribe }), deck)[layerIndex]?.locked) return;
+    if (!preserveHold) holds.delete(rowKey(deck, layerIndex));
     let didTrigger = false;
     let isReclick = false;
     let outgoingClip: VJClip | null = null;
     let incomingClip: VJClip | null = null;
-
-    // Prepare the decoded frame before the store publishes this clip as
-    // active. Store subscribers (including the compositor adapter) run
-    // synchronously inside update(), so this ordering is the difference
-    // between same-frame video/shader triggering and a one-frame video lag.
-    const before = get({ subscribe });
-    const requestedClip = pickGrid(before, deck)[layerIndex]?.[columnIndex];
-    if (requestedClip?.type === 'video') {
-      prepareVideoClipForTrigger(requestedClip);
-    }
+    let incomingStartSeconds = 0;
+    let presetOnly = false;
 
     update(state => {
       const targetGrid = pickGrid(state, deck);
@@ -919,22 +1202,23 @@ function createVJClipLauncherStore() {
       const clip = targetGrid[layerIndex]?.[columnIndex];
       if (!clip) return state;
       // Preset clips:
-      //   - ALWAYS load the composition into project.layers (side
-      //     effect). In STAGE mode this immediately swaps the mapping
-      //     topology, exiting VJ shows the loaded preset, etc.
-      //   - In MAP mode ALSO occupy the VJ layer slot via activeClip
-      //     so the Canvas MAP render branch composites this preset
-      //     into the output stack. The cell highlight + per-VJ-layer
-      //     opacity + blend mode all flow from that.
-      //   - In MIX / STAGE the slot stays available for the user's
-      //     real VJ content. Otherwise firing a preset would lock
-      //     a VJ layer to "no content" (the preset is filtered out
-      //     of vjOutputLayers) and shader/video fires on the same
-      //     layer would appear to do nothing visually.
+      //   - In MAP mode the preset occupies the VJ layer slot via
+      //     activeClip and the Canvas MAP render branch composites it
+      //     from the saved preset over the shared map. project.layers
+      //     is NOT touched: the editor keeps its unsaved edits and the
+      //     sequencer / keyframe transports keep running.
+      //   - In MIX / STAGE firing a preset loads it into project.layers
+      //     (a side effect; in STAGE it swaps the mapping topology) and
+      //     the slot stays available for the user's real VJ content.
+      //     Otherwise firing a preset would lock a VJ layer to "no
+      //     content" (the preset is filtered out of vjOutputLayers) and
+      //     shader/video fires on the same layer would appear to do
+      //     nothing visually.
       if (clip.type === 'preset') {
-        if (clip.presetId) {
+        vjClipTransitions.cancel(deck, layerIndex);
+        if (clip.presetId && !state.mapMode) {
           void import('./layers').then(({ project }) => {
-            project.loadComposition(clip.presetId!);
+            project.loadComposition(clip.presetId!, { recordHistory: false });
           }).catch((err) => {
             console.error('[VJ] preset load failed:', err);
           });
@@ -956,87 +1240,61 @@ function createVJClipLauncherStore() {
           activeClip: clip,
         };
         didTrigger = true;
+        presetOnly = true;
         incomingClip = clip;
         const next = withDeck(state, deck, newLayerStates);
         return { ...next, stoppedAll: false };
       }
+      if (clip.type === 'video') {
+        incomingStartSeconds = triggerNativeVJVideoClip(clip);
+      }
+
       const current = newLayerStates[layerIndex].activeClip;
       isReclick = !!(current && current.id === clip.id);
       outgoingClip = !isReclick ? current : null;
-      incomingClip = clip;
+      // Clone video clips so retriggers publish their new native seek
+      // generation even when the same grid cell is already active.
+      const triggeredClip = { ...clip, _launchGeneration: ++launchGeneration };
+      incomingClip = triggeredClip;
+      beginVJClipTransition(state, deck, layerIndex, triggeredClip);
 
-      // Re-clicking the currently-playing clip keeps STATE unchanged
-      // (so we don't reset keyframe time mid-show), but the video
-      // element below is still restarted to frame 0 — that's the
-      // explicit user expectation: every click on a clip starts it
-      // from the beginning, no exceptions.
+      // A retrigger is a real state transition. The cloned clip carries a
+      // fresh native seek generation, allowing the core to present trim-in
+      // immediately without rebuilding or rewarming the decoder.
       if (isReclick) {
-        didTrigger = false;
-        return state;
+        newLayerStates[layerIndex] = {
+          ...newLayerStates[layerIndex],
+          activeColumn: columnIndex,
+          activeClip: triggeredClip,
+        };
+        didTrigger = true;
+        const next = withDeck(state, deck, newLayerStates);
+        return { ...next, stoppedAll: false };
       }
 
       newLayerStates[layerIndex] = {
         ...newLayerStates[layerIndex],
         activeColumn: columnIndex,
-        activeClip: clip,
+        activeClip: triggeredClip,
       };
       didTrigger = true;
       const next = withDeck(state, deck, newLayerStates);
       return { ...next, stoppedAll: false };
     });
 
-    // VJ semantics: clicking a clip ALWAYS restarts it at its trim start,
-    // never resumes from where it last paused. Combined with pausing
-    // the outgoing clip on this same layer/deck, this stops the
-    // "videos play forever in the background and resume mid-stream"
-    // behaviour the user reported. Wrapped in try/catch because
-    // currentTime= can throw if the element is mid-load.
-    // Cast through the VJClip type — TS can't track assignments
-    // inside the update() closure across closure boundaries.
     const inc = incomingClip as VJClip | null;
     const out = outgoingClip as VJClip | null;
-    // Pause the OUTGOING video so it doesn't keep decoding in the
-    // background. Only when it's a different element from the
-    // incoming clip's — same element (e.g. re-clicking same clip on
-    // the layer) doesn't get paused mid-restart.
-    if (out && out.type === 'video' && out.videoElement &&
-        out.videoElement !== inc?.videoElement) {
-      pauseClipRuntime(out);
-    }
 
     if (didTrigger) {
-      keyframeTimeline.seek(0);
-      keyframeTimeline.play();
-    }
-  };
-
-  // A clip cannot enter the visible stack until Chromium has decoded a frame.
-  // Usually this is synchronous because setClip arms videos in advance. The
-  // async branch only covers a user firing immediately after adding a clip;
-  // the outgoing layer remains visible instead of flashing black.
-  const pendingVideoTriggers = new Map<string, number>();
-  let videoTriggerSerial = 0;
-  immediateTriggerClip = (layerIndex, columnIndex, deck) => {
-    const triggerKey = `${deck}:${layerIndex}`;
-    const requestId = ++videoTriggerSerial;
-    pendingVideoTriggers.set(triggerKey, requestId);
-
-    const state = get({ subscribe });
-    const clip = pickGrid(state, deck)[layerIndex]?.[columnIndex];
-    if (clip?.type === 'video') {
-      const videoEl = ensureClipVideoElement(clip);
-      if (videoEl && !isVideoArmedAtTrimStart(clip, videoEl)) {
-        void armVideoClipForTrigger(clip)
-          .then(() => {
-            if (pendingVideoTriggers.get(triggerKey) !== requestId) return;
-            commitImmediateTriggerClip(layerIndex, columnIndex, deck);
-          })
-          .catch((error) => console.warn('[vjClipLauncher] trigger held; video is not ready:', error));
-        return;
+      requestImmediateNativeVJSync([inc]);
+      syncBrowserVideoAfterNativeTrigger(inc, out, incomingStartSeconds);
+      // A MAP preset renders from its saved copy; restarting the editor's
+      // keyframe transport would animate project.layers underneath it.
+      if (!presetOnly) {
+        keyframeTimeline.seek(0);
+        keyframeTimeline.play();
       }
     }
-
-    commitImmediateTriggerClip(layerIndex, columnIndex, deck);
   };
 
   return {
@@ -1046,18 +1304,19 @@ function createVJClipLauncherStore() {
 
     // Reset to default state
     reset() {
+      holds.clear();
+      releaseTempoNudgeInputs('');
+      vjClipTransitions.clear();
       // Cleanup video elements
       for (const video of videoElementCache.values()) {
         video.pause();
         video.src = '';
       }
       videoElementCache.clear();
-      armedVideoStates.clear();
-      clearVJSourceCache();
-      for (const texture of videoTextureCache.values()) {
-        try { texture?.dispose?.(); } catch { /* ignore */ }
+      for (const clipId of Array.from(audibleVideoElementCache.keys())) {
+        releaseAudibleClipElement(clipId);
       }
-      videoTextureCache.clear();
+      clearVJSourceCache();
       set(createDefaultState());
     },
 
@@ -1065,6 +1324,7 @@ function createVJClipLauncherStore() {
     // clip grid. Used when exiting VJ so stale shader/canvas textures do
     // not linger behind the main editor.
     clearRuntimeSourceCache() {
+      vjClipTransitions.clear();
       clearVJSourceCache();
     },
 
@@ -1076,7 +1336,12 @@ function createVJClipLauncherStore() {
     // is used when workspace.setActive() drives the close itself, to
     // avoid bouncing back through workspace and double-firing.
     setOpen(isOpen: boolean, opts?: { fromWorkspace?: boolean }) {
-      update(state => ({ ...state, isOpen }));
+      if (!isOpen) releaseTempoNudgeInputs('');
+      if (!isOpen) vjClipTransitions.clear();
+      // Closing or leaving the VJ workspace relinquishes output ownership in
+      // the same notification. Otherwise Canvas can keep presenting VJ while
+      // its transports have already stopped, leaving a frozen frame in Mapping.
+      update(state => ({ ...state, isOpen, isLive: isOpen ? state.isLive : false }));
       if (!opts?.fromWorkspace) {
         void import('./workspace').then(({ workspace }) => {
           workspace.setActive(isOpen ? 'vj' : 'main');
@@ -1088,6 +1353,8 @@ function createVJClipLauncherStore() {
     // to the active block's persisted grid (Bank B has no block system).
     setClip(layerIndex: number, columnIndex: number, clip: VJClip | null, deck: VJDeck = 'A') {
       update(state => {
+        const protectedLayer = pickLayerStates(state, deck)[layerIndex];
+        if (protectedLayer?.locked && protectedLayer.activeClip && protectedLayer.activeClip.id === pickGrid(state, deck)[layerIndex]?.[columnIndex]?.id) return state;
         const targetGrid = pickGrid(state, deck);
         const newGrid = targetGrid.map(row => [...row]);
 
@@ -1106,7 +1373,7 @@ function createVJClipLauncherStore() {
         // and the first VideoTexture sample comes back as a single black
         // frame. That's the "VJ video shows one stuck frame" bug.
         if (clip && clip.type === 'video') {
-          ensureClipVideoElement(clip);
+          armVJVideoClip(clip);
           let videoEl = videoElementCache.get(clip.id) || clip.videoElement;
           if (!videoEl) {
             videoEl = document.createElement('video');
@@ -1115,7 +1382,7 @@ function createVJClipLauncherStore() {
             if (!clip.src.startsWith('blob:') && !clip.src.startsWith('file:')) {
               videoEl.crossOrigin = 'anonymous';
             }
-            videoEl.loop = false;
+            videoEl.loop = true;
             videoEl.muted = true;
             videoEl.playsInline = true;
             videoEl.preload = 'auto';
@@ -1124,7 +1391,6 @@ function createVJClipLauncherStore() {
             // the deck, so playback should start. UI toggle (pause from the
             // VJ video controls panel) flips this to false later.
             clip.isPlaying = clip.isPlaying ?? true;
-            syncTrimmedVideoPlayback(videoEl, clip);
             // Wait for the first frame to decode, then play. DON'T call
             // `.load()` here — the `.src=` setter above already initiated
             // the resource selection algorithm. A second load() races the
@@ -1139,10 +1405,6 @@ function createVJClipLauncherStore() {
             videoElementCache.set(clip.id, videoEl);
           }
           clip.videoElement = videoEl;
-          ensureClipVideoTexture(clip, videoEl);
-          void armVideoClipForTrigger(clip).catch((error) => {
-            console.warn('[vjClipLauncher] video arm failed:', error);
-          });
         }
 
         // If setting a threejs clip (built-in), create/get the iframe context
@@ -1151,8 +1413,11 @@ function createVJClipLauncherStore() {
           clip.iframeElement = context.iframe;
         }
 
-        // If setting an AI-generated JS animation (threejs or p5js with jsAnimation)
-        if (clip && (clip.type === 'jsanimation' || clip.type === 'p5js') && clip.jsAnimation) {
+        // If setting an AI-generated JS animation (threejs or p5js with jsAnimation).
+        // Under the native engine the sync runs these pages in offscreen hosts
+        // while the clip is live; an editor iframe here would run the page a
+        // second time, on the editor's own thread, and never be disposed.
+        if (clip && (clip.type === 'jsanimation' || clip.type === 'p5js') && clip.jsAnimation && !(NATIVE_ENGINE_ONLY && isDesktopApp)) {
           const context = createJSAnimationContext(clip.id, clip.jsAnimation);
           clip.iframeElement = context.iframe;
         }
@@ -1186,12 +1451,9 @@ function createVJClipLauncherStore() {
 
     // Clear a clip from the grid for the given deck
     clearClip(layerIndex: number, columnIndex: number, deck: VJDeck = 'A') {
-      const before = get({ subscribe });
-      const activeBefore = pickLayerStates(before, deck)[layerIndex]?.activeClip;
-      if (activeBefore && pickLayerStates(before, deck)[layerIndex]?.activeColumn === columnIndex) {
-        pauseClipRuntime(activeBefore);
-      }
       update(state => {
+        const protectedLayer = pickLayerStates(state, deck)[layerIndex];
+        if (protectedLayer?.locked && protectedLayer.activeClip && protectedLayer.activeClip.id === pickGrid(state, deck)[layerIndex]?.[columnIndex]?.id) return state;
         const targetGrid = pickGrid(state, deck);
         const targetLayerStates = pickLayerStates(state, deck);
 
@@ -1209,6 +1471,7 @@ function createVJClipLauncherStore() {
         // If this was the active clip, deactivate it and clear the reference
         const newLayerStates = [...targetLayerStates];
         if (newLayerStates[layerIndex].activeColumn === columnIndex) {
+          vjClipTransitions.cancel(deck, layerIndex);
           newLayerStates[layerIndex] = { ...newLayerStates[layerIndex], activeColumn: null, activeClip: null };
         }
 
@@ -1263,6 +1526,13 @@ function createVJClipLauncherStore() {
 
         if (!changed) return state;
 
+        for (const transition of get(vjClipTransitions).values()) {
+          if (transition.outgoingClip.type === 'synthvision'
+            || pickLayerStates(state, transition.deck)[transition.layerIndex]?.activeClip?.type === 'synthvision') {
+            vjClipTransitions.cancel(transition.deck, transition.layerIndex, transition.token);
+          }
+        }
+
         const newLayerStatesA = state.layerStates.map((ls) => {
           if (ls.activeClip?.type === 'synthvision') {
             return { ...ls, activeColumn: null, activeClip: null };
@@ -1286,6 +1556,48 @@ function createVJClipLauncherStore() {
       });
     },
 
+    // Launch a Performer source directly into a deck layer without writing it
+    // into the user's clip grid. Keyboard cells are instruments, not aliases
+    // for VJ grid column 0; persisting them there caused a key assigned on
+    // Deck A to be copied into Deck B when B happened to be selected.
+    launchTransientClip(layerIndex: number, clip: VJClip, deck: VJDeck = 'A') {
+      if (pickLayerStates(get({ subscribe }), deck)[layerIndex]?.locked) return;
+      let outgoingClip: VJClip | null = null;
+      let didLaunch = false;
+      const incomingStartSeconds = clip.type === 'video'
+        ? triggerNativeVJVideoClip(clip)
+        : 0;
+      const launchedClip = { ...clip, _launchGeneration: ++launchGeneration };
+
+      update(state => {
+        const targetLayerStates = pickLayerStates(state, deck);
+        const currentLayer = targetLayerStates[layerIndex];
+        if (!currentLayer) return state;
+
+        outgoingClip = currentLayer.activeClip;
+        beginVJClipTransition(state, deck, layerIndex, launchedClip);
+        const newLayerStates = [...targetLayerStates];
+        newLayerStates[layerIndex] = {
+          ...currentLayer,
+          activeColumn: null,
+          activeClip: launchedClip,
+        };
+        didLaunch = true;
+        return {
+          ...withDeck(state, deck, newLayerStates),
+          stoppedAll: false,
+        };
+      });
+
+      if (!didLaunch) return;
+
+      const outgoing = outgoingClip as VJClip | null;
+      requestImmediateNativeVJSync([launchedClip]);
+      syncBrowserVideoAfterNativeTrigger(launchedClip, outgoing, incomingStartSeconds);
+      keyframeTimeline.seek(0);
+      keyframeTimeline.play();
+    },
+
     // Trigger a clip on the given deck.
     //
     // Behavior depends on `state.quantization`:
@@ -1295,27 +1607,40 @@ function createVJClipLauncherStore() {
     // Click-while-already-queued cancels the pending trigger (lets the
     // user re-arm without firing). Bank B triggers work whether or not
     // the crossfader is enabled so users can pre-arm Bank B before flipping.
-    triggerClip(layerIndex: number, columnIndex: number, deck: VJDeck = 'A') {
+    triggerClip(layerIndex: number, columnIndex: number, deck: VJDeck = 'A', inputId?: string, automatic = false) {
       const state = get({ subscribe });
+      if (pickLayerStates(state, deck)[layerIndex]?.locked) return;
       const grid = state.quantization;
+      const clip = pickGrid(state, deck)[layerIndex]?.[columnIndex];
+      if (!clip) return;
+      const key = rowKey(deck, layerIndex);
+      if (!automatic && clip.triggerStyle === 'toggle' && pickLayerStates(state, deck)[layerIndex]?.activeClip?.id === clip.id) {
+        this.stopLayer(layerIndex, deck);
+        return;
+      }
+      if (!automatic && clip.triggerStyle === 'piano' && inputId) {
+        const existing = holds.get(key);
+        if (existing?.clipId === clip.id && existing.column === columnIndex) {
+          existing.inputs.add(inputId);
+          return;
+        }
+        holds.set(key, { clipId: clip.id, column: columnIndex, inputs: new Set([inputId]) });
+      } else holds.delete(key);
 
       // Off → instant path
       if (grid === 'off') {
-        immediateTriggerClip(layerIndex, columnIndex, deck);
+        immediateTriggerClip(layerIndex, columnIndex, deck, true);
         return;
       }
 
       // Validate the cell exists before queuing
-      const targetGrid = pickGrid(state, deck);
-      const clip = targetGrid[layerIndex]?.[columnIndex];
-      if (!clip) return;
-
       // Click-the-queued-cell-again unqueues it. Lets the user pre-arm and
       // back out without firing.
       const existingIdx = state.pendingTriggers.findIndex(
         p => p.layerIndex === layerIndex && p.columnIndex === columnIndex && p.bank === deck
       );
       if (existingIdx >= 0) {
+        if (clip.triggerStyle === 'piano' && inputId) return;
         update(s => ({
           ...s,
           pendingTriggers: s.pendingTriggers.filter((_, i) => i !== existingIdx),
@@ -1323,71 +1648,236 @@ function createVJClipLauncherStore() {
         return;
       }
 
-      const fireAt = nextQuantumWallTime(grid);
+      const { fireAt, fireBeat } = launchDeadline(grid);
       const queuedAt = performance.now();
       update(s => ({
         ...s,
         pendingTriggers: [
-          ...s.pendingTriggers,
-          { id: generateUUID(), layerIndex, columnIndex, bank: deck, fireAt, queuedAt },
+          // Latest cell wins its row. A manual cell selection supersedes
+          // the deck's pending column as a whole, preserving column atomicity.
+          ...s.pendingTriggers.filter(p => p.bank !== deck || (p.kind !== 'column' && p.layerIndex !== layerIndex)),
+          { id: generateUUID(), kind: 'clip', blockId: state.activeBlockId,
+            clipIds: [clip.id], layerIndex, columnIndex, bank: deck, fireAt, fireBeat, queuedAt,
+            ...(automatic && pickLayerStates(state, deck)[layerIndex]?.activeClip ? { autopilotSource: autopilotSourceToken(pickLayerStates(state, deck)[layerIndex].activeClip!, pickLayerStates(state, deck)[layerIndex].autopilot) } : {}) },
         ],
       }));
       ensureQuantTickRunning({ update });
     },
 
+    releaseClip(layerIndex: number, columnIndex: number, deck: VJDeck = 'A', inputId = 'default') {
+      const key = rowKey(deck, layerIndex);
+      const hold = holds.get(key);
+      if (!hold || hold.column !== columnIndex || !hold.inputs.delete(inputId) || hold.inputs.size) return;
+      holds.delete(key);
+      const state = get({ subscribe });
+      update(s => ({ ...s, pendingTriggers: s.pendingTriggers.filter(p =>
+        !(p.bank === deck && p.kind !== 'column' && p.layerIndex === layerIndex && p.columnIndex === columnIndex)) }));
+      if (pickLayerStates(state, deck)[layerIndex]?.activeClip?.id === hold.clipId) this.stopLayer(layerIndex, deck);
+    },
+
+    releaseInputs(prefix: string) {
+      for (const [key, hold] of [...holds]) {
+        const [deck, row] = key.split(':');
+        for (const input of [...hold.inputs]) if (input.startsWith(prefix)) this.releaseClip(Number(row), hold.column, deck as VJDeck, input);
+      }
+    },
+
+    setActiveClipCuePoint(layerIndex: number, cueIndex: number, seconds: number | null, deck: VJDeck = 'A'): boolean {
+      if (!validCueIndex(cueIndex) || (seconds !== null && (!Number.isFinite(seconds) || seconds < 0))) return false;
+      const clip = pickLayerStates(get({ subscribe }), deck)[layerIndex]?.activeClip;
+      if (!clip || clip.type !== 'video' || clip.src.startsWith('live://')) return false;
+      const points = normalizeCuePoints(clip.cuePoints) ?? Array<number | null>(VJ_CUE_POINT_COUNT).fill(null);
+      const duration = knownClipDurationSeconds(clip);
+      points[cueIndex] = seconds === null ? null : Math.min(seconds, duration ?? Infinity);
+      patchActiveVideo(layerIndex, deck, { cuePoints: normalizeCuePoints(points) });
+      return true;
+    },
+
+    jumpToCuePoint(layerIndex: number, cueIndex: number, deck: VJDeck = 'A'): boolean {
+      if (!validCueIndex(cueIndex)) return false;
+      const clip = pickLayerStates(get({ subscribe }), deck)[layerIndex]?.activeClip;
+      const time = normalizeCuePoints(clip?.cuePoints)?.[cueIndex];
+      if (!clip || clip.type !== 'video' || clip.src.startsWith('live://') || time == null || !knownClipDurationSeconds(clip)) return false;
+      // Revoke pending mouse scrub/frame-step work before claiming a newer
+      // native generation. MIDI scratch also revokes itself on the update.
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('ghost:vj-cue-seek', {
+        detail: { layerIndex, deck, clipId: clip.id },
+      }));
+      seekNativeVideoImmediately(clip, time, clip.isPlaying !== false, patch => {
+        const current = pickLayerStates(get({ subscribe }), deck)[layerIndex]?.activeClip;
+        if (current?.id === clip.id && current.src === clip.src) patchActiveVideo(layerIndex, deck, patch);
+      });
+      return true;
+    },
+
+    pressCuePoint(layerIndex: number, cueIndex: number, deck: VJDeck = 'A'): 'set' | 'jumped' | null {
+      if (!validCueIndex(cueIndex)) return null;
+      const clip = pickLayerStates(get({ subscribe }), deck)[layerIndex]?.activeClip;
+      if (!clip || clip.type !== 'video' || !knownClipDurationSeconds(clip)) return null;
+      if (normalizeCuePoints(clip.cuePoints)?.[cueIndex] != null) return this.jumpToCuePoint(layerIndex, cueIndex, deck) ? 'jumped' : null;
+      return this.setActiveClipCuePoint(layerIndex, cueIndex, predictedClipPlayheadSeconds(clip), deck) ? 'set' : null;
+    },
+
+    resyncBeatClips() {
+      const state = get({ subscribe });
+      if (!state.isLive || !state.isOpen) return;
+      for (const deck of ['A', 'B'] as const) {
+        if (deck === 'B' && !state.crossfaderEnabled) continue;
+        pickLayerStates(state, deck).forEach((row, index) => {
+          const clip = row.activeClip;
+          if (clip?.type !== 'video' || clip.src.startsWith('live://') || !(Number(clip.playbackSyncBeats) > 0)) return;
+          if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('ghost:vj-cue-seek', {
+            detail: { layerIndex: index, deck, clipId: clip.id },
+          }));
+          seekNativeVideoImmediately(clip, clipLaunchTimeSeconds(clip), clip.isPlaying !== false,
+            patch => patchActiveVideo(index, deck, { ...patch, _launchGeneration: ++launchGeneration }));
+        });
+      }
+      update(current => ({ ...current, pendingTriggers: current.pendingTriggers.map(p => ({ ...p, ...launchDeadline(current.quantization) })) }));
+    },
+
+    hasHeldInput(layerIndex: number, deck: VJDeck = 'A') { return holds.has(rowKey(deck, layerIndex)); },
+
+    setClipLaunchOptions(layerIndex: number, columnIndex: number,
+      options: { faderStart?: boolean | null; ignoreColumnTrigger?: boolean | null }, deck: VJDeck = 'A') {
+      const patch: Partial<VJClip> = {};
+      for (const key of ['faderStart', 'ignoreColumnTrigger'] as const) {
+        if (key in options) patch[key] = typeof options[key] === 'boolean' ? options[key] : undefined;
+      }
+      update(state => {
+        const grid = pickGrid(state, deck).map(row => [...row]);
+        const clip = grid[layerIndex]?.[columnIndex];
+        if (!clip) return state;
+        grid[layerIndex][columnIndex] = { ...clip, ...patch };
+        const rows = pickLayerStates(state, deck).map(row => row.activeClip?.id === clip.id
+          ? { ...row, activeClip: { ...row.activeClip, ...patch } } : row);
+        return { ...withDeck(state, deck, rows, grid), blocks: blocksWithDeckGrid(state, deck, grid) };
+      });
+    },
+
+    toggleLayerAutopilot(layerIndex: number, deck: VJDeck = 'A') {
+      update(state => {
+        const rows = pickLayerStates(state, deck).map((row, index) => index === layerIndex
+          ? { ...row, autopilot: row.autopilot ?? { target: 'next' as const, unit: 'beats' as const, count: 4 },
+              autopilotPaused: row.autopilot ? !row.autopilotPaused : false } : row);
+        return withDeck(state, deck, rows);
+      });
+    },
+
+    setLayerAudio(layerIndex: number, patch: { audioVolume?: number; audioPan?: number }, deck: VJDeck = 'A') {
+      update(state => withDeck(state, deck, pickLayerStates(state, deck).map((row, index) => index === layerIndex ? {
+        ...row,
+        ...(Number.isFinite(patch.audioVolume) ? { audioVolume: Math.max(0, Math.min(1, patch.audioVolume!)) } : {}),
+        ...(Number.isFinite(patch.audioPan) ? { audioPan: Math.max(-1, Math.min(1, patch.audioPan!)) } : {}),
+      } : row)));
+    },
+
+    setLayerAutopilot(layerIndex: number, value: VJAutopilot | undefined, deck: VJDeck = 'A') {
+      update(state => {
+        const rows = pickLayerStates(state, deck).map((row, index) => index === layerIndex
+          ? { ...row, autopilot: normalizeAutopilot(value), autopilotPaused: false } : row);
+        return withDeck(state, deck, rows);
+      });
+    },
+
+    setClipTriggerStyle(layerIndex: number, columnIndex: number, style: VJTriggerStyle, deck: VJDeck = 'A') {
+      if (!['normal', 'toggle', 'piano'].includes(style)) return;
+      const hold = holds.get(rowKey(deck, layerIndex));
+      if (hold?.column === columnIndex) for (const input of [...hold.inputs]) this.releaseClip(layerIndex, columnIndex, deck, input);
+      update(state => {
+        const grid = pickGrid(state, deck).map(row => [...row]);
+        const clip = grid[layerIndex]?.[columnIndex];
+        if (!clip) return state;
+        grid[layerIndex][columnIndex] = { ...clip, triggerStyle: style };
+        const states = pickLayerStates(state, deck).map(row => row.activeClip?.id === clip.id
+          ? { ...row, activeClip: { ...row.activeClip, triggerStyle: style } } : row);
+        return { ...withDeck(state, deck, states, grid), blocks: blocksWithDeckGrid(state, deck, grid) };
+      });
+    },
+
     /** Fire a clip immediately, bypassing quantization. Used by both the
      *  'off' path and by the rAF tick when a queued trigger comes due. */
     triggerClipNow(layerIndex: number, columnIndex: number, deck: VJDeck = 'A') {
+      if (pickLayerStates(get({ subscribe }), deck)[layerIndex]?.locked) return;
+      update(state => ({ ...state, pendingTriggers: state.pendingTriggers.filter(p =>
+        p.bank !== deck || (p.kind !== 'column' && p.layerIndex !== layerIndex)) }));
       immediateTriggerClip(layerIndex, columnIndex, deck);
     },
 
-    // Trigger an entire column on the given deck (all layers at once)
-    triggerColumn(columnIndex: number, deck: VJDeck = 'A') {
-      let didTrigger = false;
-      const incomingVideos: VJClip[] = [];
-      const outgoingVideos: VJClip[] = [];
-
-      // Match single-cell triggering: every incoming video is already
-      // rewound and moving before the column swap reaches subscribers.
-      const before = get({ subscribe });
-      const beforeGrid = pickGrid(before, deck);
-      const videosToArm: VJClip[] = [];
-      for (let layerIndex = 0; layerIndex < beforeGrid.length; layerIndex++) {
-        const clip = beforeGrid[layerIndex]?.[columnIndex];
-        if (clip?.type !== 'video') continue;
-        const videoEl = ensureClipVideoElement(clip);
-        if (videoEl && !isVideoArmedAtTrimStart(clip, videoEl)) videosToArm.push(clip);
+    // Full-column launches replace that deck's column queue. Disjoint group
+    // launches coexist; repeat presses cancel their own group. All targeted
+    // rows share one deadline and one state update.
+    prepareColumn(columnIndex: number, deck: VJDeck = 'A') {
+      const state = get({ subscribe });
+      for (const row of pickGrid(state, deck)) {
+        const clip = row[columnIndex];
+        // Intent refreshes preparations evicted by larger grids or memory
+        // pressure; it must bypass the library's twenty-second debounce.
+        if (clip?.type === 'video') armVJVideoClip(clip, true);
       }
-      if (videosToArm.length > 0) {
-        void Promise.all(videosToArm.map((clip) => armVideoClipForTrigger(clip)))
-          .then(() => vjClipLauncher.triggerColumn(columnIndex, deck))
-          .catch((error) => console.warn('[vjClipLauncher] column trigger held; video is not ready:', error));
+    },
+
+    triggerColumn(columnIndex: number, deck: VJDeck = 'A', groupId?: string) {
+      const state = get({ subscribe });
+      if (!Number.isInteger(columnIndex) || columnIndex < 0 || columnIndex >= state.numColumns) return;
+      const group = groupId ? state.groups?.find(g => g.id === groupId) : undefined;
+      if (groupId && !group) return;
+      const groupRows = group ? Array.from({ length: group.last - group.first + 1 }, (_, i) => group.first + i) : undefined;
+      if (state.quantization === 'off') {
+        this.triggerColumnNow(columnIndex, deck, groupRows);
         return;
       }
-      for (let layerIndex = 0; layerIndex < beforeGrid.length; layerIndex++) {
-        const clip = beforeGrid[layerIndex]?.[columnIndex];
-        if (clip?.type === 'video') prepareVideoClipForTrigger(clip);
-      }
+      const layerIndices = pickLayerStates(state, deck).flatMap((row, index) => row.locked || ignoresColumn(row) || (groupRows && !groupRows.includes(index)) ? [] : [index]);
+      if (!layerIndices.length) return;
+      const existing = state.pendingTriggers.some(p => p.kind === 'column' && p.bank === deck && p.columnIndex === columnIndex && p.groupId === groupId);
+      const entry: PendingTrigger = {
+        id: generateUUID(), kind: 'column', groupId, layerIndex: -1, columnIndex, bank: deck, layerIndices,
+        blockId: state.activeBlockId, clipIds: queuedClipIds(state, deck, columnIndex),
+        ...launchDeadline(state.quantization), queuedAt: performance.now(),
+      };
+      update(s => ({ ...s, pendingTriggers: [
+        ...s.pendingTriggers.filter(p => p.bank !== deck || (p.kind === 'column'
+          ? !!groupId && p.groupId !== groupId && !(p.layerIndices ?? []).some(index => layerIndices.includes(index))
+          : !layerIndices.includes(p.layerIndex))), ...(existing ? [] : [entry]),
+      ] }));
+      if (!existing) ensureQuantTickRunning({ update });
+    },
 
+    /** Immediate column transaction shared by quantized and direct launches. */
+    triggerColumnNow(columnIndex: number, deck: VJDeck = 'A', layerIndices?: number[]) {
+      if (!Number.isInteger(columnIndex) || columnIndex < 0 || columnIndex >= get({ subscribe }).numColumns) return;
+      const launchedAtMs = performance.now();
+      const columnLaunchGroup = ++launchGeneration;
+      let didTrigger = false;
+      const incomingVideos: Array<{ clip: VJClip; startSeconds: number }> = [];
+      const outgoingVideos: VJClip[] = [];
+      const touched = new Set<number>();
       update(state => {
         const targetGrid = pickGrid(state, deck);
         const targetLayerStates = pickLayerStates(state, deck);
         const newLayerStates = targetLayerStates.map((layerState, layerIndex) => {
+          if (layerState.locked || ignoresColumn(layerState) || (layerIndices && !layerIndices.includes(layerIndex))) return layerState;
+          touched.add(layerIndex);
+          holds.delete(rowKey(deck, layerIndex));
           const clip = targetGrid[layerIndex]?.[columnIndex];
           if (clip) {
+            let triggeredClip = { ...clip, _launchGeneration: ++launchGeneration };
             if (clip.type === 'video') {
-              ensureClipVideoElement(clip);
-              incomingVideos.push(clip);
+              const startSeconds = triggerNativeVJVideoClip(clip, launchedAtMs);
+              triggeredClip = { ...clip, _launchGeneration: triggeredClip._launchGeneration };
+              incomingVideos.push({ clip: triggeredClip, startSeconds });
             }
             if (layerState.activeClip && layerState.activeClip.id !== clip.id) {
               outgoingVideos.push(layerState.activeClip);
             }
+            beginVJClipTransition(state, deck, layerIndex, triggeredClip, columnLaunchGroup);
             didTrigger = true;
-            return { ...layerState, activeColumn: columnIndex, activeClip: clip };
+            return { ...layerState, activeColumn: columnIndex, activeClip: triggeredClip };
           }
           if (layerState.activeClip) {
             outgoingVideos.push(layerState.activeClip);
           }
+          vjClipTransitions.cancel(deck, layerIndex);
           if (layerState.activeColumn !== null || layerState.activeClip !== null) {
             return { ...layerState, activeColumn: null, activeClip: null };
           }
@@ -1395,37 +1885,40 @@ function createVJClipLauncherStore() {
         });
 
         const next = withDeck(state, deck, newLayerStates);
-        return { ...next, stoppedAll: false };
+        return { ...next, stoppedAll: touched.size ? false : state.stoppedAll, pendingTriggers: state.pendingTriggers.filter(p => p.bank !== deck || (p.kind !== 'column' && !touched.has(p.layerIndex))) };
       });
-      if (didTrigger || outgoingVideos.length > 0) {
-        const incomingEls = new Set<HTMLVideoElement>();
-        for (const clip of incomingVideos) {
-          const videoEl = clip.videoElement || videoElementCache.get(clip.id);
-          if (!videoEl) continue;
-          incomingEls.add(videoEl);
+      if (didTrigger) {
+        requestImmediateNativeVJSync(incomingVideos.map(({ clip }) => clip));
+        const incomingIds = new Set(incomingVideos.map(({ clip }) => clip.id));
+        for (const { clip, startSeconds } of incomingVideos) {
+          syncBrowserVideoAfterNativeTrigger(clip, null, startSeconds);
         }
         for (const clip of outgoingVideos) {
-          if (clip.type !== 'video') continue;
-          const videoEl = clip.videoElement || videoElementCache.get(clip.id);
-          if (!videoEl || incomingEls.has(videoEl)) continue;
-          pauseClipRuntime(clip);
+          if (!incomingIds.has(clip.id)) {
+            syncBrowserVideoAfterNativeTrigger(null, clip, 0);
+          }
         }
-      }
-      if (didTrigger) {
         keyframeTimeline.seek(0);
         keyframeTimeline.play();
+      } else {
+        for (const clip of outgoingVideos) {
+          syncBrowserVideoAfterNativeTrigger(null, clip, 0);
+        }
       }
     },
 
     // Stop all clips on a layer for the given deck
     stopLayer(layerIndex: number, deck: VJDeck = 'A') {
-      const before = get({ subscribe });
-      pauseClipRuntime(pickLayerStates(before, deck)[layerIndex]?.activeClip);
+      if (pickLayerStates(get({ subscribe }), deck)[layerIndex]?.locked) return;
+      holds.delete(rowKey(deck, layerIndex));
+      pauseClipRuntime(pickLayerStates(get({ subscribe }), deck)[layerIndex]?.activeClip);
+      vjClipTransitions.cancel(deck, layerIndex);
       update(state => {
         const targetLayerStates = pickLayerStates(state, deck);
         const newLayerStates = [...targetLayerStates];
         newLayerStates[layerIndex] = { ...newLayerStates[layerIndex], activeColumn: null, activeClip: null };
-        return withDeck(state, deck, newLayerStates);
+        return { ...withDeck(state, deck, newLayerStates), pendingTriggers: state.pendingTriggers.filter(p =>
+          p.bank !== deck || (p.kind !== 'column' && p.layerIndex !== layerIndex)) };
       });
     },
 
@@ -1433,6 +1926,9 @@ function createVJClipLauncherStore() {
     // Also flushes the pending-trigger queue so a panic STOP doesn't leave
     // queued clips that fire seconds later when the bar boundary lands.
     stopAll() {
+      holds.clear();
+      releaseTempoNudgeInputs('');
+      vjClipTransitions.clear();
       update(state => {
         for (const layerState of state.layerStates) pauseClipRuntime(layerState.activeClip);
         for (const layerState of state.bankBLayerStates) pauseClipRuntime(layerState.activeClip);
@@ -1485,13 +1981,117 @@ function createVJClipLauncherStore() {
       }));
     },
 
-    // Set layer opacity for the given deck
+    // Publish the fader and restart anchor together: native output must never
+    // see positive opacity with the previous playhead for an intervening frame.
     setLayerOpacity(layerIndex: number, opacity: number, deck: VJDeck = 'A') {
+      if (!Number.isFinite(opacity)) return;
+      let restarted: VJClip | null = null;
+      let startSeconds = 0;
       update(state => {
-        const targetLayerStates = pickLayerStates(state, deck);
-        const newLayerStates = [...targetLayerStates];
-        newLayerStates[layerIndex] = { ...newLayerStates[layerIndex], opacity: Math.max(0, Math.min(1, opacity)) };
-        return withDeck(state, deck, newLayerStates);
+        const states = pickLayerStates(state, deck);
+        const layer = states[layerIndex];
+        if (!layer) return state;
+        const nextOpacity = Math.max(0, Math.min(1, opacity));
+        if (nextOpacity === layer.opacity) return state;
+        const nextStates = [...states];
+        nextStates[layerIndex] = { ...layer, opacity: nextOpacity };
+        const clip = layer.activeClip;
+        if (!(clip?.faderStart ?? layer.faderStart) || layer.opacity > 0 || nextOpacity <= 0 || clip?.type !== 'video'
+          || clip.src?.startsWith('live://')) return withDeck(state, deck, nextStates);
+
+        // Use the actual playing clip, even when its original block is no
+        // longer visible. This is a transport restart, not a pad trigger:
+        // retain Piano ownership, queued launches, and the global timeline.
+        const nextClip = { ...clip, _launchGeneration: ++launchGeneration };
+        startSeconds = triggerNativeVJVideoClip(nextClip);
+        restarted = nextClip;
+        nextStates[layerIndex].activeClip = nextClip;
+        vjClipTransitions.cancel(deck, layerIndex);
+        const transport = {
+          isPlaying: nextClip.isPlaying,
+          durationSeconds: nextClip.durationSeconds,
+          _nativePlaybackDirection: nextClip._nativePlaybackDirection,
+          _nativePlaybackTimeSeconds: nextClip._nativePlaybackTimeSeconds,
+          _nativePlaybackUpdatedAtMs: nextClip._nativePlaybackUpdatedAtMs,
+          _nativePlaybackSeekSeq: nextClip._nativePlaybackSeekSeq,
+        };
+        const syncGrid = (grid: (VJClip | null)[][]) => {
+          if (!grid[layerIndex]?.some(cell => cell?.id === clip.id)) return grid;
+          const next = [...grid];
+          next[layerIndex] = grid[layerIndex].map(cell => cell?.id === clip.id ? { ...cell, ...transport } : cell);
+          return next;
+        };
+        const grid = syncGrid(pickGrid(state, deck));
+        const blocks = state.blocks.map(block => deck === 'A'
+          ? { ...block, clipGrid: syncGrid(block.clipGrid) }
+          : { ...block, bankBClipGrid: block.bankBClipGrid ? syncGrid(block.bankBClipGrid) : undefined });
+        return { ...withDeck(state, deck, nextStates, grid), blocks };
+      });
+      if (restarted) {
+        requestImmediateNativeVJSync([restarted]);
+        syncBrowserVideoAfterNativeTrigger(restarted, null, startSeconds);
+      }
+    },
+
+    setLayerLaunchProtection(layerIndex: number, options: { locked?: boolean; ignoreColumnTrigger?: boolean }, deck: VJDeck = 'A') {
+      if (options.locked === true) holds.delete(rowKey(deck, layerIndex));
+      update(state => {
+        const states = pickLayerStates(state, deck);
+        if (!states[layerIndex]) return state;
+        const next = [...states];
+        const layer = { ...states[layerIndex], ...options };
+        next[layerIndex] = layer;
+        // Once protected, remove this row from an already queued column.
+        // Unlocking before the beat must not resurrect that canceled launch.
+        const pendingTriggers = state.pendingTriggers.flatMap(p => {
+          if (p.bank !== deck) return [p];
+          if (p.kind !== 'column') return layer.locked && p.layerIndex === layerIndex ? [] : [p];
+          if (!layer.locked && !ignoresColumn(layer)) return [p];
+          const indices = (p.layerIndices ?? states.map((_, index) => index)).filter(index => index !== layerIndex);
+          return indices.length ? [{ ...p, layerIndices: indices }] : [];
+        });
+        return { ...withDeck(state, deck, next), pendingTriggers };
+      });
+    },
+
+    setLayerFaderStart(layerIndex: number, enabled: boolean, deck: VJDeck = 'A') {
+      update(state => {
+        const states = pickLayerStates(state, deck);
+        if (!states[layerIndex]) return state;
+        const next = [...states];
+        next[layerIndex] = { ...next[layerIndex], faderStart: enabled === true };
+        return withDeck(state, deck, next);
+      });
+    },
+
+    setLayerTransition(layerIndex: number, values: { duration?: number | null; style?: CrossfaderTransition | null }, deck: VJDeck = 'A') {
+      update(state => {
+        const states = pickLayerStates(state, deck);
+        if (!states[layerIndex]) return state;
+        const next = [...states];
+        next[layerIndex] = { ...next[layerIndex],
+          ...(values.duration !== undefined ? { transitionDuration: normalizedTransitionDuration(values.duration) } : {}),
+          ...(values.style !== undefined ? { transitionStyle: normalizedTransitionStyle(values.style) } : {}),
+        };
+        return withDeck(state, deck, next);
+      });
+    },
+
+    setClipTransition(layerIndex: number, columnIndex: number, values: { duration?: number | null; style?: CrossfaderTransition | null }, deck: VJDeck = 'A') {
+      update(state => {
+        const grid = pickGrid(state, deck);
+        const clip = grid[layerIndex]?.[columnIndex];
+        if (!clip) return state;
+        const nextClip = { ...clip };
+        if (values.duration === null) delete nextClip.transitionDuration;
+        else if (values.duration !== undefined) nextClip.transitionDuration = normalizedTransitionDuration(values.duration);
+        if (values.style === null) delete nextClip.transitionStyle;
+        else if (values.style !== undefined) nextClip.transitionStyle = normalizedTransitionStyle(values.style);
+        const nextGrid = grid.map(row => [...row]);
+        nextGrid[layerIndex][columnIndex] = nextClip;
+        const nextStates = pickLayerStates(state, deck).map((layer, index) =>
+          index === layerIndex && layer.activeClip?.id === clip.id ? { ...layer, activeClip: { ...layer.activeClip, transitionDuration: nextClip.transitionDuration, transitionStyle: nextClip.transitionStyle } } : layer);
+        return { ...withDeck(state, deck, nextStates, nextGrid), blocks: blocksWithDeckGrid(state, deck, nextGrid) };
       });
     },
 
@@ -1511,7 +2111,9 @@ function createVJClipLauncherStore() {
         const targetLayerStates = pickLayerStates(state, deck);
         const newLayerStates = [...targetLayerStates];
         newLayerStates[layerIndex] = { ...newLayerStates[layerIndex], solo: !newLayerStates[layerIndex].solo };
-        return withDeck(state, deck, newLayerStates);
+        const next = withDeck(state, deck, newLayerStates);
+        cancelHiddenVJClipTransitions(next, deck);
+        return next;
       });
     },
 
@@ -1521,7 +2123,9 @@ function createVJClipLauncherStore() {
         const targetLayerStates = pickLayerStates(state, deck);
         const newLayerStates = [...targetLayerStates];
         newLayerStates[layerIndex] = { ...newLayerStates[layerIndex], mute: !newLayerStates[layerIndex].mute };
-        return withDeck(state, deck, newLayerStates);
+        const next = withDeck(state, deck, newLayerStates);
+        cancelHiddenVJClipTransitions(next, deck);
+        return next;
       });
     },
 
@@ -1532,16 +2136,43 @@ function createVJClipLauncherStore() {
 
     // Toggle live mode
     toggleLive() {
+      if (get({ subscribe }).isLive) vjClipTransitions.clear();
       update(state => ({ ...state, isLive: !state.isLive }));
     },
 
     // Set live mode
     setLive(isLive: boolean) {
+      if (!isLive) vjClipTransitions.clear();
       update(state => ({ ...state, isLive }));
+    },
+
+    /** Apply a complete preset in one store notification, including the saved block. */
+    setEffectChain(scope: 'composition' | 'layer' | 'clip', effects: Effect[], layerIndex = 0, deck: VJDeck = 'A') {
+      if (!effects.every(effect => allowNativeOnlyEffect(effect, scope))) return;
+      const chain = JSON.parse(JSON.stringify(effects)) as Effect[];
+      update(state => {
+        if (scope === 'composition') return { ...state, compositionEffects: chain };
+        const rows = [...pickLayerStates(state, deck)];
+        const row = rows[layerIndex];
+        if (!row) return state;
+        if (scope === 'layer') {
+          rows[layerIndex] = { ...row, effects: chain };
+          return withDeck(state, deck, rows);
+        }
+        const column = row.activeColumn;
+        const grid = pickGrid(state, deck).map(cells => [...cells]);
+        const clip = column === null ? null : grid[layerIndex]?.[column];
+        if (!clip || !row.activeClip || clip.id !== row.activeClip.id) return state;
+        const nextClip = { ...clip, effects: chain };
+        grid[layerIndex][column!] = nextClip;
+        rows[layerIndex] = { ...row, activeClip: nextClip };
+        return { ...withDeck(state, deck, rows, grid), blocks: blocksWithDeckGrid(state, deck, grid) };
+      });
     },
 
     // Add effect to layer on the given deck
     addLayerEffect(layerIndex: number, effect: Effect, deck: VJDeck = 'A') {
+      if (!allowNativeOnlyEffect(effect, 'layer')) return;
       update(state => {
         const targetLayerStates = pickLayerStates(state, deck);
         const newLayerStates = [...targetLayerStates];
@@ -1579,6 +2210,86 @@ function createVJClipLauncherStore() {
         };
         return withDeck(state, deck, newLayerStates);
       });
+    },
+
+    // ── Active-clip effects (per deck) ────────────────────────────────
+    // Layer effects (addLayerEffect etc.) live on the layer ROW, so whatever
+    // clip is playing there inherits them. Performer needs the opposite: its
+    // effects belong to the Performer clip alone, or they bleed onto every
+    // other clip fired on that row. These mutate the active clip's own
+    // `effects` array, mirroring the change into the grid cell the clip came
+    // from so it survives re-triggering.
+    updateActiveClipInPlace(
+      layerIndex: number,
+      deck: VJDeck,
+      mutate: (clip: VJClip) => VJClip,
+    ) {
+      update(state => {
+        const targetLayerStates = pickLayerStates(state, deck);
+        const targetGrid = pickGrid(state, deck);
+        const activeClip = targetLayerStates[layerIndex]?.activeClip;
+        if (!activeClip) return state;
+
+        const newClip = mutate(activeClip);
+        const newLayerStates = [...targetLayerStates];
+        newLayerStates[layerIndex] = { ...newLayerStates[layerIndex], activeClip: newClip };
+
+        const newGrid = targetGrid.map(row => [...row]);
+        for (let col = 0; col < state.numColumns; col++) {
+          const gridClip = newGrid[layerIndex]?.[col];
+          if (gridClip && gridClip.id === activeClip.id) {
+            newGrid[layerIndex][col] = newClip;
+          }
+        }
+        return withDeck(state, deck, newLayerStates, newGrid);
+      });
+    },
+
+    /** Replace the active clip's effect chain wholesale. Performer uses this
+     *  to stamp its own chain onto whichever transient clip it is driving. */
+    setActiveClipEffects(layerIndex: number, effects: Effect[], deck: VJDeck = 'A') {
+      this.updateActiveClipInPlace(layerIndex, deck, (clip) => ({
+        ...clip,
+        effects: [...effects],
+      }));
+    },
+
+    addActiveClipEffect(layerIndex: number, effect: Effect, deck: VJDeck = 'A') {
+      if (!allowNativeOnlyEffect(effect, 'clip')) return;
+      this.updateActiveClipInPlace(layerIndex, deck, (clip) => ({
+        ...clip,
+        effects: [...(clip.effects || []), effect],
+      }));
+    },
+
+    removeActiveClipEffect(layerIndex: number, effectId: string, deck: VJDeck = 'A') {
+      this.updateActiveClipInPlace(layerIndex, deck, (clip) => ({
+        ...clip,
+        effects: (clip.effects || []).filter(e => e.id !== effectId),
+      }));
+    },
+
+    toggleActiveClipEffect(layerIndex: number, effectId: string, deck: VJDeck = 'A') {
+      this.updateActiveClipInPlace(layerIndex, deck, (clip) => ({
+        ...clip,
+        effects: (clip.effects || []).map(e =>
+          e.id === effectId ? { ...e, enabled: !e.enabled } : e
+        ),
+      }));
+    },
+
+    updateActiveClipEffectParams(
+      layerIndex: number,
+      effectId: string,
+      params: Record<string, any>,
+      deck: VJDeck = 'A',
+    ) {
+      this.updateActiveClipInPlace(layerIndex, deck, (clip) => ({
+        ...clip,
+        effects: (clip.effects || []).map(e =>
+          e.id === effectId ? { ...e, params: { ...e.params, ...params } } : e
+        ),
+      }));
     },
 
     // Update a single shader uniform value on the active clip of a layer (per deck)
@@ -1620,6 +2331,99 @@ function createVJClipLauncherStore() {
           typeof value === 'boolean' ? 'boolean' : 'number'
         );
       }
+    },
+
+    // Update a JS animation parameter on the active VJ clip. The clip owns
+    // these values in VJ mode; Mapping's selected-layer editor must not leak
+    // into this state.
+    updateActiveClipJSAnimationParam(layerIndex: number, paramName: string, value: number | boolean | number[], deck: VJDeck = 'A') {
+      let runtimeClipId: string | null = null;
+      update(state => {
+        const targetLayerStates = pickLayerStates(state, deck);
+        const targetGrid = pickGrid(state, deck);
+        const activeClip = targetLayerStates[layerIndex]?.activeClip;
+        if (
+          !activeClip?.jsAnimation ||
+          (activeClip.type !== 'jsanimation' && activeClip.type !== 'p5js')
+        ) {
+          return state;
+        }
+
+        runtimeClipId = activeClip.id;
+        const newClip: VJClip = {
+          ...activeClip,
+          jsAnimation: {
+            ...activeClip.jsAnimation,
+            paramValues: {
+              ...(activeClip.jsAnimation.paramValues || {}),
+              [paramName]: value,
+            },
+          },
+        };
+
+        const newLayerStates = [...targetLayerStates];
+        newLayerStates[layerIndex] = {
+          ...newLayerStates[layerIndex],
+          activeClip: newClip,
+        };
+
+        const newGrid = targetGrid.map(row => [...row]);
+        for (let col = 0; col < state.numColumns; col++) {
+          const gridClip = newGrid[layerIndex]?.[col];
+          if (gridClip?.id === activeClip.id) {
+            newGrid[layerIndex][col] = newClip;
+          }
+        }
+
+        return withDeck(state, deck, newLayerStates, newGrid);
+      });
+
+      if (runtimeClipId) {
+        updateJSAnimationParams(runtimeClipId, { [paramName]: value });
+      }
+
+      if (runtimeClipId && (typeof value === 'number' || typeof value === 'boolean')) {
+        keyframeTimeline.autoRecord(
+          `vj-${runtimeClipId}`,
+          `js:${paramName}`,
+          value,
+          paramName,
+          typeof value === 'boolean' ? 'boolean' : 'number'
+        );
+      }
+    },
+
+    // Update a group of native shader uniforms in one store transaction.
+    // Performer worlds use this when their six dedicated dials move.
+    updateActiveClipShaderValues(layerIndex: number, values: Record<string, any>, deck: VJDeck = 'A') {
+      if (Object.keys(values).length === 0) return;
+      update(state => {
+        const targetLayerStates = pickLayerStates(state, deck);
+        const activeClip = targetLayerStates[layerIndex]?.activeClip;
+        if (!activeClip) return state;
+
+        const newClip: VJClip = {
+          ...activeClip,
+          shaderValues: { ...(activeClip.shaderValues || {}), ...values },
+        };
+        const newLayerStates = [...targetLayerStates];
+        newLayerStates[layerIndex] = {
+          ...newLayerStates[layerIndex],
+          activeClip: newClip,
+        };
+
+        const targetGrid = pickGrid(state, deck);
+        let gridChanged = false;
+        const newGrid = targetGrid.map((row, rowIndex) => row.map((gridClip) => {
+          if (rowIndex === layerIndex && gridClip?.id === activeClip.id) {
+            gridChanged = true;
+            return newClip;
+          }
+          return gridClip;
+        }));
+
+        return withDeck(state, deck, newLayerStates, gridChanged ? newGrid : null);
+      });
     },
 
     // Batch-update multiple shader values (modulation engine HOT PATH —
@@ -1761,35 +2565,93 @@ function createVJClipLauncherStore() {
       });
     },
 
-    // Update video playback props plus shared visual transform props on the
-    // active clip of a layer. Still images use the same transform fields as
-    // videos; playback fields are ignored unless the clip is a video.
-    updateActiveClipVideoProps(layerIndex: number, updates: Partial<VJVideoPlaybackProps & VJTransformProps>, deck: VJDeck = 'A') {
+    // Update video playback props (playbackMode / playbackRate / trimStart /
+    // trimEnd / isPlaying) on the active clip of a layer. Mirrors the
+    // splat/model3d shape so the VJ video controls panel can write through to
+    // the store without touching the live videoElement (the panel does that
+    // separately on the DOM node).
+    /**
+     * Drive the active clip's playhead from an external timeline.
+     *
+     * This is what a DAW, a show controller, or Beat Link Trigger following a
+     * CDJ sends: "the track is at N seconds". The OSC path vj:<layer>:video:
+     * position already existed, but it only wrote videoElement.currentTime —
+     * and under the native engine that element is not what renders, so the
+     * visuals never moved. That is the whole of "Ghost Arcade does not receive
+     * the track's timeline position": the message arrived and was applied to
+     * the wrong clock.
+     *
+     * Correcting only past a drift threshold is what makes a continuous stream
+     * usable. Seeking on every message would re-arm the decoder tens of times a
+     * second; between corrections the anchor already advances the clip at the
+     * right rate.
+     *
+     * Returns true when it actually re-anchored, so callers and tests can see
+     * corrections rather than infer them.
+     */
+    syncActiveClipPosition(
+      layerIndex: number,
+      seconds: number,
+      deck: VJDeck = 'A',
+      driftToleranceSeconds = CLIP_POSITION_SYNC_DRIFT_SECONDS,
+    ): boolean {
+      if (!Number.isFinite(seconds)) return false;
+      const state = get({ subscribe });
+      const layerStates = deck === 'B' ? state.bankBLayerStates : state.layerStates;
+      const clip = layerStates[layerIndex]?.activeClip;
+      if (!clip || clip.type !== 'video') return false;
+
+      const duration = knownClipDurationSeconds(clip);
+      const target = Math.max(0, duration ? Math.min(duration, seconds) : seconds);
+      // Already in step — leave the decoder alone and let it free-run.
+      if (!needsNativeReanchor(clip, target, driftToleranceSeconds)) return false;
+
+      this.updateActiveClipVideoProps(layerIndex, buildNativeAnchor(clip, target), deck);
+
+      // Best effort so any audible element follows; the native transport stays
+      // authoritative for what is actually on screen.
+      const el = clip.videoElement || videoElementCache.get(clip.id);
+      if (el) { try { el.currentTime = target; } catch { /* may still be loading */ } }
+      return true;
+    },
+
+    updateActiveClipVideoProps(layerIndex: number, updates: Partial<Pick<VJClip, 'playbackMode' | 'playbackRate' | 'playbackSyncBeats' | 'durationSeconds' | '_nativePlaybackDirection' | '_nativePlaybackTimeSeconds' | '_nativePlaybackUpdatedAtMs' | '_nativePlaybackSeekSeq' | 'trimStart' | 'trimEnd' | 'isPlaying' | 'zoom' | 'fit' | 'anchorX' | 'anchorY' | 'rotation' | 'opacity' | 'mirrorX' | 'audioPlayback' | 'audioVolume' | 'audioPan' | 'audioMuted'>>, deck: VJDeck = 'A') {
       update(state => {
         const targetLayerStates = pickLayerStates(state, deck);
         const targetGrid = pickGrid(state, deck);
         const newLayerStates = [...targetLayerStates];
         if (layerIndex < 0 || layerIndex >= newLayerStates.length) return state;
         const activeClip = newLayerStates[layerIndex]?.activeClip;
-        if (!isTransformableMediaClip(activeClip)) return state;
+        // Video-only would silently drop every image transform edit.
+        if (!activeClip || !clipSupportsTransform(activeClip)) return state;
 
-        const allowedUpdates: Partial<VJVideoPlaybackProps & VJTransformProps> = {};
-        const transformKeys: (keyof VJTransformProps)[] = ['zoom', 'fit', 'anchorX', 'anchorY', 'rotation', 'opacity', 'mirrorX'];
-        for (const key of transformKeys) {
-          if (key in updates) (allowedUpdates as any)[key] = (updates as any)[key];
+        // Tempo/trim edits can arrive without a time patch. Settle the old
+        // clock before adopting a new speed, range or mode.
+        if (updates._nativePlaybackTimeSeconds === undefined &&
+            ['playbackRate', 'playbackMode', 'trimStart', 'trimEnd', 'isPlaying'].some(key => key in updates)) {
+          updates = { ...updates, _nativePlaybackTimeSeconds: nativeVideoTransportSnapshot(activeClip).timeSeconds,
+            _nativePlaybackUpdatedAtMs: performance.now() };
         }
-        if (activeClip.type === 'video') {
-          const playbackKeys: (keyof VJVideoPlaybackProps)[] = ['playbackMode', 'playbackRate', 'playbackSyncBeats', 'trimStart', 'trimEnd', 'isPlaying'];
-          for (const key of playbackKeys) {
-            if (key in updates) (allowedUpdates as any)[key] = (updates as any)[key];
-          }
-        }
-
-        const newClip = { ...activeClip, ...allowedUpdates };
-        if (newClip.type === 'video' && newClip.videoElement) {
-          syncTrimmedVideoPlayback(newClip.videoElement, newClip);
+        const newClip = { ...activeClip, ...updates };
+        if (updates._nativePlaybackTimeSeconds !== undefined) {
+          newClip._nativePlaybackDirection = nativeVideoAnchorDirection(activeClip, updates);
         }
         newLayerStates[layerIndex] = { ...newLayerStates[layerIndex], activeClip: newClip };
+
+        // Audio side-effects. `audioPlayback` flipping is the only thing that
+        // builds or tears down WebAudio state; volume/mute are cheap gain
+        // writes that no-op when the clip was never attached.
+        if ('audioPlayback' in updates && updates.audioPlayback !== activeClip.audioPlayback) {
+          if (updates.audioPlayback) {
+            ensureClipVideoElement(newClip);
+          } else {
+            releaseAudibleClipElement(newClip.id);
+            newClip.videoElement = undefined;
+            ensureClipVideoElement(newClip);
+          }
+        }
+        if ('audioVolume' in updates) clipAudioBus.setClipVolume(newClip.id, newClip.audioVolume ?? 1);
+        if ('audioMuted' in updates) clipAudioBus.setClipMuted(newClip.id, newClip.audioMuted === true);
 
         // Mirror the change into the grid for any cells whose clip.id matches
         // (handles the case where the same source has been triggered into
@@ -1918,6 +2780,7 @@ function createVJClipLauncherStore() {
     // ========== Composition Effects ==========
 
     addCompositionEffect(effect: Effect) {
+      if (!allowNativeOnlyEffect(effect, 'composition')) return;
       update(state => ({
         ...state,
         compositionEffects: [...state.compositionEffects, effect]
@@ -1940,6 +2803,17 @@ function createVJClipLauncherStore() {
       }));
     },
 
+    setCompositionEffectParamAuto(effectId: string, paramName: string, auto: import('../types').AutoConfig | null) {
+      update(state => ({ ...state, compositionEffects: state.compositionEffects.map(effect => {
+        if (effect.id !== effectId) return effect;
+        const paramAuto = { ...effect.paramAuto };
+        if (auto === null) delete paramAuto[paramName];
+        else paramAuto[paramName] = { ...auto };
+        const { paramAuto: _old, ...rest } = effect;
+        return Object.keys(paramAuto).length ? { ...rest, paramAuto } : rest;
+      }) }));
+    },
+
     updateCompositionEffectParams(effectId: string, params: Record<string, any>) {
       update(state => ({
         ...state,
@@ -1952,6 +2826,7 @@ function createVJClipLauncherStore() {
     // ========== Clip Effects ==========
 
     addClipEffect(layerIndex: number, columnIndex: number, effect: Effect, deck: VJDeck = 'A') {
+      if (!allowNativeOnlyEffect(effect, 'clip')) return;
       update(state => {
         const targetGrid = pickGrid(state, deck);
         const targetLayerStates = pickLayerStates(state, deck);
@@ -2064,11 +2939,22 @@ function createVJClipLauncherStore() {
       });
     },
 
-    /** Set or clear the Auto playhead config for a single param on a
-     *  VJ-layer-state effect. Effects live on the layer slot (not the
-     *  clip) so the routing is by (layerIndex, bank, effectId). The
-     *  autoEngine reads paramAuto from layerStates / bankBLayerStates
-     *  and writes resolved values via updateLayerEffectParams. */
+    /** Configure the active clip without leaking automation onto its layer. */
+    setActiveClipEffectParamAuto(layerIndex: number, effectId: string, paramName: string, auto: import('../types').AutoConfig | null, bank: VJDeck = 'A') {
+      const state = get({ subscribe });
+      const clip = pickLayerStates(state, bank)[layerIndex]?.activeClip;
+      if (!clip?.effects?.some(effect => effect.id === effectId)) return;
+      const effects = clip.effects.map(effect => {
+        if (effect.id !== effectId) return effect;
+        const paramAuto = { ...effect.paramAuto };
+        if (auto === null) delete paramAuto[paramName];
+        else paramAuto[paramName] = auto;
+        const { paramAuto: _old, ...rest } = effect;
+        return Object.keys(paramAuto).length ? { ...rest, paramAuto } : rest;
+      });
+      this.setEffectChain('clip', effects, layerIndex, bank);
+    },
+
     setLayerEffectParamAuto(layerIndex: number, effectId: string, paramName: string, auto: import('../types').AutoConfig | null, bank: VJDeck = 'A') {
       update(state => {
         const targetStates = bank === 'B' ? state.bankBLayerStates : state.layerStates;
@@ -2127,6 +3013,26 @@ function createVJClipLauncherStore() {
           layerStates: mapStates(state.layerStates),
           bankBLayerStates: mapStates(state.bankBLayerStates),
         };
+      });
+    },
+
+    /** Macro routes address clips by identity, including inactive blocks. */
+    updateClipEffectParamsById(clipId: string, effectId: string, params: Record<string, number>, deck: VJDeck) {
+      update(state => {
+        let changed = false;
+        const apply = (clip: VJClip | null): VJClip | null => {
+          if (!clip || clip.id !== clipId || !clip.effects?.some(e => e.id === effectId)) return clip;
+          changed = true;
+          return { ...clip, effects: clip.effects.map(e => e.id === effectId ? { ...e, params: { ...e.params, ...params } } : e) };
+        };
+        const grid = (rows: (VJClip | null)[][]) => rows.map(row => row.map(apply));
+        const states = pickLayerStates(state, deck).map(row => ({ ...row, activeClip: apply(row.activeClip) }));
+        const nextGrid = grid(pickGrid(state, deck));
+        const blocks = state.blocks.map(block => deck === 'A'
+          ? { ...block, clipGrid: grid(block.clipGrid) }
+          : { ...block, bankBClipGrid: block.bankBClipGrid ? grid(block.bankBClipGrid) : undefined });
+        if (!changed) return state;
+        return { ...withDeck(state, deck, states, nextGrid), blocks };
       });
     },
 
@@ -2308,6 +3214,7 @@ function createVJClipLauncherStore() {
     // so a row swap reorders BOTH banks' layerStates and clip grids in lockstep
     // — across ALL blocks — keeps the visual layout symmetric and predictable.
     reorderLayers(fromIndex: number, toIndex: number) {
+      vjClipTransitions.clear();
       update(state => {
         if (fromIndex === toIndex) return state;
         if (fromIndex < 0 || fromIndex >= state.numLayers) return state;
@@ -2395,8 +3302,54 @@ function createVJClipLauncherStore() {
       });
     },
 
+    addGroup(first: number, last: number) {
+      const id = `group-${crypto.randomUUID()}`;
+      update(state => ({ ...state, groups: normalizeVJGroups([...(state.groups ?? []),
+        { id, name: `Group ${(state.groups?.length ?? 0) + 1}`, first, last, opacity: 1, blendMode: 'normal', effects: [] }], state.numLayers) }));
+    },
+    updateGroup(id: string, patch: Partial<Pick<VJGroup, 'name' | 'opacity' | 'blendMode' | 'effects'>>) {
+      update(state => ({ ...state, groups: normalizeVJGroups((state.groups ?? []).map(g => g.id === id ? { ...g, ...patch } : g), state.numLayers) }));
+    },
+    addGroupEffects(id: string, types: import('../types').EffectType[]): string | null {
+      const state = get({ subscribe });
+      const group = state.groups?.find(g => g.id === id);
+      if (!group) return 'Group is no longer available.';
+      if (types.some(type => !isNativeSelectableEffect(type))) return 'Choose effects supported by the native renderer.';
+      if (group.effects.filter(effect => effect.enabled !== false).length + types.length > NATIVE_EFFECT_PASS_LIMIT) return `A group supports ${NATIVE_EFFECT_PASS_LIMIT} enabled effects. Disable or remove effects first.`;
+      const added: Effect[] = types.map(type => ({ id: crypto.randomUUID(), type, enabled: true, opacity: 1, blendMode: 'normal', params: { ...getDefaultEffectParams(type) } }));
+      this.updateGroup(id, { effects: [...group.effects, ...added] });
+      return null;
+    },
+    updateGroupEffect(id: string, effectId: string, patch: Partial<Pick<Effect, 'enabled' | 'opacity' | 'params'>>) {
+      const group = get({ subscribe }).groups?.find(g => g.id === id);
+      if (!group) return;
+      this.updateGroup(id, { effects: group.effects.map(effect => effect.id === effectId
+        ? { ...effect, ...patch, params: { ...effect.params, ...patch.params } } : effect) });
+    },
+    removeGroupEffect(id: string, effectId: string) {
+      const group = get({ subscribe }).groups?.find(g => g.id === id);
+      if (group) this.updateGroup(id, { effects: group.effects.filter(effect => effect.id !== effectId) });
+    },
+    moveGroupEffect(id: string, effectId: string, offset: number) {
+      const group = get({ subscribe }).groups?.find(g => g.id === id);
+      if (!group || (offset !== 1 && offset !== -1)) return;
+      const effects = [...group.effects];
+      const index = effects.findIndex(effect => effect.id === effectId);
+      if (index < 0 || index + offset < 0 || index + offset >= effects.length) return;
+      [effects[index], effects[index + offset]] = [effects[index + offset], effects[index]];
+      this.updateGroup(id, { effects });
+    },
+
+    removeGroup(id: string) {
+      update(state => ({ ...state, groups: (state.groups ?? []).filter(g => g.id !== id), pendingTriggers: state.pendingTriggers.filter(trigger => trigger.groupId !== id) }));
+    },
+
     // Remove a layer (default: last) from BOTH banks across ALL blocks.
     removeLayer(index?: number) {
+      const current = get({ subscribe });
+      const row = index ?? current.numLayers - 1;
+      if (current.layerStates[row]?.locked || current.bankBLayerStates[row]?.locked) return;
+      vjClipTransitions.clear();
       update(state => {
         if (state.numLayers <= 1) return state;
 
@@ -2419,6 +3372,7 @@ function createVJClipLauncherStore() {
 
         return {
           ...state,
+          groups: removeVJGroupRow(state.groups ?? [], removeIdx, newNumLayers),
           numLayers: newNumLayers,
           clipGrid: newClipGrid,
           blocks: newBlocks,
@@ -2511,15 +3465,18 @@ function createVJClipLauncherStore() {
     },
 
     toggleMapMode() {
+      vjClipTransitions.clear();
       update(state => ({ ...state, mapMode: !state.mapMode, stageMode: false }));
     },
 
     setMapMode(enabled: boolean) {
+      vjClipTransitions.clear();
       update(state => ({ ...state, mapMode: enabled, stageMode: enabled ? false : state.stageMode }));
     },
 
     /** Convenience: set the active sub-mode by name. */
     setSubMode(mode: 'mix' | 'stage' | 'map') {
+      vjClipTransitions.clear();
       update(state => ({
         ...state,
         stageMode: mode === 'stage',
@@ -2545,6 +3502,9 @@ function createVJClipLauncherStore() {
     // ===== Crossfader actions =====
 
     setCrossfaderEnabled(enabled: boolean) {
+      // Canonical row ids change between single- and dual-deck modes.
+      // Finish their current handoff before replacing that graph topology.
+      if (get({ subscribe }).crossfaderEnabled !== enabled) vjClipTransitions.clear();
       update(state => {
         // Toggling preserves both decks' state. We just snap the fader back
         // to 0 (full Bank A) on disable so the user has a defined starting
@@ -2596,6 +3556,280 @@ function createVJClipLauncherStore() {
 }
 
 export const vjClipLauncher = createVJClipLauncherStore();
+
+// A single scheduler for both decks; dormant when nothing is following.
+const autopilotClock = new VJAutopilotClock();
+let autopilotFrame: number | null = null;
+function autopilotSamples(state: VJClipLauncherState): AutopilotSample[] {
+  // Mirrored simulator/output windows must never become another show clock.
+  if (typeof window !== 'undefined' && new URLSearchParams(window.location?.search ?? '').has('mode')) return [];
+  if (!state.isLive || !state.isOpen || state.stoppedAll) return [];
+  const bpm = launchClockTempo();
+  const samples: AutopilotSample[] = [];
+  for (const deck of ['A', 'B'] as const) {
+    if (deck === 'B' && !state.crossfaderEnabled) continue;
+    pickLayerStates(state, deck).forEach((row, index) => {
+      const clip = row.activeClip;
+      const config = normalizeAutopilot(row.autopilot);
+      if (!clip || !config || row.autopilotPaused) return;
+      // Presets only fire in MAP, where rows may mix presets and clips.
+      const ids = (pickGrid(state, deck)[index] ?? []).map(cell =>
+        cell && (state.mapMode || cell.type !== 'preset') ? cell.id : null);
+      const current = ids.indexOf(clip.id);
+      // Don't jump from a playing clip in an old block into unrelated content.
+      if (current < 0) return;
+      const pending = state.pendingTriggers.some(p => p.bank === deck && (p.kind === 'column'
+        ? (!ignoresColumn(row) && (!p.layerIndices || p.layerIndices.includes(index))) : p.layerIndex === index));
+      const duration = knownClipDurationSeconds(clip) ?? 0;
+      samples.push({ key: `${deck}:${index}`, scope: `${state.activeBlockId}:${deck}:${index}`,
+        token: `${get(launchClock).resyncedAt}:${state.activeBlockId}:${autopilotSourceToken(clip, config)}`, config, ids, current,
+        running: !row.locked && !pending && !vjClipLauncher.hasHeldInput(index, deck) && clip.isPlaying !== false,
+        bpm, rate: clip.playbackRate ?? 1,
+        rangeSeconds: duration * Math.max(0, (clip.trimEnd ?? 1) - (clip.trimStart ?? 0)) * (clip.playbackMode === 'bounce' ? 2 : 1),
+        initialLoopProgress: nativeVideoLoopProgress(clip),
+        video: clip.type === 'video' && !clip.src.startsWith('live://'), once: clip.playbackMode === 'once' });
+    });
+  }
+  return samples;
+}
+function scheduleAutopilot() {
+  if (autopilotFrame !== null || !autopilotClock.active || typeof requestAnimationFrame === 'undefined') return;
+  autopilotFrame = requestAnimationFrame(() => {
+    autopilotFrame = null;
+    autopilotClock.sync(autopilotSamples(get(vjClipLauncher)), performance.now());
+    for (const action of autopilotClock.takeDue()) {
+      const current = autopilotSamples(get(vjClipLauncher)).find(s => s.key === action.key);
+      if (!current?.running || current.token !== action.token) continue;
+      const [deck, row] = action.key.split(':');
+      vjClipLauncher.triggerClip(Number(row), action.column, deck as VJDeck, undefined, true);
+    }
+    scheduleAutopilot();
+  });
+}
+vjClipLauncher.subscribe(state => {
+  autopilotClock.sync(autopilotSamples(state), performance.now());
+  if (!autopilotClock.active && autopilotFrame !== null) {
+    cancelAnimationFrame(autopilotFrame); autopilotFrame = null;
+  }
+  scheduleAutopilot();
+});
+onLaunchClockResync(() => {
+  if (typeof window !== 'undefined' && new URLSearchParams(window.location?.search ?? '').has('mode')) return;
+  vjClipLauncher.resyncBeatClips();
+});
+launchClock.subscribe(() => { autopilotClock.sync(autopilotSamples(get(vjClipLauncher)), performance.now()); scheduleAutopilot(); });
+// Settle the interval at the old tempo before following a new one.
+audioStore.subscribe(() => { autopilotClock.sync(autopilotSamples(get(vjClipLauncher)), performance.now()); scheduleAutopilot(); });
+abletonLink.subscribe(() => { autopilotClock.sync(autopilotSamples(get(vjClipLauncher)), performance.now()); scheduleAutopilot(); });
+
+let previousTransitionClips = new Map<string, VJClip>();
+vjClipTransitions.subscribe(transitions => {
+  const retained = new Map(Array.from(transitions.values())
+    .filter(entry => !entry.frozenSourceId).map(entry => [entry.outgoingClip.id, entry.outgoingClip]));
+  const released = Array.from(previousTransitionClips.entries()).filter(([id]) => !retained.has(id));
+  previousTransitionClips = retained;
+  if (!released.length) return;
+  queueMicrotask(() => {
+    const state = get(vjClipLauncher);
+    for (const [id, clip] of released) {
+      const active = [...state.layerStates, ...state.bankBLayerStates].some(layer => layer.activeClip?.id === id);
+      if (active || vjClipTransitions.referencesClip(id)) continue;
+      pauseClipRuntime(clip);
+      releaseClipRuntimeIfOrphaned(state, id);
+    }
+  });
+});
+
+
+// A clip that is resident in either VJ deck must already be warm before it is
+// triggered. Keep the native decoder arm signature aligned with the exact
+// playback contract so trigger only claims a prepared session.
+const residentVideoArmSignatures = new Map<string, string>();
+if (typeof window !== 'undefined') {
+  vjClipLauncher.subscribe((state) => {
+    const seen = new Set<string>();
+    for (const grid of [state.clipGrid, state.bankBClipGrid]) {
+      for (const row of grid) {
+        for (const clip of row) {
+          if (!clip || clip.type !== 'video' || !clip.src || clip.src.startsWith('live://')) {
+            continue;
+          }
+          seen.add(clip.id);
+          const signature = [
+            clip.src,
+            clip.playbackRate ?? 1,
+            clip.playbackMode ?? 'loop',
+            clip.durationSeconds ?? '',
+            clip.trimStart ?? 0,
+            clip.trimEnd ?? 1,
+          ].join('|');
+          if (residentVideoArmSignatures.get(clip.id) !== signature) {
+            residentVideoArmSignatures.set(clip.id, signature);
+            armVJVideoClip(clip);
+          }
+        }
+      }
+    }
+    for (const id of residentVideoArmSignatures.keys()) {
+      if (!seen.has(id)) residentVideoArmSignatures.delete(id);
+    }
+  });
+}
+
+// ─── Beat/bar video playback sync (store-side clock application) ─────────
+// Release v1.9.96 applied `playbackSyncBeats` inside Canvas.svelte's
+// per-frame browser <video> loop. In the native tree video plays in the
+// core decoder, so the clock is applied here instead: whenever the master
+// BPM or an active clip changes, recompute the beat-locked rate — trim
+// span divided by (beats × 60/bpm), clamped 0.05..8, same math as release
+// — and write it onto the active clip's playbackRate. The existing native
+// video-playback sync path (resident arm signatures above + renderer
+// sync) then delivers the new rate to the core decoder. Writes are
+// rate-limited: only when the effective rate moves by more than floating-point tolerance,
+// which also terminates the store-update → recompute feedback loop.
+if (typeof window !== 'undefined') {
+  let playbackBeatSyncScheduled = false;
+
+  const applyPlaybackBeatSync = () => {
+    playbackBeatSyncScheduled = false;
+    const state = getStore(vjClipLauncher);
+    const bpm = launchClockTempo();
+    if (!bpm || bpm <= 0) return;
+    const decks: Array<{ deck: VJDeck; layers: VJLayerState[] }> = [
+      { deck: 'A', layers: state.layerStates },
+      { deck: 'B', layers: state.bankBLayerStates },
+    ];
+    for (const { deck, layers } of decks) {
+      for (let layerIndex = 0; layerIndex < layers.length; layerIndex++) {
+        const clip = layers[layerIndex]?.activeClip;
+        if (!clip || clip.type !== 'video') continue;
+        const syncBeats = clip.playbackSyncBeats ?? null;
+        if (!syncBeats || syncBeats <= 0) continue;
+        const duration = clip.durationSeconds || clip.videoElement?.duration || 0;
+        if (!Number.isFinite(duration) || duration <= 0) continue;
+        const trimS = clip.trimStart ?? 0;
+        const trimE = clip.trimEnd ?? 1;
+        const fit = videoBeatFit(duration, trimS, trimE, syncBeats, bpm,
+          clip.playbackMode === 'bounce', clip.playbackRate ?? 1);
+        if (!fit) continue;
+        const rate = fit.rate;
+        // Preserve fine tempo changes: a 0.001 rate deadband accumulates
+        // visible phase error over a long set, especially at slow speeds.
+        if (Math.abs((clip.playbackRate ?? 1) - rate) <= 1e-9) continue;
+        vjClipLauncher.updateActiveClipVideoProps(layerIndex, { playbackRate: rate }, deck);
+      }
+    }
+  };
+
+  // Defer off the subscribe callback (no reentrant store writes) and
+  // coalesce bursts — audioStore ticks per animation frame.
+  const schedulePlaybackBeatSync = () => {
+    if (playbackBeatSyncScheduled) return;
+    playbackBeatSyncScheduled = true;
+    queueMicrotask(applyPlaybackBeatSync);
+  };
+
+  vjClipLauncher.subscribe(schedulePlaybackBeatSync);
+  audioStore.subscribe(schedulePlaybackBeatSync);
+  launchClock.subscribe(schedulePlaybackBeatSync);
+  abletonLink.subscribe(schedulePlaybackBeatSync);
+}
+
+// One native mixer owns desktop sound; library previews remain silent.
+if (typeof window !== 'undefined' && isDesktopApp) {
+  let signature = '';
+  let scheduled = false;
+  const publishAudio = () => {
+    if (scheduled || new URLSearchParams(window.location?.search ?? '').has('mode')) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      const command = nativeClipAudioMix(get(vjClipLauncher), get(nativeAudioMaster), get(vjClipTransitions));
+      const audible = command.voices.some(voice => voice.gain > 0);
+      if (get(nativeClipAudioAudible) !== audible) nativeClipAudioAudible.set(audible);
+      const next = JSON.stringify(command);
+      if (signature === next) return;
+      signature = next;
+      void submitNativeRendererCommands([command]).catch(() => { signature = ''; });
+    });
+  };
+  vjClipLauncher.subscribe(publishAudio);
+  nativeAudioMaster.subscribe(publishAudio);
+  // Clip transitions fade the audio too: the core follows each fade's clock.
+  vjClipTransitions.subscribe(publishAudio);
+  let wasRunning = false;
+  nativeRendererRuntime.subscribe(runtime => {
+    if (runtime.running && !wasRunning) { signature = ''; publishAudio(); }
+    wasRunning = runtime.running;
+  });
+}
+
+// Phase targets are a separate, bounded control channel: no project writes,
+// seek generations, or per-frame graph rebuilds. The core expires corrections
+// after 500 ms if the mixer closes or the frontend stops publishing.
+if (typeof window !== 'undefined') {
+  const follower = new VideoBeatPhase();
+  let phaseTimer: ReturnType<typeof setTimeout> | null = null;
+  let sending = false;
+  let phaseSources = new Set<string>();
+  const eligible = () => {
+    const state = get(vjClipLauncher);
+    if (!isDesktopApp || !state.isOpen || !state.isLive || state.stoppedAll
+      || new URLSearchParams(window.location?.search ?? '').has('mode')) return [];
+    return (['A', 'B'] as const).flatMap(deck => deck === 'B' && !state.crossfaderEnabled ? [] :
+      pickLayerStates(state, deck).flatMap((row, index) => {
+        const clip = row.activeClip;
+        return clip?.type === 'video' && !clip.src.startsWith('live://') && clip.isPlaying !== false
+          && clip.playbackMode !== 'once' && Number(clip.playbackSyncBeats) > 0
+          ? [{ key: `${deck}:${index}`, clip }] : [];
+      }));
+  };
+  const publish = async () => {
+    phaseTimer = null;
+    const clips = eligible();
+    follower.retain(new Set(clips.map(item => item.key)));
+    const commands: RendererCommand[] = [];
+    const currentSources = new Set<string>();
+    const now = performance.now();
+    const beat = launchClockPosition(now).beat;
+    const link = get(abletonLink);
+    for (const { key, clip } of clips) {
+      const fit = videoBeatFit(Number(clip.durationSeconds ?? clip.videoElement?.duration),
+        clip.trimStart ?? 0, clip.trimEnd ?? 1, Number(clip.playbackSyncBeats), launchClockTempo(),
+        clip.playbackMode === 'bounce', clip.playbackRate ?? 1);
+      if (!fit || fit.limited) continue;
+      const target = follower.sample(key, clip, beat, get(launchClock).resyncedAt, now);
+      if (target) { currentSources.add(clip.id); commands.push({ type: 'set_media_source_phase', source_id: clip.id, uri: clip.src,
+        seek_generation: clip._nativePlaybackSeekSeq ?? 0, time_seconds: target.timeSeconds, reverse: target.reverse,
+        ...(link.enabled && link.peers > 0 ? { clock: 'link', beat_position: beat, beats_per_cycle: Number(clip.playbackSyncBeats) } : {}),
+      }); }
+    }
+    for (const id of phaseSources) if (!currentSources.has(id)) commands.push({ type: 'set_media_source_phase', source_id: id, enabled: false });
+    phaseSources = currentSources;
+    if (commands.length) {
+      sending = true;
+      try { await submitNativeRendererCommands(commands); }
+      catch { /* Renderer recovery owns connection errors; stale corrections expire. */ }
+      finally { sending = false; }
+    }
+    schedule();
+  };
+  const schedule = () => {
+    const clips = eligible();
+    follower.retain(new Set(clips.map(item => item.key)));
+    if (!clips.length) {
+      if (phaseTimer !== null) clearTimeout(phaseTimer);
+      phaseTimer = null; follower.clear();
+      if (phaseSources.size) {
+        const commands: RendererCommand[] = [...phaseSources].map(source_id => ({ type: 'set_media_source_phase', source_id, enabled: false }));
+        phaseSources.clear(); void submitNativeRendererCommands(commands).catch(() => {});
+      }
+      return;
+    }
+    if (phaseTimer === null && !sending) phaseTimer = setTimeout(publish, 100);
+  };
+  vjClipLauncher.subscribe(schedule);
+}
 
 // Derived store: Get the active clip for each layer.
 //
@@ -2672,303 +3906,340 @@ export const activeVJLayers = derived(
   }
 );
 
-// Derived store: Get layers to render when VJ mode is live
-export const vjOutputLayers = derived(
-  [vjClipLauncher, activeVJLayers, vjLayerSequencer],
-  ([$vjClipLauncher, $activeVJLayers, $vjLayerSequencer]) => {
-    if (!$vjClipLauncher.isLive) return null;
+export interface ActiveVJLayer {
+  clip: VJClip;
+  opacity: number;
+  blendMode: BlendMode;
+  effects: Effect[];
+  layerIndex: number;
+  bank: VJDeck | null;
+}
 
-    const outputLayers: Layer[] = [];
+/** Shared conversion preserves each outgoing clip's exact source and geometry. */
+export function buildVJClipLayer(activeLayer: ActiveVJLayer, launcherState: VJClipLauncherState, sequencerState: VJLayerSequencerState): Layer {
+  const vjLayerIndex = activeLayer.layerIndex;
+  const clip = activeLayer.clip;
+  const sequenceOverrides = activeLayer.bank === 'B'
+    ? (sequencerState.bankBOpacityOverrides ?? {})
+    : sequencerState.opacityOverrides;
+  const sequenceOpacity = sequencerState.isPlaying
+    ? (sequenceOverrides[vjLayerIndex] ?? 1)
+    : 1;
+  const vjLayerOpacity = activeLayer.opacity * sequenceOpacity * launcherState.masterOpacity;
+  if (clip.type === 'video') {
+    ensureClipVideoElement(clip);
+  }
 
-    // Iterate every active entry — when crossfader is on, a single VJ
-    // layer may have BOTH a Bank A and a Bank B entry. We emit one
-    // Layer per entry so the engine can route each to its bank FBO.
-    for (const activeLayer of $activeVJLayers) {
-      const vjLayerIndex = activeLayer.layerIndex;
-      const clip = activeLayer.clip;
-      const sequenceOverrides = activeLayer.bank === 'B'
-        ? ($vjLayerSequencer.bankBOpacityOverrides ?? {})
-        : $vjLayerSequencer.opacityOverrides;
-      const sequenceOpacity = $vjLayerSequencer.isPlaying
-        ? (sequenceOverrides[vjLayerIndex] ?? 1)
-        : 1;
-      const vjLayerOpacity = activeLayer.opacity * sequenceOpacity * $vjClipLauncher.masterOpacity;
-      if (clip.type === 'video') {
-        ensureClipVideoElement(clip);
+  // Cache key includes the bank so Bank A and Bank B clips on the same
+  // row don't collide. In single-bank mode bank is null and the key
+  // matches the original vj-{layer}-{clipId} shape.
+  const bankSuffix = activeLayer.bank ? `-${activeLayer.bank}` : '';
+  const cacheKey = `vj-${vjLayerIndex}${bankSuffix}-${clip.id}`;
+  let source = vjSourceCache.get(cacheKey);
+
+  if (!source) {
+    // Map VJClip type to MediaSource type
+    const mediaType = mediaTypeForClip(clip);
+
+    source = {
+      id: clip.id,
+      type: mediaType,
+      name: clip.name,
+      src: clip.src,
+      _assetRef: clip._assetRef,
+      shaderCode: clip.shaderCode,
+      shaderInputs: getShaderInputs(clip.shaderCode),
+      shaderValues: clip.shaderValues || {},
+      jsAnimation: clip.jsAnimation,
+      videoElement: clip.videoElement,
+      iframeElement: clip.iframeElement,
+      // Forward video playback props so Canvas.svelte's updateTexturesSync
+      // sees them. Canvas already has trim-aware loop/clamp/once logic
+      // (`source.trimStart/trimEnd/playbackMode/playbackRate/isPlaying`)
+      // — without these forwards the playhead ignores the trim handles
+      // and just plays the whole file end-to-end on loop.
+      playbackMode: clip.playbackMode || 'loop',
+      playbackRate: clip.playbackRate ?? 1,
+      playbackSyncBeats: clip.playbackSyncBeats ?? null,
+      trimStart: clip.trimStart ?? 0,
+      trimEnd: clip.trimEnd ?? 1,
+      isPlaying: clip.isPlaying !== false,
+      durationSeconds: clip.durationSeconds,
+      videoWidth: clip.videoWidth, videoHeight: clip.videoHeight,
+      _nativePlaybackDirection: clip._nativePlaybackDirection,
+      _nativePlaybackTimeSeconds: clip._nativePlaybackTimeSeconds,
+      _nativePlaybackUpdatedAtMs: clip._nativePlaybackUpdatedAtMs,
+      _nativePlaybackSeekSeq: clip._nativePlaybackSeekSeq,
+    };
+
+    // For threejs clips, get the canvas from the iframe context
+    if (clip.type === 'threejs') {
+      const context = getThreeJSIframeContext(clip.id);
+      if (context) {
+        source.threejsCanvas = context.canvas;
       }
-
-      // Cache key includes the bank so Bank A and Bank B clips on the same
-      // row don't collide. In single-bank mode bank is null and the key
-      // matches the original vj-{layer}-{clipId} shape.
-      const bankSuffix = activeLayer.bank ? `-${activeLayer.bank}` : '';
-      const cacheKey = `vj-${vjLayerIndex}${bankSuffix}-${clip.id}`;
-      let source = vjSourceCache.get(cacheKey);
-
-      if (!source) {
-        // Map VJClip type to MediaSource type
-        const mediaType = mediaTypeForClip(clip);
-
-        source = {
-          id: clip.id,
-          type: mediaType,
-          name: clip.name,
-          src: clip.src,
-          _assetRef: clip._assetRef,
-          shaderCode: clip.shaderCode,
-          shaderInputs: getShaderInputs(clip.shaderCode),
-          shaderValues: clip.shaderValues || {},
-          jsAnimation: clip.jsAnimation,
-          videoElement: clip.videoElement,
-          texture: clip.type === 'video' ? clip.videoTexture : undefined,
-          iframeElement: clip.iframeElement,
-          // Forward video playback props so Canvas.svelte's updateTexturesSync
-          // sees them. Canvas already has trim-aware loop/clamp/once logic
-          // (`source.trimStart/trimEnd/playbackMode/playbackRate/isPlaying`)
-          // — without these forwards the playhead ignores the trim handles
-          // and just plays the whole file end-to-end on loop.
-          playbackMode: clip.playbackMode || 'loop',
-          playbackRate: clip.playbackRate ?? 1,
-          playbackSyncBeats: clip.playbackSyncBeats ?? null,
-          trimStart: clip.trimStart ?? 0,
-          trimEnd: clip.trimEnd ?? 1,
-          isPlaying: clip.isPlaying !== false,
-        };
-
-        // For threejs clips, get the canvas from the iframe context
-        if (clip.type === 'threejs') {
-          const context = getThreeJSIframeContext(clip.id);
-          if (context) {
-            source.threejsCanvas = context.canvas;
-          }
-        }
-
-        // For synthvision clips, use the provided offscreen canvas
-        if (clip.type === 'synthvision' && clip.synthVisionCanvas) {
-          source.threejsCanvas = clip.synthVisionCanvas;
-        }
-
-        // For live network clips, route to the correct renderer receiver.
-        // NDI reuses the legacy 'spout' clip type for compatibility, but
-        // Canvas distinguishes it by ndiSource vs spoutSource.
-        if (clip.type === 'spout' && clip.ndiSource) {
-          source.ndiSource = clip.ndiSource;
-        } else if (clip.type === 'spout' && clip.spoutSource) {
-          source.spoutSource = {
-            senderName: clip.spoutSource,
-            name: clip.spoutSource, // Legacy compatibility
-            width: 1920,
-            height: 1080,
-          };
-        }
-
-        // For effect clips, set the effectSource property for integrated WebGL effects
-        if (clip.type === 'effect' && clip.effectSource) {
-          source.effectSource = clip.effectSource;
-        }
-
-        vjSourceCache.set(cacheKey, source);
-      } else {
-        // Update dynamic properties
-        const mediaType = mediaTypeForClip(clip);
-        const srcChanged = source.src !== clip.src;
-        source.id = clip.id;
-        source.type = mediaType;
-        source.name = clip.name;
-        source.src = clip.src;
-        source.jsAnimation = clip.jsAnimation;
-        if (srcChanged) {
-          source.texture?.dispose?.();
-          source.texture = undefined;
-          source.videoElement = undefined;
-        }
-        source.shaderValues = clip.shaderValues || {};
-        if (clip.videoElement) {
-          source.videoElement = clip.videoElement;
-        }
-        if (clip.type === 'video' && clip.videoTexture) {
-          source.texture = clip.videoTexture;
-        }
-        source._assetRef = clip._assetRef;
-        if (clip.iframeElement) {
-          source.iframeElement = clip.iframeElement;
-        }
-        // For video clips: refresh trim/playback props every recompute so
-        // the trim handles in the VJ video controls panel feed live values
-        // into Canvas.svelte's per-frame trim clamp / loop logic. Without
-        // this refresh the cached source freezes its trim values at
-        // first-trigger time and the playhead ignores subsequent drags.
-        if (clip.type === 'video') {
-          source.playbackMode = clip.playbackMode || 'loop';
-          source.playbackRate = clip.playbackRate ?? 1;
-          source.playbackSyncBeats = clip.playbackSyncBeats ?? null;
-          source.trimStart = clip.trimStart ?? 0;
-          source.trimEnd = clip.trimEnd ?? 1;
-          source.isPlaying = clip.isPlaying !== false;
-        }
-        // For threejs clips, get the canvas from the iframe context
-        if (clip.type === 'threejs') {
-          const context = getThreeJSIframeContext(clip.id);
-          if (context) {
-            source.threejsCanvas = context.canvas;
-          }
-        }
-        // For synthvision clips, update the canvas reference
-        if (clip.type === 'synthvision' && clip.synthVisionCanvas) {
-          source.threejsCanvas = clip.synthVisionCanvas;
-        }
-        // For live network clips, refresh receiver metadata and clear the
-        // opposite transport so cached sources cannot flip stale routes.
-        if (clip.type === 'spout' && clip.ndiSource) {
-          source.ndiSource = clip.ndiSource;
-          source.spoutSource = undefined;
-        } else if (clip.type === 'spout' && clip.spoutSource) {
-          source.spoutSource = {
-            senderName: clip.spoutSource,
-            name: clip.spoutSource,
-            width: 1920,
-            height: 1080,
-          };
-          source.ndiSource = undefined;
-        } else {
-          source.spoutSource = undefined;
-          source.ndiSource = undefined;
-        }
-        // For effect clips, update the effectSource (for parameter changes)
-        if (clip.type === 'effect' && clip.effectSource) {
-          source.effectSource = clip.effectSource;
-        }
-      }
-
-      // Map content clips to their native layer types so Canvas creates the
-      // same renderers used by mapping mode.
-      let layerType: Layer['type'] = 'media';
-      if (clip.type === 'splat') layerType = 'splat';
-      else if (clip.type === 'model3d') layerType = 'model3d';
-      else if (clip.type === 'gpu') layerType = 'gpu';
-      else if (clip.type === 'text') layerType = 'text';
-
-      // Create Layer object with all required properties.
-      // ID includes the bank suffix when in dual-bank mode so the render
-      // engine treats Bank A and Bank B clips on the same row as
-      // distinct layers (they'll otherwise collide in renderPlan
-      // dedup / texture caches).
-      const layerIdSuffix = activeLayer.bank ? `-${activeLayer.bank}` : '';
-
-      // Per-clip transforms — applied by REWRITING THE CORNERS of
-      // the layer's warp quad. The engine renders VJ layers through
-      // the warp-quad pipeline; layer.position/scale/rotation are
-      // bypassed for layers in 'corners' warp mode. So we bake the
-      // transforms into the corners directly:
-      //   1. Start with default unit-rect corners at ±0.5 from center
-      //   2. Scale by zoom (uniform scale around center)
-      //   3. Rotate by rotation degrees (around center)
-      //   4. Translate by (anchor - 0.5)
-      //   5. Re-anchor to (0.5, 0.5) and convert to corner format
-      // contentFit + opacity are still consumed via the existing
-      // shader uniforms (they're UV-based and per-layer-multiply,
-      // not corner-based).
-      const transformableClip = isTransformableMediaClip(clip);
-      const clipZoom = transformableClip ? (clip.zoom ?? 1) : 1;
-      const clipRotation = transformableClip ? (clip.rotation ?? 0) : 0;
-      const clipOpacity = transformableClip ? (clip.opacity ?? 1) : 1;
-      const clipMirrorX = transformableClip ? !!clip.mirrorX : false;
-      const ax = transformableClip ? (clip.anchorX ?? 0.5) : 0.5;
-      const ay = transformableClip ? (clip.anchorY ?? 0.5) : 0.5;
-      // Map VJ-friendly fit names to engine ContentFitMode.
-      let clipContentFit: 'stretch' | 'fill' | 'crop' | undefined;
-      if (transformableClip) {
-        const f = clip.fit ?? 'cover';
-        clipContentFit = f === 'cover' ? 'fill' : f === 'contain' ? 'crop' : 'stretch';
-      }
-
-      // Corner computation. Engine corner space is [0,1]² with
-      // y=1 at top. We work in centered space (-0.5..0.5) for the
-      // matrix math, then re-translate to [0,1] for the engine.
-      const cosR = Math.cos((clipRotation * Math.PI) / 180);
-      const sinR = Math.sin((clipRotation * Math.PI) / 180);
-      // Anchor maps user 0..1 → quad offset from center in [-0.5..0.5].
-      // anchorX=0 means "anchor at left edge" → quad shifts LEFT by 0.5
-      // (so the right edge ends up at x=0.5 of canvas? actually that's
-      // "anchor at left edge of source maps to center of canvas"; for
-      // a more intuitive pan-the-content semantics we shift the OPPOSITE
-      // way so anchorX=1 reveals the left side of source).
-      const offX = (ax - 0.5);
-      const offY = (ay - 0.5);
-      const transformCorner = (cx: number, cy: number) => {
-        // cx,cy are corner positions in centered space ±0.5
-        // Apply zoom, rotate around center, translate by anchor
-        const sx = cx * clipZoom;
-        const sy = cy * clipZoom;
-        const rx = sx * cosR - sy * sinR;
-        const ry = sx * sinR + sy * cosR;
-        return { x: rx + 0.5 + offX, y: ry + 0.5 + offY };
-      };
-      // Default unit corners in centered space (-0.5..0.5). The
-      // top corners have cy=+0.5 because engine corner space has
-      // y=1 at the top, y=0 at the bottom — transformCorner adds
-      // 0.5 at the end so cy=+0.5 → y=1 (top) for identity. Hand-
-      // off into the engine's corner format is now direct.
-      const clipCorners = {
-        topLeft:     transformCorner(-0.5,  0.5),
-        topRight:    transformCorner( 0.5,  0.5),
-        bottomLeft:  transformCorner(-0.5, -0.5),
-        bottomRight: transformCorner( 0.5, -0.5),
-      };
-
-      const layer: Layer = {
-        id: `vj-layer-${vjLayerIndex}${layerIdSuffix}`,
-        name: clip.name,
-        type: layerType,
-        visible: true,
-        locked: false,
-        opacity: vjLayerOpacity * clipOpacity,
-        blendMode: activeLayer.blendMode,
-        source,
-        linesContent: null,
-        svgContent: null,
-        colorContent: null,
-        lightPaintingContent: null,
-        advLightPaintingContent: null,
-        textContent: clip.type === 'text' ? (clip.textContent || createDefaultTextContent()) : null,
-        splatContent: clip.type === 'splat' ? (clip.splatContent || createDefaultSplatContent()) : null,
-        model3dContent: clip.type === 'model3d' ? (clip.model3dContent || createDefaultModel3DContent()) : null,
-        pixelFXContent: null,
-        gpuLayerContent: clip.type === 'gpu' ? (clip.gpuLayerContent || createDefaultGPULayerContent()) : null,
-        arcadeContent: null,
-        // Transform identity — per-clip transforms are baked into
-        // `corners` below so the engine's warp pipeline applies them
-        // uniformly. position/scale/rotation are bypassed by the
-        // corner pipeline anyway.
-        position: { x: 0, y: 0 },
-        scale: { x: 1, y: 1 },
-        rotation: 0,
-        flipH: clipMirrorX,
-        // VideoTexture already normalizes DOM video frames for the renderer.
-        // Keep the VJ adapter neutral so rotation 0 / mirror off matches Mapping.
-        flipV: false,
-        contentFit: clipContentFit,
-        // Warping - corners computed from per-clip zoom/anchor/rotation
-        // above; defaults to a full-screen unit quad when all transforms
-        // are at identity (zoom=1, anchor=0.5/0.5, rotation=0).
-        warpMode: 'corners',
-        corners: clipCorners,
-        meshGrid: null,
-        // No mask or crop
-        mask: null,
-        cropRegion: null,
-        layerShape: null,
-        edgeEffects: null,
-        // Effects from VJ layer state
-        effects: activeLayer.effects,
-        // Bank tag — read by engine.render() to route to A or B FBO when crossfader is on.
-        bank: activeLayer.bank ?? undefined,
-      };
-
-      outputLayers.push(layer);
     }
 
-    return outputLayers.length > 0 ? outputLayers : null;
+    // For synthvision clips, use the provided offscreen canvas
+    if (clip.type === 'synthvision' && clip.synthVisionCanvas) {
+      source.threejsCanvas = clip.synthVisionCanvas;
+    }
+
+    // For live network clips, route to the correct renderer receiver.
+    // NDI reuses the legacy 'spout' clip type for compatibility, but
+    // Canvas distinguishes it by ndiSource vs spoutSource.
+    if (clip.type === 'spout' && clip.ndiSource) {
+      source.ndiSource = clip.ndiSource;
+    } else if (clip.type === 'spout' && clip.spoutSource) {
+      source.spoutSource = {
+        senderName: clip.spoutSource,
+        name: clip.spoutSource, // Legacy compatibility
+        width: 1920,
+        height: 1080,
+      };
+    }
+
+    // For effect clips, set the effectSource property for integrated WebGL effects
+    if (clip.type === 'effect' && clip.effectSource) {
+      source.effectSource = clip.effectSource;
+    }
+
+    vjSourceCache.set(cacheKey, source);
+  } else {
+    // Update dynamic properties
+    const mediaType = mediaTypeForClip(clip);
+    const srcChanged = source.src !== clip.src;
+    source.id = clip.id;
+    source.type = mediaType;
+    source.name = clip.name;
+    source.src = clip.src;
+    source.jsAnimation = clip.jsAnimation;
+    if (srcChanged) {
+      source.texture?.dispose?.();
+      source.texture = undefined;
+      source.videoElement = undefined;
+    }
+    source.shaderValues = clip.shaderValues || {};
+    if (clip.videoElement) {
+      source.videoElement = clip.videoElement;
+    }
+    source._assetRef = clip._assetRef;
+    if (clip.iframeElement) {
+      source.iframeElement = clip.iframeElement;
+    }
+    // For video clips: refresh trim/playback props every recompute so
+    // the trim handles in the VJ video controls panel feed live values
+    // into Canvas.svelte's per-frame trim clamp / loop logic. Without
+    // this refresh the cached source freezes its trim values at
+    // first-trigger time and the playhead ignores subsequent drags.
+    if (clip.type === 'video') {
+      source.playbackMode = clip.playbackMode || 'loop';
+      source.playbackRate = clip.playbackRate ?? 1;
+      source.playbackSyncBeats = clip.playbackSyncBeats ?? null;
+      source.trimStart = clip.trimStart ?? 0;
+      source.trimEnd = clip.trimEnd ?? 1;
+      source.isPlaying = clip.isPlaying !== false;
+      source.durationSeconds = clip.durationSeconds;
+      source.videoWidth = clip.videoWidth; source.videoHeight = clip.videoHeight;
+      source._nativePlaybackDirection = clip._nativePlaybackDirection;
+      source._nativePlaybackTimeSeconds = clip._nativePlaybackTimeSeconds;
+      source._nativePlaybackUpdatedAtMs = clip._nativePlaybackUpdatedAtMs;
+      source._nativePlaybackSeekSeq = clip._nativePlaybackSeekSeq;
+    }
+    // For threejs clips, get the canvas from the iframe context
+    if (clip.type === 'threejs') {
+      const context = getThreeJSIframeContext(clip.id);
+      if (context) {
+        source.threejsCanvas = context.canvas;
+      }
+    }
+    // For synthvision clips, update the canvas reference
+    if (clip.type === 'synthvision' && clip.synthVisionCanvas) {
+      source.threejsCanvas = clip.synthVisionCanvas;
+    }
+    // For live network clips, refresh receiver metadata and clear the
+    // opposite transport so cached sources cannot flip stale routes.
+    if (clip.type === 'spout' && clip.ndiSource) {
+      source.ndiSource = clip.ndiSource;
+      source.spoutSource = undefined;
+    } else if (clip.type === 'spout' && clip.spoutSource) {
+      source.spoutSource = {
+        senderName: clip.spoutSource,
+        name: clip.spoutSource,
+        width: 1920,
+        height: 1080,
+      };
+      source.ndiSource = undefined;
+    } else {
+      source.spoutSource = undefined;
+      source.ndiSource = undefined;
+    }
+    // For effect clips, update the effectSource (for parameter changes)
+    if (clip.type === 'effect' && clip.effectSource) {
+      source.effectSource = clip.effectSource;
+    }
   }
+
+  // Map clip type to layer type (splat/model3d get their own layer types for proper rendering)
+  let layerType: Layer['type'] = 'media';
+  if (clip.type === 'splat') layerType = 'splat';
+  else if (clip.type === 'model3d') layerType = 'model3d';
+  else if (clip.type === 'gpu') layerType = 'gpu';
+  else if (clip.type === 'text') layerType = 'text';
+
+  // Create Layer object with all required properties.
+  // ID includes the bank suffix when in dual-bank mode so the render
+  // engine treats Bank A and Bank B clips on the same row as
+  // distinct layers (they'll otherwise collide in renderPlan
+  // dedup / texture caches).
+  const layerIdSuffix = activeLayer.bank ? `-${activeLayer.bank}` : '';
+
+  // Per-clip transforms — applied by REWRITING THE CORNERS of
+  // the layer's warp quad. The engine renders VJ layers through
+  // the warp-quad pipeline; layer.position/scale/rotation are
+  // bypassed for layers in 'corners' warp mode. So we bake the
+  // transforms into the corners directly:
+  //   1. Start with default unit-rect corners at ±0.5 from center
+  //   2. Scale by zoom (uniform scale around center)
+  //   3. Rotate by rotation degrees (around center)
+  //   4. Translate by (anchor - 0.5)
+  //   5. Re-anchor to (0.5, 0.5) and convert to corner format
+  // contentFit + opacity are still consumed via the existing
+  // shader uniforms (they're UV-based and per-layer-multiply,
+  // not corner-based).
+  const transformable = clipSupportsTransform(clip);
+  const clipZoom = transformable ? (clip.zoom ?? 1) : 1;
+  const clipRotation = transformable ? (clip.rotation ?? 0) : 0;
+  const clipOpacity = transformable ? (clip.opacity ?? 1) : 1;
+  const clipMirrorX = transformable ? !!clip.mirrorX : false;
+  const ax = transformable ? (clip.anchorX ?? 0.5) : 0.5;
+  const ay = transformable ? (clip.anchorY ?? 0.5) : 0.5;
+  // Map VJ-friendly fit names to engine ContentFitMode.
+  let clipContentFit: 'stretch' | 'fill' | 'crop' | undefined;
+  if (transformable) {
+    const f = clip.fit ?? 'cover';
+    clipContentFit = f === 'cover' ? 'fill' : f === 'contain' ? 'crop' : 'stretch';
+  }
+
+  // Corner computation. Engine corner space is [0,1]² with
+  // y=1 at top. We work in centered space (-0.5..0.5) for the
+  // matrix math, then re-translate to [0,1] for the engine.
+  const cosR = Math.cos((clipRotation * Math.PI) / 180);
+  const sinR = Math.sin((clipRotation * Math.PI) / 180);
+  // Anchor maps user 0..1 → quad offset from center in [-0.5..0.5].
+  // anchorX=0 means "anchor at left edge" → quad shifts LEFT by 0.5
+  // (so the right edge ends up at x=0.5 of canvas? actually that's
+  // "anchor at left edge of source maps to center of canvas"; for
+  // a more intuitive pan-the-content semantics we shift the OPPOSITE
+  // way so anchorX=1 reveals the left side of source).
+  const offX = (ax - 0.5);
+  const offY = (ay - 0.5);
+  const transformCorner = (cx: number, cy: number) => {
+    // cx,cy are corner positions in centered space ±0.5
+    // Apply zoom, rotate around center, translate by anchor
+    const sx = cx * clipZoom;
+    const sy = cy * clipZoom;
+    const rx = sx * cosR - sy * sinR;
+    const ry = sx * sinR + sy * cosR;
+    return { x: rx + 0.5 + offX, y: ry + 0.5 + offY };
+  };
+  // Default unit corners in centered space (-0.5..0.5). The
+  // top corners have cy=+0.5 because engine corner space has
+  // y=1 at the top, y=0 at the bottom — transformCorner adds
+  // 0.5 at the end so cy=+0.5 → y=1 (top) for identity. Hand-
+  // off into the engine's corner format is now direct.
+  const clipCorners = {
+    topLeft:     transformCorner(-0.5,  0.5),
+    topRight:    transformCorner( 0.5,  0.5),
+    bottomLeft:  transformCorner(-0.5, -0.5),
+    bottomRight: transformCorner( 0.5, -0.5),
+  };
+
+  const layer: Layer = {
+    id: `vj-layer-${vjLayerIndex}${layerIdSuffix}`,
+    name: clip.name,
+    type: layerType,
+    visible: true,
+    locked: false,
+    opacity: vjLayerOpacity * clipOpacity,
+    blendMode: activeLayer.blendMode,
+    source,
+    linesContent: null,
+    svgContent: null,
+    colorContent: null,
+    lightPaintingContent: null,
+    advLightPaintingContent: null,
+    textContent: clip.type === 'text' ? (clip.textContent || createDefaultTextContent()) : null,
+    splatContent: clip.type === 'splat' ? (clip.splatContent || createDefaultSplatContent()) : null,
+    model3dContent: clip.type === 'model3d' ? (clip.model3dContent || createDefaultModel3DContent()) : null,
+    pixelFXContent: null,
+    gpuLayerContent: clip.type === 'gpu' ? (clip.gpuLayerContent || createDefaultGPULayerContent()) : null,
+    arcadeContent: null,
+    // Transform identity — per-clip transforms are baked into
+    // `corners` below so the engine's warp pipeline applies them
+    // uniformly. position/scale/rotation are bypassed by the
+    // corner pipeline anyway.
+    position: { x: 0, y: 0 },
+    scale: { x: 1, y: 1 },
+    rotation: 0,
+    flipH: clipMirrorX,
+    flipV: false,
+    contentFit: clipContentFit,
+    // Warping - corners computed from per-clip zoom/anchor/rotation
+    // above; defaults to a full-screen unit quad when all transforms
+    // are at identity (zoom=1, anchor=0.5/0.5, rotation=0).
+    warpMode: 'corners',
+    corners: clipCorners,
+    meshGrid: null,
+    // No mask or crop
+    mask: null,
+    cropRegion: null,
+    layerShape: null,
+    edgeEffects: null,
+    // Effects from VJ layer state
+    effects: activeLayer.effects,
+    // Bank tag — read by engine.render() to route to A or B FBO when crossfader is on.
+    bank: activeLayer.bank ?? undefined,
+  };
+
+  return layer;
+}
+
+// Normal output stays unchanged; retained outgoing clips have a separate feed.
+export const vjOutputLayers = derived(
+  [vjClipLauncher, activeVJLayers, vjLayerSequencer, vjClipTransitions],
+  ([state, active, sequencer, transitions]) => {
+    if (!state.isLive) return null;
+    const output = active.map(entry => {
+      const prepared=transitions.get(`${entry.bank??'A'}:${entry.layerIndex}`);
+      if (prepared?.queuedTriggerId && prepared.preparedIncoming && prepared.outgoingClip.id===entry.clip.id
+        && prepared.outgoingClip._nativePlaybackSeekSeq===entry.clip._nativePlaybackSeekSeq) {
+        const layer=buildVJClipLayer({...entry,clip:prepared.preparedIncoming},state,sequencer);
+        return {...layer,source:layer.source?{...layer.source,_nativeLaunchPreparation:true}:layer.source};
+      }
+      return buildVJClipLayer(entry,state,sequencer);
+    });
+    return output.length ? output : null;
+  },
+);
+
+export const vjTransitionOutputLayers = derived(
+  [vjClipLauncher, vjClipTransitions, vjLayerSequencer],
+  ([state, transitions, sequencer]) => {
+    if (!state.isLive) return [];
+    return Array.from(transitions.values()).flatMap(transition => {
+      const layerState = pickLayerStates(state, transition.deck)[transition.layerIndex];
+      if (!layerState || (transition.deck === 'B' && !state.crossfaderEnabled)) return [];
+      return [{ transition, layer: buildVJClipLayer({
+        clip: transition.outgoingClip,
+        opacity: layerState.opacity,
+        blendMode: layerState.blendMode,
+        effects: [...(transition.outgoingClip.effects ?? []), ...layerState.effects],
+        layerIndex: transition.layerIndex,
+        bank: state.crossfaderEnabled ? transition.deck : null,
+      }, state, sequencer) }];
+    });
+  },
 );
 
 // Helper to get current state
@@ -2979,3 +4250,215 @@ export function getVJClipLauncherState(): VJClipLauncherState {
 // Don't clear source cache when VJ mode toggles - let textures persist
 // This was causing issues because textures need to be reloaded each time
 // The cache is small and keyed by vj-layer-index + clip-id, so it won't grow unbounded
+
+// Prepared video cuts on either deck. Columns are admitted as one transaction;
+// if any participating row needs another route, the whole column stays there.
+type NativeCutRow = { layerIndex: number; incoming: VJClip; outgoing: VJClip; layerId: string; start: number; transition: ReturnType<typeof effectiveClipTransition>; fadeToken?:number; signature: string };
+type NativeCutPlan = { trigger: PendingTrigger; rows: NativeCutRow[]; lane: string; dualDeck: boolean; signature: string };
+export function buildNativeQueuedCutPlan(trigger: PendingTrigger, state: VJClipLauncherState): NativeCutPlan | null {
+  if (trigger.autopilotSource || (trigger.bank === 'B' && !state.crossfaderEnabled)
+    || !state.isLive || !state.isOpen || state.stoppedAll || !queuedTriggerStillMatches(trigger,state)
+    || !get(nativeRendererRuntime).running || get(vjLayerSequencer).isPlaying
+    || Object.values(get(keyframeTimeline).timelines).some(timeline=>timeline.tracks.length>0)) return null;
+  if (!launchClockFollowsLink() && (get(audioStore).isActive || get(launchClock).nudge !== 0)) return null;
+  const deck=trigger.bank;
+  const deckRows=pickLayerStates(state,deck), grid=pickGrid(state,deck);
+  const column=trigger.kind==='column';
+  const participants=column
+    ? (trigger.layerIndices??deckRows.map((_,index)=>index)).filter(index=> {
+      const row=deckRows[index]; return row && !row.locked && !ignoresColumn(row);
+    }) : [trigger.layerIndex];
+  if (!participants.length || new Set(participants).size!==participants.length) return null;
+  const rows: NativeCutRow[]=[];
+  const incomingIds=new Set<string>();
+  for (const layerIndex of participants) {
+    const row=deckRows[layerIndex];
+    const incoming=grid[layerIndex]?.[trigger.columnIndex];
+    const outgoing=row?.activeClip;
+    if (!incoming || !outgoing || incoming.triggerStyle==='piano' || incoming.id===outgoing.id || row.locked || row.mute
+      || deckRows.some(r=>r.solo) || row.effects.length || [...get(vjClipTransitions).values()].some(value=>value.queuedTriggerId!==trigger.id)
+      || vjClipLauncher.hasHeldInput(layerIndex,deck)) return null;
+    for (const clip of [incoming,outgoing]) {
+      if (clip.type!=='video' || clip.src.startsWith('live://') || clip.audioPlayback || clip.effects?.length
+        || clip.playbackSyncBeats || clip.playbackMode==='bounce' || clip.playbackMode==='once'
+        || (clip.playbackRate??1)<=0 || !knownClipDurationSeconds(clip)
+        || !(clip.videoWidth && clip.videoHeight)) return null;
+    }
+    const geometry=(clip:VJClip)=>JSON.stringify([clip.zoom??1,clip.rotation??0,clip.opacity??1,!!clip.mirrorX,
+      clip.anchorX??0.5,clip.anchorY??0.5,clip.fit??'cover',clip.videoWidth!/clip.videoHeight!]);
+    if (geometry(incoming)!==geometry(outgoing) || incomingIds.has(incoming.id)) return null;
+    if ([...state.layerStates,...state.bankBLayerStates].some(r=>r.activeClip?.id===incoming.id)) return null;
+    if ([...state.layerStates,...state.bankBLayerStates].filter(r=>r.activeClip?.id===outgoing.id).length>1) return null;
+    incomingIds.add(incoming.id);
+    const start=clipLaunchTimeSeconds(incoming,knownClipDurationSeconds(incoming));
+    const signature=JSON.stringify([layerIndex,outgoing.id,outgoing._nativePlaybackSeekSeq,
+      incoming.id,incoming.src,incoming.playbackRate,incoming.trimStart,incoming.trimEnd,incoming.durationSeconds,
+      incoming._nativePlaybackSeekSeq,geometry(incoming),row.opacity,row.blendMode,effectiveClipTransition(row,incoming)]);
+    rows.push({layerIndex,incoming:{...incoming},outgoing:{...outgoing},layerId:`vj-layer-${layerIndex}${state.crossfaderEnabled?`-${deck}`:''}`,start,transition:effectiveClipTransition(row,incoming),signature});
+  }
+  return {trigger,rows,dualDeck:state.crossfaderEnabled,lane:column?`vj-column:${deck}`:`vj-cut:${deck}:${trigger.layerIndex}`,
+    signature:JSON.stringify([trigger.id,deck,state.crossfaderEnabled,state.activeBlockId,rows.map(row=>row.signature),state.masterOpacity,
+      launchClockFollowsLink(),launchClockFollowsLink()?null:launchClockTempo(),get(launchClock).resyncedAt])};
+}
+/** Resolve only the steady graph shape Canvas installs. Active transition
+ * helpers and foreign/mapped layers keep the whole launch on the old route. */
+export function resolveNativeQueuedCutBindings(plan: NativeCutPlan, layers: Array<{layer_id:string;source_id?:string|null}>): Map<number,string> | null {
+  const canonical = plan.dualDeck ? /^vj-layer-\d+-[AB]$/ : /^vj-layer-\d+$/;
+  const allowed = (id:string) => plan.rows.some(row=>row.fadeToken!==undefined && (id===vjClipTransitionInputId(row.layerId,'in',row.fadeToken) || id===vjClipTransitionInputId(row.layerId,'out',row.fadeToken))) || canonical.test(id) || id==='__vj-mix__'
+    || (plan.dualDeck && /^vj-xfade-\d+$/.test(id))
+    || (id.startsWith('__vj-clip:') && id.endsWith(':steady:in') && canonical.test(id.slice('__vj-clip:'.length,-':steady:in'.length)));
+  if (layers.some(layer=>!allowed(layer.layer_id))) return null;
+  const result=new Map<number,string>();
+  for (const row of plan.rows) {
+    const outer=layers.find(layer=>layer.layer_id===row.layerId);
+    if (row.fadeToken!==undefined) {
+      const outgoing=vjClipTransitionInputId(row.layerId,'out',row.fadeToken);
+      const incoming=vjClipTransitionInputId(row.layerId,'in',row.fadeToken);
+      if (outer?.source_id!==vjClipTransitionSourceId(row.layerId)
+        || layers.find(layer=>layer.layer_id===outgoing)?.source_id!==row.outgoing.id
+        || layers.find(layer=>layer.layer_id===incoming)?.source_id!==row.incoming.id) return null;
+      result.set(row.layerIndex,outgoing);continue;
+    }
+    if (outer?.source_id===row.outgoing.id) { result.set(row.layerIndex,row.layerId); continue; }
+    const inputId=vjClipTransitionInputId(row.layerId,'in','steady');
+    const input=layers.find(layer=>layer.layer_id===inputId);
+    if (outer?.source_id!==vjClipTransitionSourceId(row.layerId) || input?.source_id!==row.outgoing.id) return null;
+    result.set(row.layerIndex,inputId);
+  }
+  return result;
+}
+if (typeof window !== 'undefined' && isDesktopApp && !new URLSearchParams(window.location?.search??'').has('mode')) {
+  type PreparedCut = {row:NativeCutRow; bindingLayerId:string; uri:string; incoming:VJClip};
+  const manager=createNativeQueuedLaunches<NativeCutPlan>({
+    resources: plan=>plan.rows.flatMap(row=>[`layer:${row.layerId}`,`source:${row.incoming.id}`]),
+    release: plan=> {
+      for (const row of plan.rows) {
+        if (row.fadeToken===undefined) continue;
+        const entry=get(vjClipTransitions).get(`${plan.trigger.bank}:${row.layerIndex}`);
+        if (entry?.queuedTriggerId===plan.trigger.id) vjClipTransitions.cancel(plan.trigger.bank,row.layerIndex,row.fadeToken);
+      }
+    },
+    prepare: async (plan,isCurrent) => {
+      const sync=getActiveNativeRendererSync(); if (!sync) return null;
+      const capabilities=await getNativeRendererCapabilities();
+      if (!capabilities?.implemented_methods?.includes('schedule_launch') || !capabilities.features?.native_launch_resource_fences) return null;
+      const fade=plan.rows.some(row=>row.transition.duration>0);
+      if (fade && !capabilities.features?.native_prepared_fade_playback) return null;
+      if (fade && plan.rows.some(row=>row.transition.duration===0) && !capabilities.features?.native_mixed_column_launch) return null;
+      const snapshot=await getNativeRendererLayersSnapshot();
+      const bindings=resolveNativeQueuedCutBindings(plan,snapshot.layers);
+      if (!bindings) return null;
+      if (!isCurrent() || buildNativeQueuedCutPlan(plan.trigger,get(vjClipLauncher))?.signature!==plan.signature) return null;
+      // Wait for every preparation response before releasing ownership; a late
+      // paused-source write must not race a fallback column trigger.
+      const results=await Promise.allSettled(plan.rows.map(async row=> {
+        const incoming={...row.incoming,isPlaying:false,_nativePlaybackTimeSeconds:row.start,
+          _nativePlaybackUpdatedAtMs:performance.now(),_nativePlaybackSeekSeq:(row.incoming._nativePlaybackSeekSeq??0)+1};
+        const source={...incoming,type:'video',durationSeconds:knownClipDurationSeconds(incoming),
+          videoElement:incoming.videoElement??videoElementCache.get(incoming.id)} as MediaSource;
+        if (!isCurrent()) return null;
+        const command=await sync.prepareScheduledVideo(source);
+        return command?.type==='set_media_source_playback'?{row,bindingLayerId:bindings.get(row.layerIndex)!,uri:command.uri,incoming}:null;
+      }));
+      if (!isCurrent() || results.some(result=>result.status==='rejected' || !result.value)) return null;
+      const cuts=results.map(result=>(result as PromiseFulfilledResult<PreparedCut>).value);
+      if (fade) {
+        for (const {row,incoming} of cuts.filter(cut=>cut.row.transition.duration>0)) {
+          if (!isCurrent() || buildNativeQueuedCutPlan(plan.trigger,get(vjClipLauncher))?.signature!==plan.signature) return null;
+          const transition=vjClipTransitions.begin(plan.trigger.bank,row.layerIndex,row.outgoing,incoming,row.transition.duration,row.transition.style,undefined,plan.trigger.id);
+          if (!transition) return null;
+          row.fadeToken=transition.token;
+        }
+      }
+      const deadline=performance.now()+Math.min(1500,Math.max(0,plan.trigger.fireAt-performance.now()-50));
+      while (isCurrent() && performance.now()<deadline) {
+        const ready=await Promise.allSettled(cuts.map(cut=>getNativeSourceFrameReadiness(cut.incoming.id,cut.incoming._nativePlaybackSeekSeq)));
+        if (ready.every(result=>result.status==='fulfilled' && result.value.ready)) {
+          if (!fade) return cuts;
+          const graphReady=await Promise.all(cuts.filter(cut=>cut.row.fadeToken!==undefined).flatMap(({row,incoming})=>[
+            getNativeLayerSourceReadiness(row.layerId,vjClipTransitionSourceId(row.layerId)),
+            getNativeLayerSourceReadiness(vjClipTransitionInputId(row.layerId,'in',row.fadeToken!),incoming.id,incoming._nativePlaybackSeekSeq),
+            getNativeLayerSourceReadiness(vjClipTransitionInputId(row.layerId,'out',row.fadeToken!),row.outgoing.id,row.outgoing._nativePlaybackSeekSeq??0),
+          ]));
+          if (graphReady.every(value=>value.ready)) return cuts;
+        }
+        await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      return null;
+    },
+    submit: async (plan,prepared,revision) => {
+      const cuts=prepared as PreparedCut[];
+      if (buildNativeQueuedCutPlan(plan.trigger,get(vjClipLauncher))?.signature!==plan.signature) throw new Error('Queued clips changed');
+      const bindings=resolveNativeQueuedCutBindings(plan,(await getNativeRendererLayersSnapshot()).layers);
+      if (!bindings || cuts.some(({row,bindingLayerId})=>row.fadeToken===undefined
+        ? bindings.get(row.layerIndex)!==bindingLayerId
+        : get(vjClipTransitions).get(`${plan.trigger.bank}:${row.layerIndex}`)?.token!==row.fadeToken)) {
+        throw new Error('Queued render route changed');
+      }
+      const clock=launchClockPosition(performance.now());
+      const delay=plan.trigger.fireBeat===undefined?plan.trigger.fireAt-performance.now():(plan.trigger.fireBeat-clock.beat)*clock.beatMs;
+      if (delay<20) throw new Error('Native preparation missed the launch deadline');
+      await scheduleNativeLaunch({id:plan.trigger.id,lane:plan.lane,revision,delay_ms:delay,
+        ...(launchClockFollowsLink()?{beat:plan.trigger.fireBeat}:{}),
+        expected_sources:Object.fromEntries(cuts.map(({row,bindingLayerId})=>[row.fadeToken===undefined?bindingLayerId:vjClipTransitionInputId(row.layerId,'out',row.fadeToken),{source_id:row.outgoing.id,seek_generation:row.outgoing._nativePlaybackSeekSeq??0}])),
+        commands:cuts.flatMap(({row,bindingLayerId,incoming,uri})=>[
+          {type:'set_media_source_playback' as const,source_id:incoming.id,uri,paused:false,time_seconds:row.start,seek_generation:incoming._nativePlaybackSeekSeq},
+          ...(row.fadeToken===undefined
+            ? [{type:'bind_media_source' as const,layer_id:bindingLayerId,source_id:incoming.id,uri,source_type:'video'}]
+            : [{type:'start_prepared_transition' as const,layer_id:row.layerId,token:row.fadeToken,sources:[
+                {source_id:row.outgoing.id,seek_generation:row.outgoing._nativePlaybackSeekSeq??0},
+                {source_id:incoming.id,seek_generation:incoming._nativePlaybackSeekSeq}]}])])});
+    },
+    cancel: async (plan,revision) => (await cancelNativeLaunch(plan.lane,revision)).receipts,
+    receipts: async () => (await getNativeLaunchStatus()).receipts,
+    applied: (plan,receipt:LaunchReceipt) => {
+      const applied:Array<{incoming:VJClip;outgoing:VJClip}>=[];
+      const restoreRows:number[]=[];
+      vjClipLauncher.update(state=> {
+        const rows=[...pickLayerStates(state,plan.trigger.bank)];
+        const grid=pickGrid(state,plan.trigger.bank);
+        for (const cut of plan.rows) {
+          const current=rows[cut.layerIndex]?.activeClip;
+          if (!state.isLive || !state.isOpen || state.stoppedAll || state.crossfaderEnabled!==plan.dualDeck
+            || state.activeBlockId!==plan.trigger.blockId || current?.id!==cut.outgoing.id
+            || current?.src!==cut.outgoing.src || current?._nativePlaybackSeekSeq!==cut.outgoing._nativePlaybackSeekSeq
+            || grid[cut.layerIndex]?.[plan.trigger.columnIndex]?.id!==cut.incoming.id) {
+            restoreRows.push(cut.layerIndex); continue;
+          }
+          const duration=knownClipDurationSeconds(cut.incoming)!;
+          const lo=duration*(cut.incoming.trimStart??0), span=duration*((cut.incoming.trimEnd??1)-(cut.incoming.trimStart??0));
+          const time=lo+((cut.start-lo+(receipt.age_ms??0)/1000*(cut.incoming.playbackRate??1))%Math.max(span,0.001));
+          const incoming:VJClip={...grid[cut.layerIndex][plan.trigger.columnIndex]!,isPlaying:true,_launchGeneration:++launchGeneration,
+            _nativePlaybackTimeSeconds:time,_nativePlaybackUpdatedAtMs:performance.now(),_nativePlaybackDirection:1,
+            _nativePlaybackSeekSeq:(cut.incoming._nativePlaybackSeekSeq??0)+1};
+          applied.push({incoming,outgoing:cut.outgoing});
+          rows[cut.layerIndex]={...rows[cut.layerIndex],activeClip:incoming,activeColumn:plan.trigger.columnIndex};
+        }
+        return {...withDeck(state,plan.trigger.bank,rows),pendingTriggers:state.pendingTriggers.filter(p=>p.id!==plan.trigger.id)};
+      });
+      const startedAt=performance.now()-(receipt.age_ms??0);
+      for (const row of plan.rows) if (row.fadeToken!==undefined && applied.some(value=>value.incoming.id===row.incoming.id)) {
+        vjClipTransitions.confirmScheduled(plan.trigger.bank,row.layerIndex,row.fadeToken,startedAt);
+      }
+      for (const {incoming,outgoing} of applied) syncBrowserVideoAfterNativeTrigger(incoming,outgoing,incoming._nativePlaybackTimeSeconds??0);
+      if (restoreRows.length) requestImmediateNativeVJSync(restoreRows.map(index=>pickLayerStates(get(vjClipLauncher),plan.trigger.bank)[index]?.activeClip));
+    },
+    failed: (plan,message) => {
+      vjClipLauncher.update(state=>({...state,pendingTriggers:state.pendingTriggers.filter(p=>p.id!==plan.trigger.id)}));
+      console.warn('[Native launch]',message);
+      showToast(plan.trigger.kind==='column'?'Queued column could not launch. Trigger it again.':'Queued clip could not launch. Trigger it again.', 'error');
+    },
+  });
+  nativeOwnsQueuedTrigger=manager.owns;
+  const refresh=()=> {
+    const state=get(vjClipLauncher);
+    manager.sync(state.pendingTriggers.flatMap(trigger=> {
+      const plan=buildNativeQueuedCutPlan(trigger,state);return plan?[{id:trigger.id,signature:plan.signature,value:plan}]:[];
+    }));
+  };
+  vjClipLauncher.subscribe(refresh);
+  launchClock.subscribe(refresh); audioStore.subscribe(refresh); abletonLink.subscribe(refresh);
+  keyframeTimeline.subscribe(refresh);
+  vjClipTransitions.subscribe(refresh);
+  nativeRendererRuntime.subscribe(refresh);
+}

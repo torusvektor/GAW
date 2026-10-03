@@ -8,8 +8,14 @@
    * Done button.
    */
 
-  import { offlineRender, DEFAULT_OFFLINE_SETTINGS, type OfflineRenderSettings } from '../recording/offlineRender';
+  import { offlineRender, revealOutputPath, DEFAULT_OFFLINE_SETTINGS, type OfflineRenderSettings } from '../recording/offlineRender';
+  import { isDesktopApp, invoke } from '../bridge';
+  import { mergeRecordingCodecAvailability, type RecordingCodecOption } from '../recording/recordingSources';
+  import { getNativeRendererCapabilities } from '../api/native-renderer';
   import { project } from '../stores/layers';
+  import { showTimeline } from '../stores/showTimeline';
+  import { audioStore } from '../stores/audio';
+  import { isAudioDrivenMod, modulationStore } from '../audio/modulation';
 
   export let isOpen = false;
   export let onClose: () => void = () => {};
@@ -18,12 +24,40 @@
   // project so users land on a sensible matching resolution.
   let settings: OfflineRenderSettings = { ...DEFAULT_OFFLINE_SETTINGS };
   let seededForOpen = false;
+  let captureBackendTouched = false;
+  // The native shell has no WebGL engine — that backend reads the live
+  // compositor canvas, which does not exist there.
+  $: webglCaptureAvailable = !!offlineRender.getEngine();
+  let nativeProbeStartedForOpen = false;
+  let nativeFrameCaptureAvailable = false;
+  let nativeFrameCaptureMessage = 'Desktop only';
+  let nativeProbeGeneration = 0;
+  // Render to Video writes the opaque program output, so only the codecs
+  // without alpha are offered (H.264, ProRes 422 HQ, HAP).
+  let offlineCodecs: RecordingCodecOption[] = mergeRecordingCodecAvailability(null).filter(codec => !codec.alpha);
+  if (isDesktopApp) {
+    void invoke<{ codecs?: Array<{ id: string; available?: boolean; reason?: string }> }>('native_recording_codecs')
+      .then((result) => { offlineCodecs = mergeRecordingCodecAvailability(result?.codecs ?? null).filter(codec => !codec.alpha); })
+      .catch(() => {});
+  }
+
+  // A programmed show already knows how long it is — seed the duration
+  // from it so "render my show" is one click. Falls back to the default
+  // when the show timeline is empty.
+  $: showDuration = $showTimeline.duration;
+  $: showIsProgrammed = showDuration > 0
+    && ($showTimeline.presetClips.length > 0 || $showTimeline.audioTracks.length > 0);
+
   function seedSettingsFromProject() {
     settings = {
       ...DEFAULT_OFFLINE_SETTINGS,
       width: $project.width || 1920,
       height: $project.height || 1080,
+      ...(showIsProgrammed
+        ? { durationSeconds: Math.max(0.5, Math.round(showDuration * 100) / 100) }
+        : {}),
     };
+    captureBackendTouched = false;
   }
   $: if (isOpen && !seededForOpen) {
     seedSettingsFromProject();
@@ -31,6 +65,14 @@
   }
   $: if (!isOpen && seededForOpen) {
     seededForOpen = false;
+    nativeProbeStartedForOpen = false;
+    nativeFrameCaptureAvailable = false;
+    nativeFrameCaptureMessage = 'Desktop only';
+    nativeProbeGeneration += 1;
+  }
+  $: if (isOpen && !nativeProbeStartedForOpen) {
+    nativeProbeStartedForOpen = true;
+    refreshNativeFrameCaptureAvailability();
   }
 
   const RESOLUTION_PRESETS = [
@@ -69,7 +111,12 @@
   }
 
   function start() {
-    offlineRender.start({ ...settings });
+    offlineRender.start({
+      ...settings,
+      captureBackend: (settings.captureBackend === 'native' && nativeFrameCaptureAvailable) || !webglCaptureAvailable
+        ? 'native'
+        : 'webgl',
+    });
   }
   function cancel() {
     offlineRender.cancel();
@@ -85,6 +132,62 @@
   function closeAndReset() {
     offlineRender.reset();
     onClose();
+  }
+
+  // Where the finished file actually is. The save dialog's destination
+  // wins when the user picked one; otherwise it is still sitting in the
+  // app's generated-video folder and the user needs to see that path.
+  $: outputLocation = state.lastOutputSavedPath ?? state.lastOutputPath ?? null;
+  $: canReveal = isDesktopApp && !!outputLocation;
+  function reveal() {
+    if (outputLocation) void revealOutputPath(outputLocation);
+  }
+
+  function onOutputModeChange() {
+    captureBackendTouched = false;
+    settings = {
+      ...settings,
+      captureBackend: nativeFrameCaptureAvailable || !webglCaptureAvailable ? 'native' : 'webgl',
+    };
+  }
+
+  function selectCaptureBackend(captureBackend: 'webgl' | 'native') {
+    if (captureBackend === 'native' && !nativeFrameCaptureAvailable) return;
+    if (captureBackend === 'webgl' && !webglCaptureAvailable) return;
+    captureBackendTouched = true;
+    settings = { ...settings, captureBackend };
+  }
+
+  async function refreshNativeFrameCaptureAvailability() {
+    const generation = ++nativeProbeGeneration;
+    nativeFrameCaptureAvailable = false;
+    nativeFrameCaptureMessage = 'Checking...';
+    const hasDesktopBridge = isDesktopApp || (typeof window !== 'undefined' && !!window.__ELECTRON__);
+    if (!hasDesktopBridge) {
+      nativeFrameCaptureMessage = 'Desktop only';
+      return;
+    }
+    try {
+      const caps = await getNativeRendererCapabilities();
+      if (generation !== nativeProbeGeneration) return;
+      const available = !!caps?.features?.frame_snapshot_export
+        && !!caps?.features?.native_frame_sequence_export
+        && !!caps?.implemented_methods?.includes('export_frame_snapshot');
+      nativeFrameCaptureAvailable = available;
+      nativeFrameCaptureMessage = available ? 'Ready' : 'Not available';
+      if (!captureBackendTouched) {
+        settings = { ...settings, captureBackend: available || !webglCaptureAvailable ? 'native' : 'webgl' };
+      } else if (!available && settings.captureBackend === 'native' && webglCaptureAvailable) {
+        settings = { ...settings, captureBackend: 'webgl' };
+      }
+    } catch (err) {
+      if (generation !== nativeProbeGeneration) return;
+      nativeFrameCaptureAvailable = false;
+      nativeFrameCaptureMessage = err instanceof Error && err.message ? err.message : 'Not available';
+      if (settings.captureBackend === 'native' && webglCaptureAvailable) {
+        settings = { ...settings, captureBackend: 'webgl' };
+      }
+    }
   }
 
   // Re-render the elapsed/remaining estimate periodically while
@@ -104,6 +207,39 @@
   let _tickPulse = 0;
   // Reference _tickPulse so Svelte re-runs the elapsed derivations.
   $: void _tickPulse;
+
+  // ─── Live audio input warning ──────────────────────────────────────
+  //
+  // The render loop pins every clock it owns to the export's virtual
+  // timeline — including the visual-audio follower, so envelopes and LFOs
+  // always advance by exactly 1/fps per frame. What it CANNOT pin is the
+  // content of a live stream: a microphone or a system-audio capture only
+  // exists in the present, so frame N of the export sees whatever was
+  // playing when frame N happened to be captured, not what was playing
+  // N/fps seconds in. A file source is decoded and analysed at virtual
+  // time, so it comes out frame-accurate.
+  //
+  // Non-blocking on purpose — plenty of renders with a mic open aren't
+  // actually driving anything off it, and a user who wants the take
+  // should get the take.
+  $: liveAudioInput = $audioStore.isActive
+    && ($audioStore.inputType === 'microphone' || $audioStore.inputType === 'system');
+  $: liveAudioInputLabel = $audioStore.inputType === 'system' ? 'System audio' : 'Microphone';
+  // Audio-reactive content is either an explicit modulation assignment
+  // fed by the analyser, or a visible layer whose renderer samples the
+  // audio snapshot every frame (lines / light painting / splat / 3D model
+  // / GPU instruments / pixel FX all do, unconditionally).
+  $: hasAudioModulation = [...$modulationStore.values()].some(isAudioDrivenMod);
+  $: hasAudioReactiveLayer = ($project.layers ?? []).some(layer => layer.visible && (
+    !!layer.linesContent
+    || !!layer.lightPaintingContent
+    || !!layer.advLightPaintingContent
+    || !!layer.splatContent
+    || !!layer.model3dContent
+    || !!layer.gpuLayerContent
+    || !!layer.pixelFXContent
+  ));
+  $: showLiveAudioWarning = liveAudioInput && (hasAudioModulation || hasAudioReactiveLayer);
 </script>
 
 <!-- svelte:window must live at component root, not inside {#if}.
@@ -111,8 +247,8 @@
 <svelte:window onkeydown={onKey} />
 
 {#if isOpen}
-<div class="modal-backdrop" onclick={closeAndReset} role="presentation"></div>
-<div class="modal-shell" role="dialog" aria-label="Render to video">
+<div data-help-page="frame-locked-export" class="modal-backdrop" onclick={closeAndReset} role="presentation"></div>
+<div data-help-page="frame-locked-export" class="modal-shell" role="dialog" aria-label="Render to video">
   <header class="modal-head">
     <h2>Render to Video</h2>
     <button class="close-btn" onclick={closeAndReset} disabled={isRunning} title={isRunning ? 'Cancel before closing' : 'Close'}>×</button>
@@ -125,10 +261,14 @@
       <h3>Frames exported</h3>
       <p class="success-meta">{state.lastOutputName ?? 'render'}_%06d.jpg · {state.totalFrames} frames · {fmtTime(elapsedSec)}</p>
       {#if state.lastOutputPath}
-        <p class="success-hint">Saved to {state.lastOutputPath}</p>
+        <p class="success-hint">Saved to</p>
+        <p class="output-path" title={state.lastOutputPath}>{state.lastOutputPath}</p>
       {/if}
       <p class="success-hint">A manifest with an FFmpeg compile command was written beside the frames.</p>
       <div class="actions">
+        {#if canReveal}
+          <button class="btn-secondary" onclick={reveal}>Show in Finder</button>
+        {/if}
         <button class="btn-primary" onclick={closeAndReset}>Done</button>
       </div>
     </div>
@@ -140,8 +280,19 @@
       <h3>Render complete</h3>
       <p class="success-meta">{state.lastOutputName ?? 'render'}.mp4 · {state.totalFrames} frames · {fmtTime(elapsedSec)}</p>
       <video class="preview" src={state.lastOutputUrl} controls muted loop></video>
-      <p class="success-hint">Added to media library + downloaded.</p>
+      {#if state.lastOutputSavedPath}
+        <p class="success-hint">Saved to</p>
+        <p class="output-path" title={state.lastOutputSavedPath}>{state.lastOutputSavedPath}</p>
+      {:else if state.lastOutputPath}
+        <p class="success-hint">Added to the media library. Kept at</p>
+        <p class="output-path" title={state.lastOutputPath}>{state.lastOutputPath}</p>
+      {:else}
+        <p class="success-hint">Added to media library + downloaded.</p>
+      {/if}
       <div class="actions">
+        {#if canReveal}
+          <button class="btn-secondary" onclick={reveal}>Show in Finder</button>
+        {/if}
         <button class="btn-primary" onclick={closeAndReset}>Done</button>
       </div>
     </div>
@@ -159,7 +310,7 @@
         {:else if state.status === 'encoding'}
           Encoding to MP4…
         {:else if state.status === 'saving'}
-          {isFrameOutput ? 'Finalizing frame sequence…' : 'Saving to library…'}
+          {isFrameOutput ? 'Finalizing frame sequence…' : 'Saving — choose where to keep your video…'}
         {/if}
       </div>
       <div class="progress-bar">
@@ -205,6 +356,14 @@
         <div class="field">
           <label>Duration (seconds)</label>
           <input type="number" min="0.5" max="3600" step="0.5" bind:value={settings.durationSeconds} />
+          {#if showIsProgrammed}
+            <button
+              class="show-length-btn"
+              type="button"
+              onclick={() => settings.durationSeconds = Math.max(0.5, Math.round(showDuration * 100) / 100)}
+              title="Match the show timeline's total programmed length"
+            >Show length: {showDuration.toFixed(1)}s</button>
+          {/if}
         </div>
         <div class="field">
           <label>Frame rate</label>
@@ -246,11 +405,50 @@
 
       <div class="field">
         <label>Output</label>
-        <select bind:value={settings.outputMode}>
+        <select bind:value={settings.outputMode} onchange={onOutputModeChange}>
           <option value="mp4">MP4 video</option>
           <option value="frames">JPEG frame sequence</option>
         </select>
       </div>
+
+      <div class="field">
+        <label>Renderer</label>
+        <div class="engine-grid">
+          <button
+            type="button"
+            class="engine-btn"
+            class:active={settings.captureBackend !== 'native'}
+            disabled={!webglCaptureAvailable}
+            onclick={() => selectCaptureBackend('webgl')}
+            title={webglCaptureAvailable ? 'Live WebGL compositor' : 'Not available — this build renders natively'}
+          >
+            <span class="engine-title">WebGL</span>
+            <span class="engine-meta">{webglCaptureAvailable ? 'Current compositor' : 'Not in this build'}</span>
+          </button>
+          <button
+            type="button"
+            class="engine-btn"
+            class:active={settings.captureBackend === 'native'}
+            disabled={!nativeFrameCaptureAvailable}
+            onclick={() => selectCaptureBackend('native')}
+            title={nativeFrameCaptureAvailable ? 'Native Renderer' : nativeFrameCaptureMessage}
+          >
+            <span class="engine-title">Native Renderer</span>
+            <span class="engine-meta">{nativeFrameCaptureMessage}</span>
+          </button>
+        </div>
+      </div>
+
+      {#if isDesktopApp && !isFrameOutput}
+        <div class="field">
+          <label>Video codec</label>
+          <select value={settings.codec ?? 'h264'} onchange={(e) => { settings = { ...settings, codec: (e.currentTarget as HTMLSelectElement).value as OfflineRenderSettings['codec'] }; }}>
+            {#each offlineCodecs as codec}
+              <option value={codec.id} disabled={!codec.available}>{codec.label}{codec.available ? '' : ' (unavailable)'}</option>
+            {/each}
+          </select>
+        </div>
+      {/if}
 
       <div class="field">
         <label>{isFrameOutput ? 'Compile quality preset' : 'Quality'}</label>
@@ -264,12 +462,26 @@
       <div class="summary">
         {#if isFrameOutput}
           Will write <strong>{Math.round(settings.durationSeconds * settings.fps)}</strong> JPEG frames at
-          <strong>{settings.width}×{settings.height}</strong> to a folder.
+          <strong>{settings.width}×{settings.height}</strong> with
+          <strong>{settings.captureBackend === 'native' ? 'Native Renderer' : 'WebGL'}</strong>.
         {:else}
           Will produce <strong>{Math.round(settings.durationSeconds * settings.fps)}</strong> frames at
-          <strong>{settings.width}×{settings.height}</strong>.
+          <strong>{settings.width}×{settings.height}</strong> with
+          <strong>{settings.captureBackend === 'native' ? 'Native Renderer' : 'WebGL'}</strong>.
         {/if}
       </div>
+
+      {#if showLiveAudioWarning}
+        <div class="warn-note" role="status">
+          <span class="warn-icon">!</span>
+          <span>
+            <strong>{liveAudioInputLabel} input can't be time-locked to an offline render.</strong>
+            Reactive timing will follow real elapsed time, so the audio in the exported clip
+            won't line up with the visuals if the render runs slower than real time.
+            Use a file audio source for frame-accurate audio reactivity.
+          </span>
+        </div>
+      {/if}
 
       <div class="actions">
         <button class="btn-secondary" onclick={closeAndReset}>Cancel</button>
@@ -283,6 +495,22 @@
 {/if}
 
 <style>
+  .show-length-btn {
+    margin-top: 4px;
+    align-self: flex-start;
+    background: color-mix(in srgb, var(--ga-coral, #ff6f5e) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ga-coral, #ff6f5e) 32%, transparent);
+    color: color-mix(in srgb, var(--ga-coral, #ff6f5e) 80%, #ffffff);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: inherit;
+    letter-spacing: 0.3px;
+  }
+  .show-length-btn:hover { background: color-mix(in srgb, var(--ga-coral, #ff6f5e) 22%, transparent); color: #fff; }
+
   .modal-backdrop {
     position: fixed; inset: 0;
     background: rgba(0, 0, 0, 0.6);
@@ -400,8 +628,56 @@
     color: #4cd1ff;
   }
   .preset-label { font-size: 12px; font-weight: 500; }
-  .preset-dims { font-size: 11px; font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace); color: #666; }
+  .preset-dims { font-size: 11px; font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace); color: #666; }
   .preset-btn.active .preset-dims { color: #4cd1ff; }
+
+  .engine-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .engine-btn {
+    min-height: 54px;
+    padding: 9px 10px;
+    background: var(--bg-tertiary, #14141a);
+    border: 1px solid #2a2a30;
+    border-radius: 5px;
+    color: var(--text-secondary, #aaa);
+    cursor: pointer;
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+  }
+  .engine-btn:hover:not(:disabled) {
+    background: #1c1c22;
+    border-color: #4cd1ff;
+    color: #fff;
+  }
+  .engine-btn.active {
+    background: rgba(76, 209, 255, 0.12);
+    border-color: #4cd1ff;
+    color: #4cd1ff;
+  }
+  .engine-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.52;
+  }
+  .engine-title {
+    font-size: 12px;
+    font-weight: 650;
+  }
+  .engine-meta {
+    font-size: 11px;
+    color: #777;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+  .engine-btn.active .engine-meta { color: rgba(76, 209, 255, 0.82); }
 
   .summary {
     background: rgba(76, 209, 255, 0.05);
@@ -414,6 +690,37 @@
     margin-bottom: 14px;
   }
   .summary strong { color: #4cd1ff; }
+
+  .warn-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    background: rgba(255, 176, 32, 0.06);
+    border-left: 2px solid rgba(255, 176, 32, 0.55);
+    padding: 8px 12px;
+    border-radius: 0 4px 4px 0;
+    font-size: 12px;
+    color: var(--text-secondary, #aaa);
+    line-height: 1.5;
+    margin-bottom: 14px;
+  }
+  .warn-note strong {
+    color: #ffb020;
+    font-weight: 600;
+  }
+  .warn-icon {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    margin-top: 1px;
+    border-radius: 50%;
+    background: rgba(255, 176, 32, 0.18);
+    color: #ffb020;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+  }
 
   .actions {
     display: flex;
@@ -473,7 +780,7 @@
     justify-content: space-between;
     margin-top: 6px;
     font-size: 12px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     color: var(--text-muted, #888);
   }
   .success { text-align: center; }
@@ -488,7 +795,7 @@
     margin: 6px auto 12px;
   }
   .success h3 { margin: 0 0 4px; color: var(--text-primary, #ddd); font-size: 17px; }
-  .success-meta { color: var(--text-muted, #888); font-size: 12px; font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace); margin: 0 0 12px; }
+  .success-meta { color: var(--text-muted, #888); font-size: 12px; font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace); margin: 0 0 12px; }
   .preview {
     width: 100%;
     max-height: 280px;
@@ -497,6 +804,17 @@
     margin-bottom: 8px;
   }
   .success-hint { color: #4ade80; font-size: 12px; margin: 8px 0 0; }
+  /* The full path matters more than tidiness here — a user who dismissed
+     the save dialog has no other way to find the file. Wrap, don't clip. */
+  .output-path {
+    margin: 4px 0 0;
+    font-size: 11px;
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
+    color: var(--text-muted, #888);
+    word-break: break-all;
+    line-height: 1.4;
+    user-select: text;
+  }
 
   .error { text-align: center; }
   .error-icon {
@@ -511,5 +829,5 @@
     font-weight: 700;
   }
   .error h3 { margin: 0 0 8px; color: var(--text-primary, #ddd); font-size: 17px; }
-  .error-msg { color: #ff8888; font-size: 13px; font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace); word-break: break-word; }
+  .error-msg { color: #ff8888; font-size: 13px; font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace); word-break: break-word; }
 </style>

@@ -27,10 +27,18 @@
     setStage3DMultiSelection,
   } from '../../stage3d/store';
   import { project } from '../../stores/layers';
+  import { migrateStageLayerCorners } from '../../utils/stageTextureOrientation';
   import { ELEMENT_TYPES, makeUserElement } from '../../stage3d/elementTypes';
+  import { buildNativeStage3DScene } from '../../stage3d/nativeSceneBridge';
   import { buildVenue, paPresetElements, type PAPreset } from '../../stage3d/venues';
-  import type { Stage3DVenue, UserStageElement } from '../../stage3d/types';
+  import { DEFAULT_ATMOSPHERE, DEFAULT_LIGHTING, type Stage3DScene, type Stage3DVenue, type UserStageElement } from '../../stage3d/types';
+  import type { Layer } from '../../types';
   import { startRecording as startCanvasRecording, formatRecordingDuration, type RecorderHandle } from '../../recording/recorder';
+  import {
+    startNativeLiveFrameRecording,
+    startNativeRendererLiveFrameRecording,
+  } from '../../recording/nativeLiveFrameRecorder';
+  import { getNativeRendererCapabilities, setNativeRendererStage3DScene } from '../../api/native-renderer';
   import { invoke, isDesktopApp } from '../../bridge';
   import StageNodeProperties from './StageNodeProperties.svelte';
   import StageElementProperties from './StageElementProperties.svelte';
@@ -62,13 +70,34 @@
     '4k':   { w: 3840, h: 2160, label: '4K' },
   } as const;
   let recRes: keyof typeof REC_RES = '1080';
+  let nativeScenePublishTimer: ReturnType<typeof setTimeout> | null = null;
+  let nativeScenePublishWarnings = 0;
+  let screenLayers: Layer[] = [];
+
+  function queueNativeStageScene(scene: Stage3DScene, layers = screenLayers) {
+    if (!isDesktopApp) return;
+    if (nativeScenePublishTimer) clearTimeout(nativeScenePublishTimer);
+    nativeScenePublishTimer = setTimeout(() => {
+      nativeScenePublishTimer = null;
+      const nativeScene = buildNativeStage3DScene(scene, layers);
+      void setNativeRendererStage3DScene(nativeScene).catch((err) => {
+        if (nativeScenePublishWarnings < 3) {
+          console.warn('[Stage3D] native scene bridge unavailable:', err);
+          nativeScenePublishWarnings++;
+        }
+      });
+    }, 220);
+  }
 
   // Refresh undo/redo button state whenever historyVersion bumps.
   let canUndo = false;
   let canRedo = false;
   $: { void $historyVersion; const c = stage3dScene.getHistoryCounts(); canUndo = c.past > 0; canRedo = c.future > 0; }
-
   $: screenLayers = $project.layers.filter(l => l.type === 'screen' && l.visible !== false);
+  // Live native-scene publishing removed: the 3D window renders via WebGL.
+  // Publishing the scene into the shared core overlays the venue onto the
+  // 2D output for as long as the window is open. The native recording flow
+  // sets the scene explicitly per frame and clears it afterwards.
   $: userElements = $stage3dScene.userElements ?? [];
   $: venue = ($stage3dScene.venue ?? 'festival') as Stage3DVenue;
   // Venue scenery pieces (deck, trusses, movers, PA…) the renderer
@@ -223,6 +252,7 @@
   }
 
   let fileInput: HTMLInputElement;
+  let modelImportInput: HTMLInputElement;
   function loadDesign() { fileInput?.click(); }
   function onFileChosen(e: Event) {
     const file = (e.target as HTMLInputElement).files?.[0];
@@ -252,7 +282,7 @@
             // already has (videos, shaders, lights, etc.).
             layers: [
               ...p.layers.filter(l => l.type !== 'screen'),
-              ...data.project.screenLayers,
+              ...data.project.screenLayers.map(migrateStageLayerCorners),
             ],
             surfaces: Array.isArray(data.project.surfaces) && data.project.surfaces.length
               ? data.project.surfaces
@@ -268,20 +298,154 @@
     }
   }
 
+  function blankSlate() {
+    const current = get(stage3dScene);
+    const ok = !hasStageAdditions(current) || confirm('Start with a blank room? This clears placed elements and 3D venue edits.');
+    if (!ok) return;
+    stage3dScene.loadScene({
+      ...current,
+      venue: 'empty',
+      basePreset: 'empty',
+      userElements: [],
+      sceneryOverrides: {},
+      screenOverrides: {},
+      lighting: { ...DEFAULT_LIGHTING },
+      atmosphere: { ...DEFAULT_ATMOSPHERE },
+    });
+    setStage3DSelection(null);
+    toast('Blank room ready');
+  }
+
+  function triggerModelImport() {
+    modelImportInput?.click();
+  }
+
+  function onModelImportChosen(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+    if (!['glb', 'gltf', 'obj'].includes(ext)) {
+      toast('Use GLB, GLTF, or OBJ');
+      input.value = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const el = makeUserElement('importedmodel', {
+        modelData: String(reader.result ?? ''),
+        modelName: file.name,
+        modelFormat: ext,
+        modelScale: 8,
+        vjSource: 'master',
+      });
+      el.position = [0, 0, 0];
+      stage3dScene.addUserElement(el);
+      setStage3DSelection(`element:${el.id}`);
+      toast(`Imported ${file.name}`);
+    };
+    reader.onerror = () => toast('Import failed');
+    reader.readAsDataURL(file);
+    input.value = '';
+  }
+
   function toast(msg: string) {
     toastMessage = msg;
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => (toastMessage = ''), 1600);
   }
 
-  function startStageRecording() {
+  async function startStageRecording() {
     if (recorderHandle) return;
     const controls = $stage3DRendererControls;
     const res = REC_RES[recRes];
+    if (!controls) { toast('Stage renderer not ready'); return; }
+
+    if (isDesktopApp) {
+      recordingDuration = 0;
+      try {
+        const caps = await getNativeRendererCapabilities();
+        const nativeStageReady = !!(
+          caps?.core_capabilities_confirmed &&
+          caps?.features?.native_stage3d &&
+          caps?.features?.native_stage3d_recording_parity &&
+          caps?.features?.native_recording &&
+          caps?.features?.frame_snapshot_export &&
+          caps?.implemented_methods?.includes('set_stage3d_scene') &&
+          caps?.implemented_methods?.includes('export_frame_snapshot')
+        );
+        if (nativeStageReady) {
+          recorderHandle = await startNativeRendererLiveFrameRecording({
+            width: res.w,
+            height: res.h,
+            fps: 30,
+            quality: 'high',
+            namePrefix: 'Stage Recording',
+            prepareFrame: async () => {
+              const nativeScene = buildNativeStage3DScene(get(stage3dScene), get(project).layers, {
+                camera: controls.getCameraState(),
+              });
+              await setNativeRendererStage3DScene(nativeScene);
+            },
+            restore: async () => {
+              await setNativeRendererStage3DScene(null);
+            },
+            onDurationUpdate: (s) => { recordingDuration = s; },
+            onComplete: () => {
+              isRecording = false;
+              recorderHandle = null;
+              toast('Stage recording saved');
+            },
+            onError: (err) => {
+              isRecording = false;
+              recorderHandle = null;
+              toast(err.message || 'Recording failed');
+            },
+          });
+          if (recorderHandle) {
+            isRecording = true;
+            toast(`Stage recording started · ${res.label} native renderer`);
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('[Stage3D] Native renderer recording unavailable, falling back to live canvas capture:', err);
+      }
+
+      try {
+        recorderHandle = await startNativeLiveFrameRecording({
+          captureFrame: (width, height) => controls.captureFrameAt(width, height),
+          width: res.w,
+          height: res.h,
+          fps: 30,
+          quality: 'high',
+          namePrefix: 'Stage Recording',
+          onDurationUpdate: (s) => { recordingDuration = s; },
+          onComplete: () => {
+            isRecording = false;
+            recorderHandle = null;
+            toast('Stage recording saved');
+          },
+          onError: (err) => {
+            isRecording = false;
+            recorderHandle = null;
+            toast(err.message || 'Recording failed');
+          },
+        });
+        if (recorderHandle) {
+          isRecording = true;
+          toast(`Stage recording started · ${res.label} native`);
+          return;
+        }
+      } catch (err) {
+        console.warn('[Stage3D] Native recording unavailable, falling back to MediaRecorder:', err);
+      }
+    }
+
     // Render into a fixed 16:9 offscreen canvas (decoupled from the
     // project's output resolution) and record THAT — so a wide comp
     // still produces a clean 1080p / 4K file.
-    const recordCanvas = controls?.beginRecording(res.w, res.h) ?? null;
+    const recordCanvas = controls.beginRecording(res.w, res.h) ?? null;
     if (!recordCanvas) { toast('Stage renderer not ready'); return; }
     recordingDuration = 0;
     recorderHandle = startCanvasRecording({
@@ -318,7 +482,7 @@
 
   function toggleStageRecording() {
     if (isRecording) stopStageRecording();
-    else startStageRecording();
+    else void startStageRecording();
   }
 
   // Library grouped by category.
@@ -327,7 +491,7 @@
     for (const [type, def] of Object.entries(ELEMENT_TYPES)) {
       (groups[def.group] = groups[def.group] || []).push([type, def]);
     }
-    return ['Stage', 'Lighting', 'Audio'].map(g => ({ name: g, items: groups[g] ?? [] }));
+    return ['Stage', 'Visual', 'FX', 'Lighting', 'Audio'].map(g => ({ name: g, items: groups[g] ?? [] }));
   })();
 
   function undo() { stage3dScene.undo(); }
@@ -491,12 +655,21 @@
       clearTimeout(toastTimer);
       toastTimer = null;
     }
+    if (nativeScenePublishTimer) {
+      clearTimeout(nativeScenePublishTimer);
+      nativeScenePublishTimer = null;
+    }
+    // Clear the core's 3D stage scene on close so it can never bleed
+    // into the 2D editor or mapping output.
+    if (isDesktopApp) {
+      void setNativeRendererStage3DScene(null).catch(() => { /* core without stage3d */ });
+    }
     recorderHandle?.stop();
     recorderHandle = null;
   });
 </script>
 
-<div class="stage3d-root" class:external={!renderViewport}>
+<div data-help-page="stage-simulator" class="stage3d-root" class:external={!renderViewport}>
   {#if renderViewport}
     <div class="viewport-fallback">
       <p>Open Stage 3D in the pop-out window for the live view.</p>
@@ -542,6 +715,7 @@
       value={venue}
       onchange={(e) => setVenue((e.target as HTMLSelectElement).value as Stage3DVenue)}
     >
+      <option value="empty">Blank Room</option>
       <option value="festival">Festival Mainstage</option>
       <option value="arena">Arena</option>
       <option value="club">Club</option>
@@ -592,6 +766,7 @@
     <button class="tbtn" onclick={loadDesign}>↑ Load</button>
     <button class="tbtn danger" onclick={clearElements}>✕ Clear</button>
     <input bind:this={fileInput} type="file" accept="application/json" style="display:none" onchange={onFileChosen} />
+    <input bind:this={modelImportInput} type="file" accept=".glb,.gltf,.obj" style="display:none" onchange={onModelImportChosen} />
   </header>
 
   <!-- Camera HUD — its own strip under the toolbar so it
@@ -625,6 +800,10 @@
   {#if !panelsHidden}
   <aside class="lib">
     <h3>Element Library</h3>
+    <div class="lib-actions">
+      <button class="mini-action" onclick={blankSlate}>Blank Room</button>
+      <button class="mini-action" onclick={triggerModelImport}>Import Model</button>
+    </div>
     {#each libraryGroups as group}
       <div class="grp">
         <div class="ghd">{group.name}</div>
@@ -830,7 +1009,7 @@
     z-index: 1000;
     overflow: hidden;
     color: #e9edf4;
-    font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   }
   .stage3d-root.external { background: transparent; pointer-events: none; }
   .stage3d-root.external :global(button),
@@ -982,7 +1161,7 @@
     background: rgba(255, 68, 91, 0.18);
     border-color: rgba(255, 68, 91, 0.72);
     color: #ff8d9b;
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'Geist Mono', monospace;
     font-variant-numeric: tabular-nums;
   }
   .rec-btn.recording:hover {
@@ -1019,7 +1198,7 @@
   }
   .spacer { flex: 1 1 0; min-width: 0; }
   .dim-label {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'Geist Mono', monospace;
     font-size: 11px;
     color: #8a93a3;
     letter-spacing: 0.1em;
@@ -1079,6 +1258,27 @@
     font-size: 11px; letter-spacing: 0.22em;
     color: #8a93a3; text-transform: uppercase;
     margin: 0 0 9px;
+  }
+  .lib-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-bottom: 14px;
+  }
+  .mini-action {
+    font: inherit;
+    font-size: 11.5px;
+    color: #e9edf4;
+    background: rgba(74, 242, 255, 0.07);
+    border: 1px solid rgba(74, 242, 255, 0.22);
+    border-radius: 7px;
+    padding: 7px 6px;
+    cursor: pointer;
+  }
+  .mini-action:hover {
+    color: #04161a;
+    background: #4af2ff;
+    border-color: #4af2ff;
   }
   .grp { margin-bottom: 16px; }
   .ghd {
@@ -1148,7 +1348,7 @@
   .scenery-inspect { display: flex; flex-direction: column; gap: 8px; }
   .scenery-title { font-size: 16px; font-weight: 600; color: #e9edf4; }
   .scenery-sub {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'Geist Mono', monospace;
     font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
     color: #4af2ff;
   }
@@ -1262,7 +1462,7 @@
   }
   .hud b { color: #e9edf4; font-weight: 600; }
   .kbd {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'Geist Mono', monospace;
     background: rgba(255, 255, 255, 0.07);
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 5px;

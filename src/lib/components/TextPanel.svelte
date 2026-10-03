@@ -66,7 +66,7 @@
 </script>
 
 {#if layer && tc}
-  <div class="text-panel">
+  <div data-help-page="layers" class="text-panel">
     <h3>Text Layer</h3>
 
     <!-- Text Input -->
@@ -531,7 +531,7 @@
     text-align: right;
     font-size: 10px;
     color: var(--text-muted, #888);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
 
   .button-group {

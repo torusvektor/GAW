@@ -29,6 +29,7 @@
 import { writable, get, derived } from 'svelte/store';
 import { midiRouter } from '../midi/midiRouter';
 import { generateUUID } from '../utils/uuid';
+import { synthVisionStore } from '../stores/synthVision';
 
 export type KeyActionMode = 'trigger' | 'toggle' | 'momentary' | 'nudge';
 
@@ -96,9 +97,10 @@ const MODIFIER_CODES = new Set([
  *  'trigger' instead of 'toggle'. Mirrors the note-trigger paths the
  *  MIDI router recognises. */
 function looksLikeTrigger(path: string): boolean {
-  return /:(column|clip|block|stage|preset|snapshot)\b/.test(path)
+  return /:(cue|trigger|column|clip|block|stage|preset|snapshot)\b/.test(path)
     || /:(stopall|spaceFx)$/.test(path)
-    || path.endsWith(':trigger');
+    || path.endsWith(':trigger')
+    || path === 'vj:tempo:resync';
 }
 
 /** Render a binding (or captured event) as a human-readable combo,
@@ -141,6 +143,11 @@ function isEditableTarget(): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
 }
 
+function isNativeVideoFrameKey(e: KeyboardEvent): boolean {
+  return (e.code === 'ArrowLeft' || e.code === 'ArrowRight')
+    && document.activeElement?.hasAttribute('data-native-video-timeline') === true;
+}
+
 function createKeyboardStore() {
   const { subscribe, update, set } = writable<KeyboardState>({ ...INITIAL_STATE });
 
@@ -150,9 +157,15 @@ function createKeyboardStore() {
   const nudgeAccum = new Map<string, number>();
 
   let listening = false;
+  const heldClips = new Map<string, KeyBinding>();
+  const isClipTrigger = (path: string) => (/^(vj|vj-b):\d+:trigger:\d+$/.test(path) || /^vj:tempo:nudge-(up|down)$/.test(path));
+  function releaseHeldClips() {
+    for (const b of heldClips.values()) dispatch(b, 0);
+    heldClips.clear();
+  }
 
   function dispatch(b: KeyBinding, value: number) {
-    midiRouter.dispatchPath(b.path, value, b.discreteValues ? { discreteValues: b.discreteValues } : {});
+    midiRouter.dispatchPath(b.path, value, isClipTrigger(b.path) ? { inputId: `keyboard:${b.id}` } : b.discreteValues ? { discreteValues: b.discreteValues } : {});
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -196,7 +209,13 @@ function createKeyboardStore() {
       return;
     }
 
-    if (isEditableTarget()) return;
+    // The visible Performer surface owns its displayed keyboard. Keep
+    // learn mode above this guard so users can still remap a key there.
+    if (get(synthVisionStore).keyboardActive) return;
+
+    // The focused video timeline owns frame stepping. Learn mode still takes
+    // priority above, and mappings remain active for other controls and keys.
+    if (isEditableTarget() || isNativeVideoFrameKey(e)) return;
 
     let consumed = false;
     for (const b of state.bindings) {
@@ -206,6 +225,10 @@ function createKeyboardStore() {
       if (e.repeat && b.mode !== 'nudge') continue;
       consumed = true;
 
+      if (isClipTrigger(b.path)) {
+        if (!heldClips.has(b.id)) { heldClips.set(b.id, b); dispatch(b, 1); }
+        continue;
+      }
       switch (b.mode) {
         case 'trigger':
           dispatch(b, b.value);
@@ -238,11 +261,15 @@ function createKeyboardStore() {
   }
 
   function onKeyUp(e: KeyboardEvent) {
+    for (const [id, b] of heldClips) if (b.code === e.code) {
+      dispatch(b, 0); heldClips.delete(id); e.preventDefault();
+    }
     if (MODIFIER_CODES.has(e.code)) return;
-    if (isEditableTarget()) return;
+    if (get(synthVisionStore).keyboardActive) return;
+    if (isEditableTarget() || isNativeVideoFrameKey(e)) return;
     const state = get({ subscribe });
     for (const b of state.bindings) {
-      if (b.mode !== 'momentary' || !matches(b, e)) continue;
+      if (isClipTrigger(b.path) || b.mode !== 'momentary' || !matches(b, e)) continue;
       dispatch(b, b.min);
       e.preventDefault();
     }
@@ -254,13 +281,16 @@ function createKeyboardStore() {
     // and can swallow matched bindings.
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('blur', releaseHeldClips);
     listening = true;
   }
 
   function disarm() {
+    releaseHeldClips();
     if (!listening || typeof window === 'undefined') return;
     window.removeEventListener('keydown', onKeyDown, true);
     window.removeEventListener('keyup', onKeyUp, true);
+    window.removeEventListener('blur', releaseHeldClips);
     listening = false;
   }
 

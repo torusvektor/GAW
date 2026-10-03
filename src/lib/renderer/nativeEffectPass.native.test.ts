@@ -1,0 +1,3688 @@
+import { buildNativeCubeLutPrecompileCommand } from './nativeCubeLut';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import {
+  NATIVE_EFFECT_PASS_MANIFEST,
+  NATIVE_EFFECT_PASS_SHADER_ID,
+  buildNativeEffectPassChainGraph,
+  buildNativeEffectPassGraph,
+  buildNativeEffectPassPrecompileCommands,
+  getNativeEffectPassShaderSource,
+  nativeEffectPassManifestEntry,
+  packNativeEffectPassUniforms,
+} from './nativeEffectPass';
+import { buildPlanetNativePrecompileCommands } from './shaders/webgpuPlanet';
+
+const nativeCoreBin = join(
+  process.cwd(),
+  'native-renderer',
+  'target',
+  'release',
+  process.platform === 'win32' ? 'ghost-render-core.exe' : 'ghost-render-core',
+);
+
+const FULLSCREEN_CORNERS = {
+  topLeft: { x: 0, y: 1 },
+  topRight: { x: 1, y: 1 },
+  bottomRight: { x: 1, y: 0 },
+  bottomLeft: { x: 0, y: 0 },
+};
+
+type NativeRpc = {
+  send(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<any>;
+  close(): Promise<string>;
+};
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createNativeRpc(): NativeRpc {
+  const child = spawn(nativeCoreBin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    throw new Error('native render-core stdio was not initialized');
+  }
+
+  let nextId = 1;
+  let stdout = '';
+  let stderr = '';
+  const pending = new Map<number, {
+    method: string;
+    timer: ReturnType<typeof setTimeout>;
+    resolve(value: unknown): void;
+    reject(error: Error): void;
+  }>();
+
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    stdout += chunk;
+    let index = stdout.indexOf('\n');
+    while (index >= 0) {
+      const line = stdout.slice(0, index).trim();
+      stdout = stdout.slice(index + 1);
+      if (line) {
+        const message = JSON.parse(line) as {
+          id?: number;
+          ok?: boolean;
+          result?: unknown;
+          error?: string;
+        };
+        const wait = typeof message.id === 'number' ? pending.get(message.id) : null;
+        if (wait) {
+          clearTimeout(wait.timer);
+          pending.delete(message.id as number);
+          if (message.ok) wait.resolve(message.result);
+          else wait.reject(new Error(message.error || `${wait.method} failed`));
+        }
+      }
+      index = stdout.indexOf('\n');
+    }
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const send: NativeRpc['send'] = (method, params = {}, timeoutMs = 8000) =>
+    new Promise((resolve, reject) => {
+      const id = nextId++;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`native render-core timed out handling ${method}: ${stderr.trim()}`));
+      }, timeoutMs);
+      pending.set(id, { method, timer, resolve, reject });
+      child.stdin?.write(`${JSON.stringify({ id, method, params })}\n`);
+    });
+
+  return {
+    send,
+    async close() {
+      try {
+        await send('shutdown', {}, 1000);
+      } catch {
+        // The process may already be gone after a failed assertion.
+      }
+      child.kill();
+      return stderr.trim();
+    },
+  };
+}
+
+function makeSourceBytes(width: number, height: number): Uint8Array {
+  const bytes = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4;
+      bytes[offset] = Math.round(32 + (x / Math.max(1, width - 1)) * 160);
+      bytes[offset + 1] = Math.round(16 + (y / Math.max(1, height - 1)) * 180);
+      bytes[offset + 2] = Math.round(48 + (((x + y) % 9) / 8) * 128);
+      bytes[offset + 3] = 255;
+    }
+  }
+  return bytes;
+}
+
+function assertVisibleSnapshot(label: string, snapshot: Record<string, unknown>, minLuma = 0.02) {
+  expect(snapshot.dark_frame, label).toBe(false);
+  expect(Number(snapshot.average_luma ?? 0), label).toBeGreaterThan(minLuma);
+  expect(Number(snapshot.nonzero_pixels ?? 0), label).toBeGreaterThan(0);
+  expect(String(snapshot.checksum ?? ''), label).toHaveLength(16);
+}
+
+function snapshotPixels(snapshot: Record<string, unknown>): Uint8Array {
+  expect(snapshot.includes_pixels).toBe(true);
+  const data = typeof snapshot.rgba_b64 === 'string'
+    ? Buffer.from(snapshot.rgba_b64, 'base64')
+    : null;
+  expect(data?.byteLength ?? 0).toBe(Number(snapshot.width) * Number(snapshot.height) * 4);
+  return new Uint8Array(data ?? []);
+}
+
+function snapshotPixelLuma(snapshot: Record<string, unknown>, pixels: Uint8Array, xRatio: number, yRatio: number): number {
+  const width = Math.max(1, Number(snapshot.width ?? 1));
+  const height = Math.max(1, Number(snapshot.height ?? 1));
+  const x = Math.max(0, Math.min(width - 1, Math.round((width - 1) * xRatio)));
+  const y = Math.max(0, Math.min(height - 1, Math.round((height - 1) * yRatio)));
+  const offset = (y * width + x) * 4;
+  return (
+    pixels[offset] * 0.299 +
+    pixels[offset + 1] * 0.587 +
+    pixels[offset + 2] * 0.114
+  ) / 255;
+}
+
+function snapshotPixelRgb(snapshot: Record<string, unknown>, pixels: Uint8Array, xRatio: number, yRatio: number): [number, number, number] {
+  const width = Math.max(1, Number(snapshot.width ?? 1));
+  const height = Math.max(1, Number(snapshot.height ?? 1));
+  const x = Math.max(0, Math.min(width - 1, Math.round((width - 1) * xRatio)));
+  const y = Math.max(0, Math.min(height - 1, Math.round((height - 1) * yRatio)));
+  const offset = (y * width + x) * 4;
+  return [pixels[offset] / 255, pixels[offset + 1] / 255, pixels[offset + 2] / 255];
+}
+
+function rgbDistance(a: [number, number, number], b: [number, number, number]): number {
+  return Math.max(
+    Math.abs(a[0] - b[0]),
+    Math.abs(a[1] - b[1]),
+    Math.abs(a[2] - b[2]),
+  );
+}
+
+describe('Native effect-pass template', () => {
+  it('exposes a small parity-ready pilot manifest', () => {
+    expect(NATIVE_EFFECT_PASS_MANIFEST.map((entry) => [entry.id, entry.code])).toEqual([
+      ['invert', 1],
+      ['grayscale', 2],
+      ['brightness', 3],
+      ['contrast', 4],
+      ['gamma', 5],
+      ['saturation', 6],
+      ['hue', 7],
+      ['posterize', 8],
+      ['noise', 9],
+      ['pixelate', 10],
+      ['vignette', 11],
+      ['rgb-shift', 12],
+      ['scanlines', 13],
+      ['blur', 14],
+      ['chromatic-aberration', 15],
+      ['glitch', 16],
+      ['exposure', 17],
+      ['vibrance', 18],
+      ['temperature-tint', 19],
+      ['sharpen', 20],
+      ['directional-blur', 21],
+      ['zoom-blur', 22],
+      ['radial-blur', 23],
+      ['kaleidoscope', 24],
+      ['mirror', 25],
+      ['chroma-key', 26],
+      ['luma-key', 27],
+      ['difference-key', 28],
+      ['erode', 29],
+      ['dilate', 30],
+      ['wave', 31],
+      ['fisheye', 32],
+      ['lens-distortion', 33],
+      ['twirl', 34],
+      ['pinch-bulge', 35],
+      ['edge-detect', 36],
+      ['film-grain', 37],
+      ['filmic-tonemap', 38],
+      ['bloom', 39],
+      ['colorama', 40],
+      ['edge-feather', 41],
+      ['dither', 42],
+      ['outline', 43],
+      ['emboss', 44],
+      ['crt', 45],
+      ['thermal', 46],
+      ['night-vision', 47],
+      ['blob-track', 48],
+      ['blob-contour', 49],
+      ['blob-heatmap', 50],
+      ['tilt-shift', 51],
+      ['halation', 52],
+      ['anamorphic-streak', 53],
+      ['heat-haze', 54],
+      ['curves', 55],
+      ['selective-color', 56],
+      ['false-color', 57],
+      ['shadow-recovery', 58],
+      ['highlight-rolloff', 59],
+      ['color-balance', 60],
+      ['lift-gamma-gain', 61],
+      ['strobe-flash', 62],
+      ['fm-scanlines', 63],
+      ['vhs', 64],
+      ['plasma', 65],
+      ['halftone', 66],
+      ['toon', 67],
+      ['kuwahara', 68],
+      ['defocus-bokeh', 69],
+      ['god-rays', 70],
+      ['displacement', 71],
+      ['polar-transform', 72],
+      ['oil-paint', 73],
+      ['watercolor', 74],
+      ['comic-ink', 75],
+      ['crosshatch', 76],
+      ['linocut', 77],
+      ['dot-matrix', 78],
+      ['ascii', 79],
+      ['matrix-rain', 80],
+      ['binary-code', 81],
+      ['block-mosaic', 82],
+      ['number-grid', 83],
+      ['braille-pattern', 84],
+      ['circuit-board', 85],
+      ['stained-glass', 86],
+      ['woven-fabric', 87],
+      ['mosaic-tile', 88],
+      ['neon-outline', 89],
+      ['topo-map', 90],
+      ['led-wall', 91],
+      ['hex-grid', 92],
+      ['geometric-tile', 93],
+      ['spiral-tile', 94],
+      ['voronoi-shatter', 95],
+      ['thermal-contour', 96],
+      ['phase-lab', 97],
+      ['lens-dirt', 98],
+      ['diffusion-promist', 99],
+      ['compression-artifacts', 100],
+      ['datamosh-lite', 101],
+      ['scanline-drift', 102],
+      ['tape-dropout', 103],
+      ['ripple-caustics', 104],
+      ['shockwave', 105],
+      ['droste-recursive', 106],
+      ['slit-scan', 107],
+      ['fractal-warp', 108],
+      ['fluid-distort', 109],
+      ['wormhole', 110],
+      ['vhs-full-deck', 111],
+      ['topo-warp', 112],
+      ['strobe-sequencer', 113],
+      ['mirror-shards', 114],
+      ['rorschach-mirror', 115],
+      ['glitch-quilt', 116],
+      ['poster-tear', 117],
+      ['paint-peel', 118],
+      ['liquid-glass', 119],
+      ['crystal-refract', 120],
+      ['infinite-mirror', 121],
+      ['tunnel-flight', 122],
+      ['volumetric-fog-overlay', 123],
+      ['rain-fog-snow-overlay', 124],
+      ['particle-overlay-fx', 125],
+      ['glint-starburst', 126],
+      ['emboss-relight', 127],
+      ['pixel-sort', 128],
+      ['neon-tube-trace', 129],
+      ['hologram-scan', 130],
+      ['laser-slice', 131],
+      ['aura-field', 132],
+      ['smoke-disintegrate', 133],
+      ['shimmer-cloth', 134],
+      ['cellular-automata-burn', 135],
+      ['spectral-prism-tunnel', 136],
+      ['led-volume', 137],
+      ['audio-shock-bloom', 138],
+      ['analog-feedback-rack', 139],
+      ['club-laser-grid', 140],
+      ['ghost-exposure', 141],
+      ['dream-diffusion', 142],
+      ['ghost-double', 143],
+      ['depth-parallax', 144],
+      ['pixel-sand', 145],
+      ['point-cloud-dissolve', 146],
+      ['explode3-d', 147],
+      ['terrain3-d', 148],
+      ['wrapped-terrain', 149],
+      ['string-orb', 150],
+      ['sphere-wireframe', 151],
+      ['voxel-cube-cluster', 152],
+      ['mobius-lattice', 153],
+      ['crystal-shard-field', 154],
+      ['tube-lattice', 155],
+      ['disco-mirror-ball', 156],
+      ['lissajous-knot', 157],
+      ['helix-particle-stream', 158],
+      ['donut-constellation', 159],
+      ['sphere-project', 160],
+      ['cube-project', 161],
+      ['cylinder-wrap', 162],
+      ['torus-tunnel', 163],
+      ['diamond-gem', 164],
+      ['shatter3-d', 165],
+      ['mobius-strip', 166],
+      ['voxel-displace', 167],
+      ['wave-surface', 168],
+      ['prism-split', 169],
+      ['origami-fold', 170],
+      ['mirror-room', 171],
+      ['geometric-tile-pro', 172],
+      ['shingle-stack', 173],
+      ['time-smear', 174],
+      ['chronophoto', 175],
+      ['optical-flow-datamosh', 176],
+      ['flow-field-trails', 177],
+      ['reaction-diffusion', 178],
+      ['feedback-zoom', 179],
+      ['motion-trails', 180],
+      ['echo-repeat', 181],
+      ['light-paint', 182],
+      ['recursive-echo', 183],
+      ['cube-lut', 184],
+    ]);
+    expect(nativeEffectPassManifestEntry('posterize')).toMatchObject({
+      code: 8,
+      defaultAmount: 6,
+    });
+  });
+
+  it('exposes one fullscreen source-frame sampling WGSL shader', () => {
+    const source = getNativeEffectPassShaderSource();
+    expect(source.shaderId).toBe(NATIVE_EFFECT_PASS_SHADER_ID);
+    expect(source.stage).toBe('render');
+    expect(source.entry).toBe('fs_effect');
+    expect(source.source).toContain('var source_tex: texture_2d<f32>');
+    expect(source.source).toContain('var source_sampler: sampler');
+    expect(source.source).toContain('fn vs_full');
+    expect(source.source).toContain('fn fs_effect');
+    expect(source.source).toContain('fn blob_cell_bright');
+    expect(source.source).toContain('code == 48u');
+    expect(source.source).toContain('code == 50u');
+    expect(source.source).toContain('code == 59u');
+    expect(source.source).toContain('code == 61u');
+    expect(source.source).toContain('code == 62u');
+    expect(source.source).toContain('code == 63u');
+    expect(source.source).toContain('code == 64u');
+    expect(source.source).toContain('code == 65u');
+    expect(source.source).toContain('code == 66u');
+    expect(source.source).toContain('code == 67u');
+    expect(source.source).toContain('code == 68u');
+    expect(source.source).toContain('1.0 - smoothstep(1.0 - top, 1.0, uv.y)');
+    expect(source.source).toContain('1.0 - smoothstep(1.0 - right, 1.0, uv.x)');
+    expect(source.source).not.toMatch(/^\s*#include\b/m);
+  });
+
+  it('packs kuwahara painterly uniforms', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'source',
+      targetSourceId: 'target',
+      effect: 'kuwahara',
+      width: 320,
+      height: 180,
+      time: 0.2,
+      frameDelta: 1 / 60,
+      frameIndex: 9,
+      amount: 0.86,
+      mix: 1,
+      params: {
+        kuwaharaRadius: 4,
+        kuwaharaEdgeSharpness: 0.42,
+        kuwaharaColorPunch: 0.35,
+      },
+    })).toEqual([
+      320, 180, 0.2, 1 / 60,
+      68, 0.86, 1, 9,
+      4, 0.42, 0.35, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+    0, 0, 0, 0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs strobe flash timing and tint uniforms', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'source',
+      targetSourceId: 'target',
+      effect: 'strobe-flash',
+      width: 320,
+      height: 180,
+      time: 0.37,
+      frameDelta: 1 / 30,
+      frameIndex: 31,
+      amount: 0.88,
+      mix: 1,
+      params: {
+        strobeRate: 4,
+        strobeDuty: 0.52,
+        strobeMode: 2,
+        strobeTintR: 0.18,
+        strobeTintG: 0.85,
+        strobeTintB: 1,
+      },
+    })).toEqual([
+      320, 180, 0.37, 1 / 30,
+      62, 0.88, 1, 31,
+      4, 0.52, 2, 0.18,
+      0.85, 1, 0, 0,
+      0, 0, 0, 0,
+    0, 0, 0, 0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('builds native precompile commands from the same shader bundle', () => {
+    const source = getNativeEffectPassShaderSource();
+    expect(buildNativeEffectPassPrecompileCommands()).toEqual([{
+      type: 'precompile_shader',
+      shader_id: source.shaderId,
+      stage: source.stage,
+      entry: source.entry,
+      source: source.source,
+    }, buildNativeCubeLutPrecompileCommand()]);
+  });
+
+  it('packs a stable 112-byte effect uniform block', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'noise',
+      width: 640,
+      height: 360,
+      time: 1.25,
+      frameDelta: 1 / 30,
+      frameIndex: 12,
+      amount: 0.4,
+      mix: 0.75,
+      params: { scale: 0.5, seed: 9 },
+    })).toEqual([
+      640,
+      360,
+      1.25,
+      1 / 30,
+      9,
+      0.4,
+      0.75,
+      12,
+      0,
+      0,
+      0.5,
+      0,
+      1,
+      1,
+      1,
+      1,
+      9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'color-balance',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.9,
+      params: {
+        cbShadowR: -0.18,
+        cbShadowG: 0.02,
+        cbShadowB: 0.24,
+        cbPreserveLuma: 0.7,
+        cbMidR: 0.08,
+        cbMidG: 0,
+        cbMidB: -0.05,
+        cbHighR: 0.28,
+        cbHighG: 0.12,
+        cbHighB: -0.08,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      60,
+      0.9,
+      1,
+      3,
+      -0.18,
+      0.02,
+      0.24,
+      0.7,
+      0.08,
+      0,
+      -0.05,
+      0,
+      0.28,
+      0.12,
+      -0.08,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'lift-gamma-gain',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.85,
+      params: {
+        lggLiftR: -0.04,
+        lggLiftG: 0.02,
+        lggLiftB: 0.12,
+        lggLumaOnly: 0,
+        lggGammaR: 1.08,
+        lggGammaG: 1,
+        lggGammaB: 0.94,
+        lggGainR: 1.18,
+        lggGainG: 1.04,
+        lggGainB: 0.9,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      61,
+      0.85,
+      1,
+      3,
+      -0.04,
+      0.02,
+      0.12,
+      0,
+      1.08,
+      1,
+      0.94,
+      0,
+      1.18,
+      1.04,
+      0.9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native pixelate effect params into the generic param slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'pixelate',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 12,
+      params: {
+        mode: 3,
+        gridLines: 0.25,
+        animSpeed: 0.5,
+        animAmount: 0.75,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      10,
+      12,
+      1,
+      3,
+      3,
+      0.25,
+      0.5,
+      0.75,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'blob-track',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      params: {
+        blobMix: 0.72,
+        blobThreshold: 0.22,
+        blobShape: 4,
+        blobColor: 2,
+        blobThickness: 2.5,
+        blobGridSize: 24,
+        blobShowCoords: 0,
+        blobShowBBox: 1,
+        blobShowCenter: 1,
+        blobTrailLength: 0.45,
+        blobMinSize: 0.08,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      48,
+      0.72,
+      1,
+      3,
+      0.22,
+      4,
+      2,
+      2.5,
+      24,
+      6,
+      0.45,
+      0.08,
+      0,
+      0,
+      1,
+      0.5,
+      1,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'blob-heatmap',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      params: {
+        blobMix: 0.9,
+        blobThreshold: 0.18,
+        blobShape: 2,
+        blobColor: 3,
+        blobThickness: 1.2,
+        blobGridSize: 20,
+        blobFlags: 2,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      50,
+      0.9,
+      1,
+      3,
+      0.18,
+      2,
+      3,
+      1.2,
+      20,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native vignette params across both generic param vec4 slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'vignette',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.72,
+      params: {
+        softness: 0.22,
+        roundness: 0.9,
+        shape: 3,
+        aspect: 1.25,
+        centerX: 0.45,
+        centerY: 0.58,
+        tintAmount: 0.2,
+        breathing: 0.1,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      11,
+      0.72,
+      1,
+      3,
+      0.22,
+      0.9,
+      3,
+      1.25,
+      0.45,
+      0.58,
+      0.2,
+      0.1,
+      0,
+      0,
+      0,
+      0.5,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native stylize pilot params across the shared effect slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'glitch',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.9,
+      params: {
+        speed: 1.4,
+        blockSize: 0.2,
+        rgbSplit: 0.8,
+        jitter: 0.55,
+        verticalSlice: 0.3,
+        blockHold: 0.1,
+        tearChance: 0.7,
+        triggerMode: 2,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      16,
+      0.9,
+      1,
+      3,
+      1.4,
+      0.2,
+      0.8,
+      0.55,
+      0.3,
+      0.1,
+      0.7,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'chromatic-aberration',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.6,
+      params: {
+        mode: 2,
+        angle: 35,
+        centerX: 0.45,
+        centerY: 0.55,
+        edgeFalloff: 0.8,
+        outputMix: 0.7,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      15,
+      0.6,
+      1,
+      3,
+      2,
+      35,
+      0.45,
+      0.55,
+      0.8,
+      0.7,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native color correction params across the shared effect slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'exposure',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 1.25,
+      params: {
+        rollOff: 0.4,
+        highlightProtect: 0.6,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      17,
+      1.25,
+      1,
+      3,
+      0.4,
+      0.6,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'vibrance',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.8,
+      params: {
+        skinProtect: 0.25,
+        highlightProtect: 0.45,
+        ceiling: 1.2,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      18,
+      0.8,
+      1,
+      3,
+      0.25,
+      0.45,
+      1.2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'temperature-tint',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: -0.35,
+      params: {
+        tint: 0.2,
+        shadowTemp: -0.25,
+        highlightTemp: 0.4,
+        splitTone: 0.7,
+        autoCycle: 0.9,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      19,
+      -0.35,
+      1,
+      3,
+      0.2,
+      -0.25,
+      0.4,
+      0.7,
+      0.9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'colorama',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      params: {
+        coloramaPalette: 8,
+        coloramaOffset: 0.15,
+        coloramaSpeed: 0.05,
+        coloramaContrast: 1.2,
+        coloramaMix: 0.85,
+        coloramaBands: 4,
+        coloramaAudioReact: 0.35,
+        coloramaHueShift: 0.2,
+        audio: 0.4,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      40,
+      0.85,
+      1,
+      3,
+      8,
+      0.15,
+      0.05,
+      1.2,
+      4,
+      0.35,
+      0.2,
+      0.4,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native blur and symmetry params across the shared effect slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'directional-blur',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.75,
+      params: {
+        angle: 35,
+        samples: 20,
+        falloff: 0.4,
+        centerBias: 0.2,
+        outputMix: 0.9,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      21,
+      0.75,
+      1,
+      3,
+      35,
+      20,
+      0.4,
+      0.2,
+      0.9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'kaleidoscope',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.8,
+      params: {
+        segments: 9,
+        angle: 45,
+        centerX: 0.4,
+        centerY: 0.6,
+        zoom: 1.25,
+        mode: 2,
+        spiral: 0.7,
+        animSpeed: 0.2,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      24,
+      0.8,
+      1,
+      3,
+      9,
+      45,
+      0.4,
+      0.6,
+      1.25,
+      2,
+      0.7,
+      0.2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native keying and morphology params across the shared effect slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'chroma-key',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.22,
+      params: {
+        keyR: 0.1,
+        keyG: 0.8,
+        keyB: 0.2,
+        softness: 0.12,
+        spill: 0.7,
+        matte: 1,
+        mode: 2,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      26,
+      0.22,
+      1,
+      3,
+      0.1,
+      0.8,
+      0.2,
+      0.12,
+      0.7,
+      1,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'erode',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 4,
+      params: {
+        shape: 2,
+        channel: 4,
+        outputMix: 0.65,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      29,
+      4,
+      1,
+      3,
+      2,
+      4,
+      0.65,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native distortion params across the shared effect slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'wave',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 18,
+      params: {
+        mode: 2,
+        waveform: 1,
+        frequency: 12,
+        speed: 1.4,
+        phase: 90,
+        secondary: 0.4,
+        chromaSplit: 0.7,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      31,
+      18,
+      1,
+      3,
+      2,
+      1,
+      12,
+      1.4,
+      90,
+      0.4,
+      0.7,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'lens-distortion',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.7,
+      params: {
+        mode: 3,
+        centerX: 0.45,
+        centerY: 0.55,
+        cubic: -0.2,
+        anamorphicX: 1.7,
+        edgeFade: 0.8,
+        chromatic: 0.3,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      33,
+      0.7,
+      1,
+      3,
+      3,
+      0.45,
+      0.55,
+      -0.2,
+      1.7,
+      0.8,
+      0.3,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('packs native hero visual effects across the shared effect slots', () => {
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'edge-feather',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      params: {
+        featherTop: 0.1,
+        featherBottom: 0.2,
+        featherLeft: 0.3,
+        featherRight: 0.4,
+        featherSoftness: 0.6,
+        featherGamma: 1.2,
+        featherMattePreview: 1,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      41,
+      1,
+      1,
+      3,
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.6,
+      1.2,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'outline',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 4,
+      params: {
+        outlineR: 0.1,
+        outlineG: 0.8,
+        outlineB: 1,
+        outlineOnly: 1,
+        outlineGlow: 0.7,
+        outlinePosition: 2,
+        outlineCrawl: 0.5,
+        outlineAlphaAware: 1,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      43,
+      4,
+      1,
+      3,
+      0.1,
+      0.8,
+      1,
+      1,
+      0.7,
+      2,
+      0.5,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'night-vision',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 1.7,
+      params: {
+        nightVisionNoise: 0.25,
+        nightVisionVignette: 0.6,
+        nightVisionPhosphor: 2,
+        nightVisionBloom: 1.1,
+        nightVisionScopeMask: 2,
+        nightVisionRollingNoise: 0.4,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      47,
+      1.7,
+      1,
+      3,
+      0.25,
+      0.6,
+      2,
+      1.1,
+      2,
+      0.4,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'tilt-shift',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.9,
+      params: {
+        tiltShiftMode: 2,
+        tiltShiftFocusY: 0.45,
+        tiltShiftFocusX: 0.55,
+        tiltShiftFocusBand: 0.18,
+        tiltShiftFalloff: 0.32,
+        tiltShiftMaxBlur: 0.7,
+        tiltShiftAngle: 25,
+        tiltShiftSaturation: 1.35,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      51,
+      0.9,
+      1,
+      3,
+      2,
+      0.45,
+      0.55,
+      0.18,
+      0.32,
+      0.7,
+      25,
+      1.35,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'halation',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 1.1,
+      params: {
+        halationRadius: 18,
+        halationThreshold: 0.52,
+        halationTintR: 0.95,
+        halationTintG: 0.5,
+        halationTintB: 0.25,
+        halationMode: 1,
+        halationMix: 0.8,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      52,
+      1.1,
+      1,
+      3,
+      18,
+      0.52,
+      0.95,
+      0.5,
+      0.25,
+      1,
+      0.8,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'curves',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      params: {
+        curvesContrast: 0.7,
+        curvesToe: 0.25,
+        curvesShoulder: 0.35,
+        curvesBlackCrush: 0.15,
+        curvesMix: 0.9,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      55,
+      0.9,
+      1,
+      3,
+      0.7,
+      0.25,
+      0.35,
+      0.15,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'selective-color',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      amount: 0.8,
+      params: {
+        selColorTargetHue: 0.08,
+        selColorRange: 0.16,
+        selColorFeather: 0.07,
+        selColorMode: 1,
+        selColorReplaceHue: 0.58,
+        selColorSatBoost: 0.4,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      56,
+      0.8,
+      1,
+      3,
+      0.08,
+      0.16,
+      0.07,
+      1,
+      0.58,
+      0.4,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+
+    expect(packNativeEffectPassUniforms({
+      sourceId: 'src',
+      targetSourceId: 'dst',
+      effect: 'highlight-rolloff',
+      width: 320,
+      height: 180,
+      time: 0.5,
+      frameDelta: 1 / 24,
+      frameIndex: 3,
+      params: {
+        highRolloffAmount: 0.6,
+        highRolloffThreshold: 0.72,
+        highRolloffSoftness: 0.21,
+        highRolloffPreserveHue: 0.8,
+        highRolloffMaxValue: 1.05,
+        highRolloffMix: 0.85,
+      },
+    })).toEqual([
+      320,
+      180,
+      0.5,
+      1 / 24,
+      59,
+      0.6,
+      1,
+      3,
+      0.72,
+      0.21,
+      0.8,
+      1.05,
+      0.85,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, 0, 1, 1, // Default full-source bounds.
+    ]);
+  });
+
+  it('builds a source-frame to source-frame render graph', () => {
+    const graph = buildNativeEffectPassGraph({
+      sourceId: 'gpu:layer-a:source',
+      targetSourceId: 'gpu:layer-a:effect:invert',
+      effect: 'invert',
+      width: 1280,
+      height: 720,
+      time: 3,
+      frameDelta: 1 / 60,
+      frameIndex: 180,
+      amount: 0.8,
+    });
+
+    expect(graph.config.passes).toEqual([]);
+    expect(graph.config.readbacks).toEqual([]);
+    expect(graph.config.buffers).toEqual([
+      expect.objectContaining({
+        id: 'effect-pass:gpu:layer-a:effect:invert:uniform',
+        kind: 'uniform',
+        byte_length: 112,
+        initial_f32: expect.arrayContaining([1280, 720, 3, 1 / 60, 1, 0.8, 1, 180]),
+      }),
+    ]);
+    expect(graph.config.render_passes).toEqual([
+      expect.objectContaining({
+        name: 'effect-pass-invert',
+        shader_id: NATIVE_EFFECT_PASS_SHADER_ID,
+        target: 'source_frame',
+        source_id: 'gpu:layer-a:effect:invert',
+        vertex_entry: 'vs_full',
+        fragment_entry: 'fs_effect',
+        vertex_count: 3,
+        instance_count: 1,
+        clear: true,
+        blend: 'replace',
+      }),
+    ]);
+    expect(graph.config.render_passes[0].bindings).toEqual([
+      { binding: 0, kind: 'source-frame-texture', source_id: 'gpu:layer-a:source' },
+      { binding: 1, kind: 'source-frame-sampler' },
+      { binding: 2, resource: 'effect-pass:gpu:layer-a:effect:invert:uniform', kind: 'uniform' },
+    ]);
+  });
+
+  it('builds an ordered source-frame render graph for effect chains', () => {
+    const graph = buildNativeEffectPassChainGraph({
+      sourceId: 'gpu:layer-a:source',
+      targetSourceId: 'gpu:layer-a:effect:final',
+      intermediatePrefix: 'gpu:layer-a:chain',
+      effects: [
+        {
+          effect: 'vignette',
+          amount: 0.72,
+          params: {
+            softness: 0.22,
+            roundness: 0.9,
+            shape: 3,
+            aspect: 1.25,
+            centerX: 0.45,
+            centerY: 0.58,
+            tintAmount: 0.2,
+            breathing: 0.1,
+          },
+        },
+        {
+          effect: 'pixelate',
+          amount: 12,
+          params: {
+            mode: 1,
+            gridLines: 0.25,
+            animSpeed: 0.5,
+            animAmount: 0.75,
+          },
+        },
+      ],
+      width: 1280,
+      height: 720,
+      time: 3,
+      frameDelta: 1 / 60,
+      frameIndex: 180,
+      seq: 900,
+    });
+
+    expect(graph.effects).toEqual(['vignette', 'pixelate']);
+    expect(graph.config.passes).toEqual([]);
+    expect(graph.config.readbacks).toEqual([]);
+    expect(graph.config.buffers).toHaveLength(2);
+    expect(graph.config.render_passes).toHaveLength(2);
+    expect(graph.config.render_passes[0]).toMatchObject({
+      name: 'effect-pass-vignette-1',
+      source_id: 'gpu:layer-a:chain:step:0',
+      seq: 900,
+    });
+    expect(graph.config.render_passes[1]).toMatchObject({
+      name: 'effect-pass-pixelate-2',
+      source_id: 'gpu:layer-a:effect:final',
+      seq: 901,
+    });
+    expect(graph.config.buffers[1]).toEqual(expect.objectContaining({
+      initial_f32: expect.arrayContaining([1280, 720, 3, 1 / 60, 10, 12, 1, 180, 1, 0.25, 0.5, 0.75]),
+    }));
+    expect(graph.config.render_passes[0].bindings).toEqual(expect.arrayContaining([
+      { binding: 0, kind: 'source-frame-texture', source_id: 'gpu:layer-a:source' },
+    ]));
+    expect(graph.config.render_passes[1].bindings).toEqual(expect.arrayContaining([
+      { binding: 0, kind: 'source-frame-texture', source_id: 'gpu:layer-a:chain:step:0' },
+    ]));
+  });
+
+  it('ping-pongs effect-chain intermediates to stay within native source-frame slots', () => {
+    const graph = buildNativeEffectPassChainGraph({
+      sourceId: 'gpu:layer-long:source',
+      targetSourceId: 'gpu:layer-long:effect:final',
+      intermediatePrefix: 'gpu:layer-long:chain',
+      effects: [
+        'invert',
+        'grayscale',
+        'brightness',
+        'contrast',
+        'gamma',
+        'saturation',
+        'hue',
+        'posterize',
+        'noise',
+        'pixelate',
+      ].map((effect) => ({ effect: effect as any, amount: 1 })),
+      width: 640,
+      height: 360,
+      time: 1,
+      frameDelta: 1 / 60,
+      frameIndex: 60,
+      seq: 120,
+    });
+
+    const targets = graph.config.render_passes.map((pass) => String(pass.source_id));
+    expect(targets).toEqual([
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:effect:final',
+    ]);
+
+    const bindingSources = graph.config.render_passes.map((pass) => {
+      const binding = (pass.bindings as Array<Record<string, unknown>>).find((entry) => entry.binding === 0);
+      return String(binding?.source_id);
+    });
+    expect(bindingSources).toEqual([
+      'gpu:layer-long:source',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+      'gpu:layer-long:chain:step:0',
+    ]);
+
+    expect(new Set(targets.slice(0, -1))).toEqual(new Set([
+      'gpu:layer-long:chain:step:0',
+      'gpu:layer-long:chain:step:1',
+    ]));
+  });
+
+  const itIfNativeCore = existsSync(nativeCoreBin) ? it : it.skip;
+
+  itIfNativeCore('renders an uploaded source frame through the native effect-pass graph', async () => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', {
+        config: {
+          backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+          width: 160,
+          height: 90,
+          target_fps: 30,
+        },
+      }, 12000);
+      await delay(300);
+
+      const capabilities = await rpc.send('capabilities', {}, 5000);
+      expect(capabilities?.features?.compute_graph_render).toBe(true);
+      expect(capabilities?.features?.compute_graph_source_frame_target).toBe(true);
+      const precompileSummary = await rpc.send('submit_commands', {
+        commands: buildNativeEffectPassPrecompileCommands(),
+      }, 5000);
+      expect(Number(precompileSummary?.dropped ?? 0)).toBe(0);
+
+      const sourceId = 'native-effect-pass-test-source';
+      const targetSourceId = 'native-effect-pass-test-output';
+      const layerId = 'native-effect-pass-test-layer';
+      const sourceBytes = makeSourceBytes(32, 32);
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'upload_source_frame',
+            source_id: sourceId,
+            width: 32,
+            height: 32,
+            rgba_b64: Buffer.from(sourceBytes).toString('base64'),
+            seq: 1,
+          },
+          {
+            type: 'upsert_layer',
+            layer_id: layerId,
+            z_index: 0,
+            blend_mode: 'normal',
+            opacity: 1,
+            corners: FULLSCREEN_CORNERS,
+          },
+          { type: 'set_layer_visibility', layer_id: layerId, visible: true },
+          {
+            type: 'bind_media_source',
+            layer_id: layerId,
+            source_id: sourceId,
+            uri: 'native-effect-pass-test://source',
+            source_type: 'image',
+          },
+        ],
+      }, 5000);
+
+      const sourceSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: false,
+        time: 0,
+        frame_index: 1,
+      }, 8000);
+      assertVisibleSnapshot('effect pass source layer', sourceSnapshot);
+
+      const graph = buildNativeEffectPassGraph({
+        sourceId,
+        targetSourceId,
+        effect: 'invert',
+        width: 160,
+        height: 90,
+        time: 0.2,
+        frameDelta: 1 / 30,
+        frameIndex: 2,
+        amount: 1,
+        mix: 1,
+      });
+      const graphResult = await rpc.send('compute_graph', graph.config, 8000);
+      expect(graphResult?.render).toMatchObject({
+        target: 'source_frame',
+        source_id: targetSourceId,
+      });
+      expect(Number(graphResult?.render?.source_slot ?? -1)).toBeGreaterThanOrEqual(0);
+
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'bind_media_source',
+            layer_id: layerId,
+            source_id: targetSourceId,
+            uri: 'native-effect-pass-test://invert',
+            source_type: 'image',
+          },
+        ],
+      }, 5000);
+      const effectSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: false,
+        time: 0.2,
+        frame_index: 2,
+      }, 8000);
+      assertVisibleSnapshot('effect pass output layer', effectSnapshot);
+      expect(effectSnapshot.checksum).not.toBe(sourceSnapshot.checksum);
+
+      const status = await rpc.send('status', {}, 5000);
+      expect(Number(status?.compute_graph_source_frame_renders ?? 0)).toBeGreaterThan(0);
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+
+  itIfNativeCore('keeps a core-owned instrument source separate from its composited effect output', async () => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', {
+        config: {
+          backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+          width: 160,
+          height: 90,
+          target_fps: 30,
+        },
+      }, 12000);
+      await delay(300);
+
+      const precompileSummary = await rpc.send('submit_commands', {
+        commands: [
+          ...buildPlanetNativePrecompileCommands(),
+          ...buildNativeEffectPassPrecompileCommands(),
+        ],
+      }, 8000);
+      expect(Number(precompileSummary?.dropped ?? 0)).toBe(0);
+
+      const layerId = 'native-effect-instrument-layer';
+      const instrumentSourceId = 'native-effect-instrument-base';
+      const compositeSourceId = 'native-effect-instrument-invert';
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'upsert_layer',
+            layer_id: layerId,
+            z_index: 0,
+            blend_mode: 'normal',
+            opacity: 1,
+            corners: FULLSCREEN_CORNERS,
+          },
+          { type: 'set_layer_visibility', layer_id: layerId, visible: true },
+          {
+            type: 'set_native_graph_layer',
+            layer_id: layerId,
+            kind: 'planet',
+            instrument_source_id: instrumentSourceId,
+            composite_source_id: instrumentSourceId,
+            effect_graph: null,
+            params: {},
+          },
+          {
+            type: 'set_render_clock',
+            mode: 'manual',
+            time: 1.25,
+            time_delta: 0,
+            frame_index: 30,
+          },
+        ],
+      }, 8000);
+      await delay(300);
+
+      const sourceSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: false,
+        time: 1.25,
+        frame_index: 30,
+      }, 8000);
+      assertVisibleSnapshot('core-owned native instrument source', sourceSnapshot);
+      const sourceStatus = await rpc.send('status', {}, 5000);
+
+      const effectGraph = buildNativeEffectPassGraph({
+        sourceId: instrumentSourceId,
+        targetSourceId: compositeSourceId,
+        effect: 'invert',
+        width: 160,
+        height: 90,
+        time: 1.25,
+        frameDelta: 0,
+        frameIndex: 30,
+        amount: 1,
+        mix: 1,
+      });
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'set_native_graph_layer',
+            layer_id: layerId,
+            kind: 'planet',
+            instrument_source_id: instrumentSourceId,
+            composite_source_id: compositeSourceId,
+            effect_graph: effectGraph.config,
+            params: {},
+          },
+        ],
+      }, 8000);
+      await delay(300);
+
+      const effectSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: false,
+        time: 1.25,
+        frame_index: 30,
+      }, 8000);
+      assertVisibleSnapshot('core-owned native instrument effect output', effectSnapshot);
+      const effectStatus = await rpc.send('status', {}, 5000);
+      expect(
+        effectSnapshot.checksum,
+        JSON.stringify({
+          last_shader_error: effectStatus?.last_shader_error,
+          last_frame_error: effectStatus?.last_frame_error,
+          graph_layers: effectStatus?.native_graph_source_frame_layers,
+          source_frames: effectStatus?.source_frames_active,
+          source_render_passes: sourceStatus?.compute_graph_render_passes,
+          effect_render_passes: effectStatus?.compute_graph_render_passes,
+        }),
+      ).not.toBe(sourceSnapshot.checksum);
+      expect(Math.abs(
+        Number(effectSnapshot.average_luma ?? 0) - Number(sourceSnapshot.average_luma ?? 0),
+      )).toBeGreaterThan(0.08);
+
+      const advancedTime = 2.75;
+      const advancedFrame = 66;
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'set_render_clock',
+            mode: 'manual',
+            time: advancedTime,
+            time_delta: 1.5,
+            frame_index: advancedFrame,
+          },
+        ],
+      }, 8000);
+      await delay(300);
+
+      const advancedEffectSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: false,
+        time: advancedTime,
+        frame_index: advancedFrame,
+      }, 8000);
+      assertVisibleSnapshot('animated core-owned native instrument effect output', advancedEffectSnapshot);
+      expect(advancedEffectSnapshot.checksum).not.toBe(effectSnapshot.checksum);
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+
+  itIfNativeCore('runs deterministic native effect-pass pixel fixture probes', async () => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', {
+        config: {
+          backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+          width: 160,
+          height: 90,
+          target_fps: 30,
+        },
+      }, 12000);
+      await delay(80);
+
+      const capabilities = await rpc.send('capabilities', {}, 5000);
+      expect(capabilities?.features?.compute_graph_render).toBe(true);
+      expect(capabilities?.features?.compute_graph_source_frame_target).toBe(true);
+      const precompileSummary = await rpc.send('submit_commands', {
+        commands: buildNativeEffectPassPrecompileCommands(),
+      }, 5000);
+      expect(Number(precompileSummary?.dropped ?? 0)).toBe(0);
+
+      const sourceId = 'native-effect-pass-fixture-source';
+      const layerId = 'native-effect-pass-fixture-layer';
+      const sourceBytes = makeSourceBytes(32, 32);
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'upload_source_frame',
+            source_id: sourceId,
+            width: 32,
+            height: 32,
+            rgba_b64: Buffer.from(sourceBytes).toString('base64'),
+            seq: 1,
+          },
+          {
+            type: 'upsert_layer',
+            layer_id: layerId,
+            z_index: 0,
+            blend_mode: 'normal',
+            opacity: 1,
+            corners: FULLSCREEN_CORNERS,
+          },
+          { type: 'set_layer_visibility', layer_id: layerId, visible: true },
+          {
+            type: 'bind_media_source',
+            layer_id: layerId,
+            source_id: sourceId,
+            uri: 'native-effect-pass-fixture://source',
+            source_type: 'image',
+          },
+        ],
+      }, 5000);
+
+      const sourceSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: true,
+        time: 0,
+        frame_index: 1,
+      }, 8000);
+      assertVisibleSnapshot('effect fixture source layer', sourceSnapshot);
+      const sourcePixels = snapshotPixels(sourceSnapshot);
+      const chromaKeyRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.5, 0.5);
+      const differenceKeyRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.45, 0.5);
+
+      const fixtures = [
+        {
+          id: 'invert',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-invert',
+            effect: 'invert',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 2,
+            amount: 1,
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceLuma = snapshotPixelLuma(sourceSnapshot, sourcePixels, 0.08, 0.08);
+            const effectLuma = snapshotPixelLuma(snapshot, pixels, 0.08, 0.08);
+            expect(effectLuma).toBeGreaterThan(sourceLuma + 0.12);
+          },
+        },
+        {
+          id: 'edge-feather',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-edge-feather',
+            effect: 'edge-feather',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 3,
+            amount: 1,
+            params: {
+              featherTop: 0.28,
+              featherBottom: 0.28,
+              featherLeft: 0.28,
+              featherRight: 0.28,
+              featherSoftness: 0.6,
+              featherGamma: 1,
+              featherMattePreview: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceEdge = snapshotPixelLuma(sourceSnapshot, sourcePixels, 0.02, 0.5);
+            const effectEdge = snapshotPixelLuma(snapshot, pixels, 0.02, 0.5);
+            const sourceCenter = snapshotPixelLuma(sourceSnapshot, sourcePixels, 0.5, 0.5);
+            const effectCenter = snapshotPixelLuma(snapshot, pixels, 0.5, 0.5);
+            expect(effectEdge).toBeLessThan(sourceEdge * 0.2);
+            expect(Math.abs(effectCenter - sourceCenter)).toBeLessThan(0.04);
+          },
+        },
+        {
+          id: 'pixelate',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-pixelate',
+            effect: 'pixelate',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 3,
+            amount: 28,
+            params: {
+              mode: 0,
+              gridLines: 0,
+              animSpeed: 0,
+              animAmount: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const a = snapshotPixelRgb(snapshot, pixels, 0.505, 0.50);
+            const b = snapshotPixelRgb(snapshot, pixels, 0.515, 0.50);
+            const c = snapshotPixelRgb(snapshot, pixels, 0.80, 0.50);
+            expect(rgbDistance(a, b)).toBeLessThan(0.05);
+            expect(rgbDistance(a, c)).toBeGreaterThan(0.04);
+          },
+        },
+        {
+          id: 'vignette',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-vignette',
+            effect: 'vignette',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 4,
+            amount: 0.42,
+            params: {
+              softness: 0.12,
+              roundness: 1,
+              shape: 0,
+              aspect: 1,
+              centerX: 0.5,
+              centerY: 0.5,
+              tintAmount: 1,
+              breathing: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const centerLuma = snapshotPixelLuma(snapshot, pixels, 0.5, 0.5);
+            const cornerLuma = snapshotPixelLuma(snapshot, pixels, 0.04, 0.04);
+            expect(centerLuma).toBeGreaterThan(cornerLuma + 0.08);
+          },
+        },
+        {
+          id: 'rgb-shift',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-rgb-shift',
+            effect: 'rgb-shift',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 5,
+            amount: 22,
+            params: {
+              angle: 0,
+              mode: 0,
+              centerX: 0.5,
+              centerY: 0.5,
+              prismSpread: 1.5,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.5, 0.5);
+            const shiftedRgb = snapshotPixelRgb(snapshot, pixels, 0.5, 0.5);
+            expect(rgbDistance(sourceRgb, shiftedRgb)).toBeGreaterThan(0.02);
+          },
+        },
+        {
+          id: 'scanlines',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-scanlines',
+            effect: 'scanlines',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 6,
+            amount: 0.8,
+            params: {
+              count: 36,
+              speed: 0,
+              phosphor: 0.35,
+              rollingBar: 0,
+              curvature: 0,
+              interlace: 0.6,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const lineA = snapshotPixelLuma(snapshot, pixels, 0.5, 0.48);
+            const lineB = snapshotPixelLuma(snapshot, pixels, 0.5, 0.52);
+            expect(Math.abs(lineA - lineB)).toBeGreaterThan(0.003);
+          },
+        },
+        {
+          id: 'fm-scanlines',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-fm-scanlines',
+            effect: 'fm-scanlines',
+            width: 160,
+            height: 90,
+            time: 0.33,
+            frameDelta: 1 / 30,
+            frameIndex: 7,
+            amount: 1,
+            params: {
+              mode: 0,
+              count: 96,
+              width: 0.32,
+              freq: 0.34,
+              fmDepth: 0.6,
+              amp: 0.58,
+              speed: 0.5,
+              colorMix: 0.25,
+              invert: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const lineA = snapshotPixelLuma(snapshot, pixels, 0.5, 0.47);
+            const lineB = snapshotPixelLuma(snapshot, pixels, 0.5, 0.53);
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.5, 0.5);
+            const effectRgb = snapshotPixelRgb(snapshot, pixels, 0.5, 0.5);
+            expect(Math.abs(lineA - lineB)).toBeGreaterThan(0.003);
+            expect(rgbDistance(sourceRgb, effectRgb)).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'plasma',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-plasma',
+            effect: 'plasma',
+            width: 160,
+            height: 90,
+            time: 0.45,
+            frameDelta: 1 / 30,
+            frameIndex: 9,
+            amount: 1,
+            params: {
+              plasmaScale: 4.5,
+              plasmaSpeed: 0.8,
+              plasmaPalette: 8,
+              plasmaSourceMix: 0.35,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.5, 0.5);
+            const plasmaRgb = snapshotPixelRgb(snapshot, pixels, 0.5, 0.5);
+            expect(rgbDistance(sourceRgb, plasmaRgb)).toBeGreaterThan(0.04);
+          },
+        },
+        {
+          id: 'halftone',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-halftone',
+            effect: 'halftone',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 10,
+            amount: 1,
+            params: {
+              halftoneScale: 9,
+              halftoneAngle: 24,
+              halftoneDotGain: 1.1,
+              halftoneColorMode: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const maxDelta = [
+              [0.35, 0.35],
+              [0.50, 0.50],
+              [0.68, 0.56],
+            ].reduce((best, [x, y]) => {
+              const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, x, y);
+              const halftoneRgb = snapshotPixelRgb(snapshot, pixels, x, y);
+              return Math.max(best, rgbDistance(sourceRgb, halftoneRgb));
+            }, 0);
+            expect(maxDelta).toBeGreaterThan(0.04);
+          },
+        },
+        {
+          id: 'toon',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-toon',
+            effect: 'toon',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 11,
+            amount: 0.95,
+            params: {
+              toonLevels: 3,
+              toonEdgeStrength: 1.2,
+              toonSaturation: 1.2,
+              toonEdgeThreshold: 0.02,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.64, 0.44);
+            const toonRgb = snapshotPixelRgb(snapshot, pixels, 0.64, 0.44);
+            expect(rgbDistance(sourceRgb, toonRgb)).toBeGreaterThan(0.02);
+          },
+        },
+        {
+          id: 'kuwahara',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-kuwahara',
+            effect: 'kuwahara',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 12,
+            amount: 1,
+            params: {
+              kuwaharaRadius: 4,
+              kuwaharaEdgeSharpness: 0.45,
+              kuwaharaColorPunch: 0.35,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const maxDelta = [
+              [0.34, 0.35],
+              [0.50, 0.50],
+              [0.66, 0.58],
+            ].reduce((best, [x, y]) => {
+              const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, x, y);
+              const kuwaharaRgb = snapshotPixelRgb(snapshot, pixels, x, y);
+              return Math.max(best, rgbDistance(sourceRgb, kuwaharaRgb));
+            }, 0);
+            expect(maxDelta).toBeGreaterThan(0.012);
+          },
+        },
+        {
+          id: 'vhs',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-vhs',
+            effect: 'vhs',
+            width: 160,
+            height: 90,
+            time: 0.42,
+            frameDelta: 1 / 30,
+            frameIndex: 8,
+            amount: 1,
+            params: {
+              tracking: 0.42,
+              noise: 0.12,
+              distortion: 0.32,
+              colorBleed: 0.6,
+              scanlines: 1,
+              headSwitch: 0.35,
+              tapeWobble: 0.22,
+              dropout: 0,
+              chromaDelay: 0.4,
+              trackingJump: 0,
+              saturation: 0.72,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.55, 0.55);
+            const effectRgb = snapshotPixelRgb(snapshot, pixels, 0.55, 0.55);
+            const lineA = snapshotPixelLuma(snapshot, pixels, 0.5, 0.48);
+            const lineB = snapshotPixelLuma(snapshot, pixels, 0.5, 0.52);
+            expect(rgbDistance(sourceRgb, effectRgb)).toBeGreaterThan(0.01);
+            expect(Math.abs(lineA - lineB)).toBeGreaterThan(0.003);
+          },
+        },
+        {
+          id: 'blur',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-blur',
+            effect: 'blur',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 7,
+            amount: 18,
+            params: {
+              mode: 1,
+              angle: 0,
+              param2: 1,
+              edgeProtect: 0,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.76, 0.42);
+            const blurredRgb = snapshotPixelRgb(snapshot, pixels, 0.76, 0.42);
+            expect(rgbDistance(sourceRgb, blurredRgb)).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'chromatic-aberration',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-chromatic-aberration',
+            effect: 'chromatic-aberration',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 8,
+            amount: 1.2,
+            params: {
+              mode: 1,
+              angle: 0,
+              centerX: 0.5,
+              centerY: 0.5,
+              edgeFalloff: 0.4,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.78, 0.5);
+            const shiftedRgb = snapshotPixelRgb(snapshot, pixels, 0.78, 0.5);
+            expect(rgbDistance(sourceRgb, shiftedRgb)).toBeGreaterThan(0.015);
+          },
+        },
+        {
+          id: 'glitch',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-glitch',
+            effect: 'glitch',
+            width: 160,
+            height: 90,
+            time: 1.1,
+            frameDelta: 1 / 30,
+            frameIndex: 9,
+            amount: 1,
+            params: {
+              speed: 1.5,
+              blockSize: 0.1,
+              rgbSplit: 1,
+              jitter: 1,
+              verticalSlice: 1,
+              blockHold: 0,
+              tearChance: 1,
+              triggerMode: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.35, 0.62);
+            const glitchedRgb = snapshotPixelRgb(snapshot, pixels, 0.35, 0.62);
+            expect(rgbDistance(sourceRgb, glitchedRgb)).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'sharpen',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-sharpen',
+            effect: 'sharpen',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 10,
+            amount: 1.4,
+            params: {
+              mode: 0,
+              radius: 2,
+              edgeProtect: 0,
+              intensity: 0.6,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.52, 0.55);
+            const sharpenedRgb = snapshotPixelRgb(snapshot, pixels, 0.52, 0.55);
+            expect(rgbDistance(sourceRgb, sharpenedRgb)).toBeGreaterThan(0.008);
+          },
+        },
+        {
+          id: 'directional-blur',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-directional-blur',
+            effect: 'directional-blur',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 11,
+            amount: 0.85,
+            params: {
+              angle: 0,
+              samples: 24,
+              falloff: 0,
+              centerBias: 0,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.70, 0.48);
+            const blurredRgb = snapshotPixelRgb(snapshot, pixels, 0.70, 0.48);
+            expect(rgbDistance(sourceRgb, blurredRgb)).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'zoom-blur',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-zoom-blur',
+            effect: 'zoom-blur',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 12,
+            amount: 0.75,
+            params: {
+              centerX: 0.5,
+              centerY: 0.5,
+              samples: 24,
+              falloff: 0.1,
+              chromatic: 0.4,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.78, 0.5);
+            const blurredRgb = snapshotPixelRgb(snapshot, pixels, 0.78, 0.5);
+            expect(rgbDistance(sourceRgb, blurredRgb)).toBeGreaterThan(0.012);
+          },
+        },
+        {
+          id: 'radial-blur',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-radial-blur',
+            effect: 'radial-blur',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 13,
+            amount: 0.9,
+            params: {
+              centerX: 0.5,
+              centerY: 0.5,
+              samples: 24,
+              falloff: 0.1,
+              radiusInner: 0,
+              radiusOuter: 0.55,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const maxDelta = [
+              [0.72, 0.36],
+              [0.78, 0.5],
+              [0.34, 0.68],
+              [0.58, 0.78],
+            ].reduce((best, [x, y]) => {
+              const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, x, y);
+              const blurredRgb = snapshotPixelRgb(snapshot, pixels, x, y);
+              return Math.max(best, rgbDistance(sourceRgb, blurredRgb));
+            }, 0);
+            expect(maxDelta).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'kaleidoscope',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-kaleidoscope',
+            effect: 'kaleidoscope',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 14,
+            amount: 1,
+            params: {
+              segments: 8,
+              angle: 30,
+              centerX: 0.5,
+              centerY: 0.5,
+              zoom: 1,
+              mode: 0,
+              spiral: 0.4,
+              animSpeed: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const left = snapshotPixelRgb(snapshot, pixels, 0.22, 0.45);
+            const right = snapshotPixelRgb(snapshot, pixels, 0.78, 0.45);
+            expect(rgbDistance(left, right)).toBeLessThan(0.42);
+          },
+        },
+        {
+          id: 'mirror',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-mirror',
+            effect: 'mirror',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 15,
+            amount: 1,
+            params: {
+              mode: 0,
+              position: 0.5,
+              offset: 0.5,
+              flipSide: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const left = snapshotPixelRgb(snapshot, pixels, 0.25, 0.52);
+            const right = snapshotPixelRgb(snapshot, pixels, 0.75, 0.52);
+            expect(rgbDistance(left, right)).toBeLessThan(0.08);
+          },
+        },
+        {
+          id: 'chroma-key',
+          allowDarkFrame: true,
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-chroma-key',
+            effect: 'chroma-key',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 16,
+            amount: 1,
+            params: {
+              keyR: chromaKeyRgb[0],
+              keyG: chromaKeyRgb[1],
+              keyB: chromaKeyRgb[2],
+              softness: 0.08,
+              spill: 0,
+              matte: 1,
+              mode: 2,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceLuma = snapshotPixelLuma(sourceSnapshot, sourcePixels, 0.5, 0.5);
+            const keyedLuma = snapshotPixelLuma(snapshot, pixels, 0.5, 0.5);
+            expect(keyedLuma).toBeLessThan(sourceLuma - 0.08);
+          },
+        },
+        {
+          id: 'luma-key',
+          allowDarkFrame: true,
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-luma-key',
+            effect: 'luma-key',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 17,
+            amount: 0.45,
+            params: {
+              highCut: 0.7,
+              invert: 0,
+              gamma: 1,
+              matte: 0,
+              premultiply: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceLuma = snapshotPixelLuma(sourceSnapshot, sourcePixels, 0.12, 0.12);
+            const keyedLuma = snapshotPixelLuma(snapshot, pixels, 0.12, 0.12);
+            expect(keyedLuma).toBeLessThan(sourceLuma - 0.04);
+          },
+        },
+        {
+          id: 'difference-key',
+          allowDarkFrame: true,
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-difference-key',
+            effect: 'difference-key',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 18,
+            amount: 1,
+            params: {
+              refR: differenceKeyRgb[0],
+              refG: differenceKeyRgb[1],
+              refB: differenceKeyRgb[2],
+              softness: 0.04,
+              invert: 0,
+              matte: 0,
+              mode: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceLuma = snapshotPixelLuma(sourceSnapshot, sourcePixels, 0.45, 0.5);
+            const keyedLuma = snapshotPixelLuma(snapshot, pixels, 0.45, 0.5);
+            expect(keyedLuma).toBeLessThan(sourceLuma - 0.06);
+          },
+        },
+        {
+          id: 'erode',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-erode',
+            effect: 'erode',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 19,
+            amount: 5,
+            params: {
+              shape: 1,
+              channel: 0,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.78, 0.5);
+            const erodedRgb = snapshotPixelRgb(snapshot, pixels, 0.78, 0.5);
+            expect(rgbDistance(sourceRgb, erodedRgb)).toBeGreaterThan(0.006);
+          },
+        },
+        {
+          id: 'dilate',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-dilate',
+            effect: 'dilate',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 20,
+            amount: 5,
+            params: {
+              shape: 1,
+              channel: 0,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.22, 0.5);
+            const dilatedRgb = snapshotPixelRgb(snapshot, pixels, 0.22, 0.5);
+            expect(rgbDistance(sourceRgb, dilatedRgb)).toBeGreaterThan(0.006);
+          },
+        },
+        {
+          id: 'wave',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-wave',
+            effect: 'wave',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 21,
+            amount: 36,
+            params: {
+              mode: 0,
+              waveform: 0,
+              frequency: 4,
+              speed: 0,
+              phase: 45,
+              secondary: 0.4,
+              chromaSplit: 0.4,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const maxDelta = [
+              [0.38, 0.44],
+              [0.62, 0.55],
+              [0.72, 0.66],
+              [0.28, 0.72],
+            ].reduce((best, [x, y]) => {
+              const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, x, y);
+              const wavedRgb = snapshotPixelRgb(snapshot, pixels, x, y);
+              return Math.max(best, rgbDistance(sourceRgb, wavedRgb));
+            }, 0);
+            expect(maxDelta).toBeGreaterThan(0.012);
+          },
+        },
+        {
+          id: 'fisheye',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-fisheye',
+            effect: 'fisheye',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 22,
+            amount: 0.9,
+            params: {
+              radius: 1,
+              centerX: 0.5,
+              centerY: 0.5,
+              zoom: 1,
+              mode: 1,
+              edgeFalloff: 0.6,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.78, 0.55);
+            const fishRgb = snapshotPixelRgb(snapshot, pixels, 0.78, 0.55);
+            expect(rgbDistance(sourceRgb, fishRgb)).toBeGreaterThan(0.012);
+          },
+        },
+        {
+          id: 'lens-distortion',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-lens-distortion',
+            effect: 'lens-distortion',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 23,
+            amount: 0.85,
+            params: {
+              mode: 3,
+              centerX: 0.5,
+              centerY: 0.5,
+              cubic: 0.25,
+              anamorphicX: 1.5,
+              edgeFade: 1,
+              chromatic: 0.4,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.76, 0.58);
+            const lensRgb = snapshotPixelRgb(snapshot, pixels, 0.76, 0.58);
+            expect(rgbDistance(sourceRgb, lensRgb)).toBeGreaterThan(0.012);
+          },
+        },
+        {
+          id: 'twirl',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-twirl',
+            effect: 'twirl',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 24,
+            amount: 3.5,
+            params: {
+              radius: 0.95,
+              centerX: 0.5,
+              centerY: 0.5,
+              falloff: 1.1,
+              animSpeed: 0,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.68, 0.58);
+            const twirlRgb = snapshotPixelRgb(snapshot, pixels, 0.68, 0.58);
+            expect(rgbDistance(sourceRgb, twirlRgb)).toBeGreaterThan(0.012);
+          },
+        },
+        {
+          id: 'pinch-bulge',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-pinch-bulge',
+            effect: 'pinch-bulge',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 25,
+            amount: 0.9,
+            params: {
+              radius: 0.85,
+              centerX: 0.5,
+              centerY: 0.5,
+              falloff: 1.2,
+              chromatic: 0.4,
+              outputMix: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.72, 0.52);
+            const pinchRgb = snapshotPixelRgb(snapshot, pixels, 0.72, 0.52);
+            expect(rgbDistance(sourceRgb, pinchRgb)).toBeGreaterThan(0.012);
+          },
+        },
+        {
+          id: 'edge-detect',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-edge-detect',
+            effect: 'edge-detect',
+            width: 160,
+            height: 90,
+            time: 0.2,
+            frameDelta: 1 / 30,
+            frameIndex: 26,
+            amount: 0.03,
+            params: {
+              thickness: 2,
+              mode: 1,
+              invert: 0,
+              edgeTintR: 0,
+              edgeTintG: 1,
+              edgeTintB: 1,
+              tintEdges: 1,
+              edgeGlow: 0.75,
+              edgeOnlyAlpha: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.52, 0.55);
+            const edgeRgb = snapshotPixelRgb(snapshot, pixels, 0.52, 0.55);
+            expect(rgbDistance(sourceRgb, edgeRgb)).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'film-grain',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-film-grain',
+            effect: 'film-grain',
+            width: 160,
+            height: 90,
+            time: 0.4,
+            frameDelta: 1 / 30,
+            frameIndex: 30,
+            amount: 0.85,
+            params: {
+              grainSize: 1.1,
+              grainShadow: 1.2,
+              grainMid: 1,
+              grainHigh: 0.8,
+              grainMono: 0,
+              grainStock: 3,
+              grainColorJitter: 0.7,
+              grainAnimSpeed: 1,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.43, 0.47);
+            const grainRgb = snapshotPixelRgb(snapshot, pixels, 0.43, 0.47);
+            expect(rgbDistance(sourceRgb, grainRgb)).toBeGreaterThan(0.008);
+          },
+        },
+        {
+          id: 'filmic-tonemap',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-filmic-tonemap',
+            effect: 'filmic-tonemap',
+            width: 160,
+            height: 90,
+            time: 0.1,
+            frameDelta: 1 / 30,
+            frameIndex: 31,
+            amount: 1,
+            params: {
+              tonemapCurve: 2,
+              tonemapExposure: 1.8,
+              tonemapContrast: 0.55,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.68, 0.38);
+            const toneRgb = snapshotPixelRgb(snapshot, pixels, 0.68, 0.38);
+            expect(rgbDistance(sourceRgb, toneRgb)).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'bloom',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-bloom',
+            effect: 'bloom',
+            width: 160,
+            height: 90,
+            time: 0.1,
+            frameDelta: 1 / 30,
+            frameIndex: 32,
+            amount: 0.9,
+            params: {
+              bloomIntensity: 1.7,
+              threshold: 0.24,
+              bloomKnee: 0.65,
+              bloomRadius: 0.85,
+              bloomAnamorphic: 0.35,
+              red: 1,
+              green: 0.9,
+              blue: 0.75,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.58, 0.42);
+            const bloomRgb = snapshotPixelRgb(snapshot, pixels, 0.58, 0.42);
+            expect(rgbDistance(sourceRgb, bloomRgb)).toBeGreaterThan(0.01);
+          },
+        },
+        {
+          id: 'colorama',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-colorama',
+            effect: 'colorama',
+            width: 160,
+            height: 90,
+            time: 0.35,
+            frameDelta: 1 / 30,
+            frameIndex: 33,
+            params: {
+              coloramaPalette: 8,
+              coloramaOffset: 0.12,
+              coloramaSpeed: 0.2,
+              coloramaContrast: 1.25,
+              coloramaMix: 1,
+              coloramaBands: 5,
+              coloramaAudioReact: 0.2,
+              coloramaHueShift: 0.18,
+              audio: 0.4,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.42, 0.58);
+            const coloramaRgb = snapshotPixelRgb(snapshot, pixels, 0.42, 0.58);
+            expect(rgbDistance(sourceRgb, coloramaRgb)).toBeGreaterThan(0.05);
+          },
+        },
+        {
+          id: 'blob-track',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-blob-track',
+            effect: 'blob-track',
+            width: 160,
+            height: 90,
+            time: 0.35,
+            frameDelta: 1 / 30,
+            frameIndex: 34,
+            params: {
+              blobMix: 0.9,
+              blobThreshold: 0.12,
+              blobShape: 4,
+              blobColor: 0,
+              blobThickness: 3,
+              blobGridSize: 12,
+              blobFlags: 6,
+              blobTrailLength: 0,
+              blobMinSize: 0,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            let maxDelta = 0;
+            for (let i = 0; i < pixels.length; i += 4) {
+              maxDelta = Math.max(
+                maxDelta,
+                Math.abs(sourcePixels[i] - pixels[i]) / 255,
+                Math.abs(sourcePixels[i + 1] - pixels[i + 1]) / 255,
+                Math.abs(sourcePixels[i + 2] - pixels[i + 2]) / 255,
+              );
+            }
+            expect(maxDelta).toBeGreaterThan(0.006);
+          },
+        },
+        {
+          id: 'blob-contour',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-blob-contour',
+            effect: 'blob-contour',
+            width: 160,
+            height: 90,
+            time: 0.35,
+            frameDelta: 1 / 30,
+            frameIndex: 35,
+            params: {
+              blobMix: 0.8,
+              blobThreshold: 0.14,
+              blobShape: 0,
+              blobColor: 1,
+              blobThickness: 2,
+              blobGridSize: 16,
+              blobFlags: 1,
+              blobTrailLength: 0.35,
+              blobMinSize: 0.5,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.52, 0.55);
+            const contourRgb = snapshotPixelRgb(snapshot, pixels, 0.52, 0.55);
+            expect(rgbDistance(sourceRgb, contourRgb)).toBeGreaterThan(0.008);
+          },
+        },
+        {
+          id: 'blob-heatmap',
+          graph: buildNativeEffectPassGraph({
+            sourceId,
+            targetSourceId: 'native-effect-pass-fixture-blob-heatmap',
+            effect: 'blob-heatmap',
+            width: 160,
+            height: 90,
+            time: 0.35,
+            frameDelta: 1 / 30,
+            frameIndex: 36,
+            params: {
+              blobMix: 0.9,
+              blobThreshold: 0.1,
+              blobShape: 0,
+              blobColor: 0,
+              blobThickness: 1,
+              blobGridSize: 16,
+              blobFlags: 6,
+            },
+          }),
+          assert(snapshot: Record<string, unknown>, pixels: Uint8Array) {
+            const sourceRgb = snapshotPixelRgb(sourceSnapshot, sourcePixels, 0.42, 0.58);
+            const heatRgb = snapshotPixelRgb(snapshot, pixels, 0.42, 0.58);
+            expect(rgbDistance(sourceRgb, heatRgb)).toBeGreaterThan(0.02);
+          },
+        },
+      ];
+
+      for (const [fixtureIndex, fixture] of fixtures.entries()) {
+        await rpc.send('submit_commands', {
+          commands: [
+            {
+              type: 'upload_source_frame',
+              source_id: sourceId,
+              width: 32,
+              height: 32,
+              rgba_b64: Buffer.from(sourceBytes).toString('base64'),
+              seq: 100 + fixtureIndex,
+            },
+          ],
+        }, 5000);
+        const graphResult = await rpc.send('compute_graph', fixture.graph.config, 8000);
+        expect(graphResult?.render).toMatchObject({
+          target: 'source_frame',
+          source_id: `native-effect-pass-fixture-${fixture.id}`,
+        });
+        await rpc.send('submit_commands', {
+          commands: [
+            {
+              type: 'bind_media_source',
+              layer_id: layerId,
+              source_id: `native-effect-pass-fixture-${fixture.id}`,
+              uri: `native-effect-pass-fixture://${fixture.id}`,
+              source_type: 'image',
+            },
+          ],
+        }, 5000);
+        const snapshot = await rpc.send('frame_snapshot', {
+          include_pixels: true,
+          time: 0.2,
+          frame_index: 10,
+        }, 8000);
+        if (!(fixture as any).allowDarkFrame) {
+          assertVisibleSnapshot(`effect fixture ${fixture.id}`, snapshot);
+        }
+        expect(snapshot.checksum).not.toBe(sourceSnapshot.checksum);
+        fixture.assert(snapshot, snapshotPixels(snapshot));
+      }
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+
+  itIfNativeCore.each([2, 12, 16])('renders an ordered %i-pass native effect chain in one compute graph', async (passCount) => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', {
+        config: {
+          backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+          width: 160,
+          height: 90,
+          target_fps: 30,
+        },
+      }, 12000);
+      await delay(80);
+
+      const capabilities = await rpc.send('capabilities', {}, 5000);
+      expect(capabilities?.features?.compute_graph_render).toBe(true);
+      expect(capabilities?.features?.compute_graph_source_frame_target).toBe(true);
+      const precompileSummary = await rpc.send('submit_commands', {
+        commands: buildNativeEffectPassPrecompileCommands(),
+      }, 5000);
+      expect(Number(precompileSummary?.dropped ?? 0)).toBe(0);
+
+      const sourceId = 'native-effect-pass-chain-source';
+      const targetSourceId = 'native-effect-pass-chain-output';
+      const layerId = 'native-effect-pass-chain-layer';
+      const sourceBytes = makeSourceBytes(32, 32);
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'upload_source_frame',
+            source_id: sourceId,
+            width: 32,
+            height: 32,
+            rgba_b64: Buffer.from(sourceBytes).toString('base64'),
+            seq: 1,
+          },
+          {
+            type: 'upsert_layer',
+            layer_id: layerId,
+            z_index: 0,
+            blend_mode: 'normal',
+            opacity: 1,
+            corners: FULLSCREEN_CORNERS,
+          },
+          { type: 'set_layer_visibility', layer_id: layerId, visible: true },
+          {
+            type: 'bind_media_source',
+            layer_id: layerId,
+            source_id: sourceId,
+            uri: 'native-effect-pass-chain-test://source',
+            source_type: 'image',
+          },
+        ],
+      }, 5000);
+
+      const sourceSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: false,
+        time: 0,
+        frame_index: 1,
+      }, 8000);
+      assertVisibleSnapshot('effect pass chain source layer', sourceSnapshot);
+
+      const graph = buildNativeEffectPassChainGraph({
+        sourceId,
+        targetSourceId,
+        intermediatePrefix: 'native-effect-pass-chain-step',
+        effects: [
+          {
+            effect: 'vignette',
+            amount: 0.72,
+            params: {
+              softness: 0.22,
+              roundness: 0.9,
+              shape: 3,
+              aspect: 1.25,
+              centerX: 0.45,
+              centerY: 0.58,
+              tintAmount: 0.2,
+              breathing: 0,
+            },
+          },
+          {
+            effect: 'pixelate',
+            amount: 8,
+            params: {
+              mode: 1,
+              gridLines: 0.2,
+              animSpeed: 0,
+              animAmount: 0,
+            },
+          },
+          // Pairs of inversion passes preserve the expected picture while
+          // exercising the full chain and intermediate-texture reuse.
+          ...Array.from({ length: passCount - 2 }, () => ({ effect: 'invert' as const, amount: 1 })),
+        ],
+        width: 160,
+        height: 90,
+        time: 0.4,
+        frameDelta: 1 / 30,
+        frameIndex: 4,
+        seq: 40,
+      });
+      const graphResult = await rpc.send('compute_graph', graph.config, 8000);
+      expect(graphResult?.renders).toHaveLength(passCount);
+      expect(graphResult?.renders?.[0]).toMatchObject({
+        target: 'source_frame',
+        source_id: 'native-effect-pass-chain-step:step:0',
+      });
+      expect(graphResult?.renders?.[passCount - 1]).toMatchObject({
+        target: 'source_frame',
+        source_id: targetSourceId,
+      });
+
+      await rpc.send('submit_commands', {
+        commands: [
+          {
+            type: 'bind_media_source',
+            layer_id: layerId,
+            source_id: targetSourceId,
+            uri: 'native-effect-pass-chain-test://output',
+            source_type: 'image',
+          },
+        ],
+      }, 5000);
+      const effectSnapshot = await rpc.send('frame_snapshot', {
+        include_pixels: true,
+        time: 0.4,
+        frame_index: 4,
+      }, 8000);
+      assertVisibleSnapshot('effect pass chain output layer', effectSnapshot);
+      expect(effectSnapshot.checksum).not.toBe(sourceSnapshot.checksum);
+      const pixels = snapshotPixels(effectSnapshot);
+      const centerLuma = snapshotPixelLuma(effectSnapshot, pixels, 0.5, 0.5);
+      const cornerLuma = snapshotPixelLuma(effectSnapshot, pixels, 0.04, 0.04);
+      expect(centerLuma).toBeGreaterThan(cornerLuma + 0.04);
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+  itIfNativeCore('keeps effect output current when its media input changes', async () => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', {
+        config: {
+          backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+          width: 160,
+          height: 90,
+          target_fps: 30,
+        },
+      }, 12000);
+      await rpc.send('submit_commands', { commands: buildNativeEffectPassPrecompileCommands() });
+      const layerId = 'swapping-effect-media';
+      const outputId = `effect-pass:${layerId}`;
+      const first = makeSourceBytes(32, 32);
+      const second = Uint8Array.from(first, (_, index) => index % 4 === 3 ? 255 : 255 - first[index]);
+      await rpc.send('submit_commands', { commands: [
+        { type: 'upload_source_frame', source_id: 'first-media', width: 32, height: 32, rgba_b64: Buffer.from(first).toString('base64'), seq: 1 },
+        { type: 'upload_source_frame', source_id: 'second-media', width: 32, height: 32, rgba_b64: Buffer.from(second).toString('base64'), seq: 1 },
+        { type: 'upsert_layer', layer_id: layerId, z_index: 0, blend_mode: 'normal', opacity: 1, corners: FULLSCREEN_CORNERS },
+        { type: 'set_layer_visibility', layer_id: layerId, visible: true },
+        { type: 'bind_media_source', layer_id: layerId, source_id: 'first-media', uri: 'test://first', source_type: 'image' },
+      ] });
+      const raw = await rpc.send('frame_snapshot', { include_pixels: false, frame_index: 1 });
+      assertVisibleSnapshot('raw media before effect', raw);
+      const submitEffect = async (inputId: string, frameIndex: number) => {
+        const graph = buildNativeEffectPassGraph({ sourceId: inputId, targetSourceId: outputId,
+          effect: 'invert', width: 160, height: 90, time: frameIndex / 30,
+          frameDelta: 1 / 30, frameIndex, amount: 1, mix: 1 });
+        return rpc.send('submit_commands', { commands: [
+          { type: 'bind_media_source', layer_id: layerId, source_id: outputId,
+            uri: `native-effect-pass://${layerId}`, source_type: 'image', effect_input_source_id: inputId },
+          { type: 'queue_compute_graph', ...graph.config },
+          { type: 'present' },
+        ] });
+      };
+      const firstResult = await submitEffect('first-media', 2);
+      expect(firstResult.dropped).toBe(0);
+      const warming = await rpc.send('frame_snapshot', { include_pixels: false, frame_index: 2 });
+      assertVisibleSnapshot('raw input while effect pipeline warms', warming);
+      await delay(200);
+      const firstEffect = await rpc.send('frame_snapshot', { include_pixels: false, frame_index: 2 });
+      assertVisibleSnapshot('first effect input', firstEffect);
+      expect(firstEffect.checksum).not.toBe(raw.checksum);
+
+      const secondResult = await submitEffect('second-media', 3);
+      expect(secondResult.dropped).toBe(0);
+      const switching = await rpc.send('frame_snapshot', { include_pixels: false, frame_index: 3 });
+      assertVisibleSnapshot('replacement input while effect updates', switching);
+      expect(switching.checksum).not.toBe(firstEffect.checksum);
+      await delay(200);
+      const secondEffect = await rpc.send('frame_snapshot', { include_pixels: false, frame_index: 3 });
+      assertVisibleSnapshot('replacement effect input', secondEffect);
+      expect(secondEffect.checksum).not.toBe(firstEffect.checksum);
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+
+  itIfNativeCore('keeps a shader visible while its effect and shader replacement render', async () => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', { config: {
+        backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+        width: 160, height: 90, target_fps: 30,
+      } }, 12000);
+      const layerId = 'shader-effect-handoff';
+      const shader = (id: string, color: string) => ({ type: 'precompile_shader', shader_id: id,
+        stage: 'pixel', entry: 'main',
+        source: `/*{"ISFVSN":"2","INPUTS":[]}*/ void main() { gl_FragColor = vec4(${color}, 1.0); }` });
+      await rpc.send('submit_commands', { commands: [
+        ...buildNativeEffectPassPrecompileCommands(),
+        shader('first-shader', '0.2, 0.6, 0.8'),
+        { type: 'upsert_layer', layer_id: layerId, z_index: 0, blend_mode: 'normal', opacity: 1, corners: FULLSCREEN_CORNERS },
+        { type: 'set_layer_visibility', layer_id: layerId, visible: true },
+        { type: 'bind_isf_shader', layer_id: layerId, shader_id: 'first-shader' },
+        { type: 'render_isf_to_layer', layer_id: layerId },
+      ] });
+      await delay(150);
+      const raw = await rpc.send('frame_snapshot', { include_pixels: false });
+      assertVisibleSnapshot('raw shader before effect', raw);
+      const graph = (frameIndex: number) => buildNativeEffectPassGraph({
+        sourceId: `shader-frame:${layerId}`, targetSourceId: `effect-pass:${layerId}`,
+        effect: 'invert', width: 160, height: 90, time: frameIndex / 30,
+        frameDelta: 1 / 30, frameIndex, amount: 1, mix: 1,
+      });
+      await rpc.send('submit_commands', { commands: [
+        { type: 'bind_media_source', layer_id: layerId, source_id: `effect-pass:${layerId}`,
+          uri: `native-effect-pass://${layerId}`, source_type: 'image', effect_input_source_id: 'first-shader' },
+        { type: 'queue_compute_graph', ...graph(2).config },
+      ] });
+      const warming = await rpc.send('frame_snapshot', { include_pixels: false });
+      assertVisibleSnapshot('shader while effect warms', warming);
+      await delay(200);
+      const firstEffect = await rpc.send('frame_snapshot', { include_pixels: false });
+      assertVisibleSnapshot('shader with effect', firstEffect);
+      expect(firstEffect.checksum).not.toBe(raw.checksum);
+      await rpc.send('submit_commands', { commands: [
+        shader('second-shader', '0.9, 0.1, 0.2'),
+        { type: 'bind_media_source', layer_id: layerId, source_id: `effect-pass:${layerId}`,
+          uri: `native-effect-pass://${layerId}`, source_type: 'image', effect_input_source_id: 'second-shader' },
+        { type: 'bind_isf_shader', layer_id: layerId, shader_id: 'second-shader' },
+        { type: 'render_isf_to_layer', layer_id: layerId },
+        { type: 'queue_compute_graph', ...graph(3).config },
+      ] });
+      await delay(200);
+      const switched = await rpc.send('frame_snapshot', { include_pixels: false });
+      assertVisibleSnapshot('replacement shader with effect', switched);
+      expect(switched.checksum).not.toBe(firstEffect.checksum);
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+
+  itIfNativeCore('releases queued effect frames when repeatedly replacing recorded loops', async () => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', { config: {
+        backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+        width: 160, height: 90, target_fps: 30,
+      } }, 12000);
+      await rpc.send('submit_commands', { commands: buildNativeEffectPassPrecompileCommands() });
+      const bytes = Buffer.from(makeSourceBytes(32, 32)).toString('base64');
+      for (let index = 0; index < 55; index += 1) {
+        const layerId = `recorded-loop-${index}`;
+        const inputId = `recorded-input-${index}`;
+        const outputId = `effect-pass:${layerId}`;
+        const graph = buildNativeEffectPassGraph({ sourceId: inputId, targetSourceId: outputId,
+          effect: 'invert', width: 160, height: 90, time: index / 30,
+          frameDelta: 1 / 30, frameIndex: index + 1, amount: 1, mix: 1 });
+        const result = await rpc.send('submit_commands', { commands: [
+          { type: 'upload_source_frame', source_id: inputId, width: 32, height: 32, rgba_b64: bytes, seq: 1 },
+          { type: 'upsert_layer', layer_id: layerId, z_index: 0, blend_mode: 'normal', opacity: 1, corners: FULLSCREEN_CORNERS },
+          { type: 'set_layer_visibility', layer_id: layerId, visible: true },
+          { type: 'bind_media_source', layer_id: layerId, source_id: inputId, uri: `recorded-loop://${index}`, source_type: 'image' },
+          { type: 'bind_media_source', layer_id: layerId, source_id: outputId,
+            uri: `native-effect-pass://${layerId}`, source_type: 'image', effect_input_source_id: inputId },
+          { type: 'queue_compute_graph', ...graph.config },
+          { type: 'remove_layer', layer_id: layerId },
+        ] });
+        expect(result.dropped, `loop ${index}: ${JSON.stringify(result.errors)}`).toBe(0);
+      }
+      const status = await rpc.send('status');
+      expect(Number(status.source_frames_active)).toBeLessThanOrEqual(2);
+      expect(Number(status.scene_layers_active)).toBe(0);
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+
+  itIfNativeCore('releases replaced GPU shader frames during a long editing session', async () => {
+    const rpc = createNativeRpc();
+    try {
+      await rpc.send('start', { config: {
+        backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+        width: 160, height: 90, target_fps: 30,
+      } }, 12000);
+      await rpc.send('submit_commands', { commands: [
+        ...buildPlanetNativePrecompileCommands(),
+        { type: 'upsert_layer', layer_id: 'shader-cycle', z_index: 0,
+          blend_mode: 'normal', opacity: 1, corners: FULLSCREEN_CORNERS },
+        { type: 'set_layer_visibility', layer_id: 'shader-cycle', visible: true },
+      ] });
+      for (let index = 0; index < 8; index += 1) {
+        const sourceId = `gpu:shader-cycle:planet-${index}`;
+        await rpc.send('submit_commands', { commands: [
+          { type: 'set_native_graph_layer', layer_id: 'shader-cycle', kind: 'planet',
+            instrument_source_id: sourceId, composite_source_id: sourceId, params: {} },
+        ] });
+        await delay(70);
+        await rpc.send('frame_snapshot', { include_pixels: false, frame_index: index + 1 });
+      }
+      const status = await rpc.send('status');
+      expect(Number(status.source_frames_active)).toBeLessThanOrEqual(3);
+      const finalFrame = await rpc.send('frame_snapshot', { include_pixels: false, frame_index: 9 });
+      assertVisibleSnapshot('shader after repeated replacements', finalFrame);
+    } finally {
+      await rpc.close();
+    }
+  }, 30000);
+});
+
+
+describe('internal effect mix respects master opacity', () => {
+  it.each([
+    ['phase-lab', 'phaseLabMix'], ['diffusion-promist', 'diffMix'],
+    ['tape-dropout', 'tapeDropoutMix'], ['droste-recursive', 'drosteMix'],
+    ['topo-warp', 'twMix'], ['thermal-contour', 'tcMix'],
+  ] as const)('%s multiplies its wet mix by master opacity', (effect, parameter) => {
+    for (const opacity of [0, 0.25, 1]) {
+      const values = packNativeEffectPassUniforms({
+        sourceId: 'source', targetSourceId: 'target', effect,
+        mix: opacity, params: { [parameter]: 0.8 },
+      });
+      expect(values[6]).toBeCloseTo(0.8 * opacity);
+    }
+  });
+});

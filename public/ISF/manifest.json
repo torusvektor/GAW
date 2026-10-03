@@ -7,7 +7,9 @@
       "category": "Visual",
       "tags": [],
       "defaults": {},
-      "featured": false
+      "featured": false,
+      "defaultLoad": true,
+      "enabled": true
     },
     {
       "file": "DM-TestPattern.fs",
@@ -16,7 +18,8 @@
       "tags": [],
       "defaults": {},
       "featured": false,
-      "defaultLoad": true
+      "defaultLoad": true,
+      "enabled": true
     },
     {
       "file": "DM-GridMatrix.fs",
@@ -28,7 +31,8 @@
         "lineWidth": 0.09455
       },
       "featured": false,
-      "defaultLoad": true
+      "defaultLoad": true,
+      "enabled": true
     },
     {
       "file": "DM-TestBars.fs",
@@ -37,7 +41,8 @@
       "tags": [],
       "defaults": {},
       "featured": false,
-      "defaultLoad": true
+      "defaultLoad": true,
+      "enabled": true
     },
     {
       "file": "DM-UVGrid.fs",
@@ -46,7 +51,8 @@
       "tags": [],
       "defaults": {},
       "featured": false,
-      "defaultLoad": true
+      "defaultLoad": true,
+      "enabled": true
     },
     {
       "file": "DM-SafeArea.fs",
@@ -57,7 +63,171 @@
         "lineWidth": 0.005205
       },
       "featured": false,
-      "defaultLoad": true
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-MinimalSurface.fs",
+      "tier": "demo",
+      "category": "3D Room",
+      "tags": [
+        "tpms",
+        "gyroid",
+        "lattice",
+        "tunnel",
+        "raymarch",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-QuaternionJulia.fs",
+      "tier": "demo",
+      "category": "Generator",
+      "tags": [
+        "quaternion",
+        "julia",
+        "fractal",
+        "4d",
+        "raymarch",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-Quasicrystal.fs",
+      "tier": "demo",
+      "category": "Generator",
+      "tags": [
+        "quasicrystal",
+        "aperiodic",
+        "interference",
+        "duotone",
+        "print",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-HopfFibration.fs",
+      "tier": "demo",
+      "category": "Generator",
+      "tags": [
+        "hopf",
+        "fibration",
+        "4d",
+        "volumetric",
+        "topology",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-Apollonian.fs",
+      "tier": "demo",
+      "category": "3D Room",
+      "tags": [
+        "apollonian",
+        "packing",
+        "thin-film",
+        "iridescent",
+        "raymarch",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-SphericalHarmonics.fs",
+      "tier": "demo",
+      "category": "Generator",
+      "tags": [
+        "spherical-harmonics",
+        "orbital",
+        "lobes",
+        "complementary",
+        "raymarch",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-DeepDescent.fs",
+      "tier": "demo",
+      "category": "3D Room",
+      "tags": [
+        "glass",
+        "translucent",
+        "caustics",
+        "godrays",
+        "organic",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-DriftVeil.fs",
+      "tier": "demo",
+      "category": "3D Room",
+      "tags": [
+        "veil",
+        "membrane",
+        "translucent",
+        "underwater",
+        "godrays",
+        "audio",
+        "ga2-pack",
+        "deep-descent"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "GA2-Cathedral.fs",
+      "tier": "demo",
+      "category": "3D Room",
+      "tags": [
+        "menger",
+        "lattice",
+        "volumetric",
+        "godrays",
+        "architecture",
+        "audio",
+        "ga2-pack"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
     },
     {
       "file": "crystal-dimension.fs",
@@ -4152,6 +4322,21 @@
         "audio",
         "live-pack",
         "headliner"
+      ],
+      "defaults": {},
+      "featured": true,
+      "defaultLoad": true,
+      "enabled": true
+    },
+    {
+      "file": "Quotron.fs",
+      "tier": "demo",
+      "category": "Generator",
+      "tags": [
+        "terminal",
+        "ascii",
+        "generative",
+        "retro"
       ],
       "defaults": {},
       "featured": true,

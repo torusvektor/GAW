@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
+  import { WORLD_PALETTES, worldPaletteIndex } from '../performer/worldPalettes';
   import {
     synthVisionStore,
     sessionClipCache,
     isfShaderCache,
     SV_SHADERS, SV_STYLES, SV_SPACES, SV_WORLDS,
-    SV_ALL_CLIPS, SV_CLIP_ROW1, SV_CLIP_ROW2, SV_CLIP_ROW3, SV_CLIP_ROW4,
+    SV_CLIP_ROW1, SV_CLIP_ROW2, SV_CLIP_ROW3, SV_CLIP_ROW4,
     SV_PARAMS, SV_SPACE_FX, SV_CAM_MODES, SV_CAM_BLENDS,
     SV_SHADER_DEFS, SV_WORLD_DEFS,
     SV_REACTIVITY_MODES,
@@ -20,8 +21,10 @@
     geoDeckStore,
   } from '../stores/geoDeck';
   import { evaluateGeoDeck, type GeoEngineRuntime } from '../geo/engine';
-  import { vjClipLauncher, type VJClip } from '../stores/vjClipLauncher';
+  import { vjClipLauncher, type VJClip, type VJDeck } from '../stores/vjClipLauncher';
+  import { get } from 'svelte/store';
   import { mediaLibrary, type MediaItem } from '../stores/media';
+  import { resolveAssetTreeInPlace, resolveAssetRefForRuntime } from '../storage/assetRegistry';
   import { project, svKeyboardPresets } from '../stores/layers';
   import { globalSVKeyboardPresets } from '../stores/globalPresets';
   import { parseISF, getInputDefault, type ISFInput } from '../isf/parser';
@@ -43,9 +46,24 @@
   import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
   import AudioInputPicker from './AudioInputPicker.svelte';
   import { showLoading, hideLoading } from '../stores/loading';
+  import {
+    performerClipIndexForCode,
+    resolvePerformerKeyboardAction,
+  } from '../keyboard/performerKeyboard';
+  import {
+    createNativePerformerShaderClip,
+    performerAssignmentDeck,
+    performerTargetDeck,
+  } from '../performer/nativeClip';
+  import { nativePerformerWorldOverlays } from '../stores/nativePerformerWorld';
+  import { NATIVE_ENGINE_ONLY } from '../stores/settings';
 
   export let onClose: () => void = () => {};
   export let visible: boolean = true;
+  /** Deck layer index whose cell hosts the Performer clip. Performer is
+   *  dragged into the grid like any other plugin, so the layer is decided by
+   *  where it was dropped rather than picked inside this panel. */
+  export let hostLayer: number = 0;
 
   // Save clips to session cache and close — clips persist across VJ mode toggles
   function handleClose() {
@@ -60,6 +78,7 @@
   let clipAssignments: Record<number, ClipAssignment> = {};
   let clipsDirty = false; // true when assignments changed since last save/load
   let performerEditMode = false;
+  let pressedClipPosition: number | null = null;
   let shaderMixActive = true; // Start with shader mix active by default
   let dragOverClipSlot: number | null = null;
   let editMediaTab: 'fx' | 'vid' | 'img' = 'fx';
@@ -89,12 +108,23 @@
   let activeISFName: string = '';
   let activeISFShaderCode: string = ''; // track to avoid re-parsing
 
+  function activePerformerDeck(): VJDeck {
+    return performerTargetDeck($vjClipLauncher);
+  }
+
+  function activePerformerLayerState() {
+    return activePerformerDeck() === 'B'
+      ? $vjClipLauncher.bankBLayerStates[assignedVJLayer]
+      : $vjClipLauncher.layerStates[assignedVJLayer];
+  }
+
   // ─── Layer Effects System ─────────────────────────
   let showEffectPicker = false;
   let expandedEffectId: string | null = null;
 
   // ─── 3D Worlds Toggle ─────────────────────────
   let worldsEnabled = true;
+  let lastNativeWorldDeck: VJDeck | null = null;
 
   // ─── ISF Inside SynthVision Pipeline ─────────────────────────
   // When ISF shaders are triggered from performer keys, they render INSIDE SynthVision
@@ -110,8 +140,49 @@
   let isfShaderCode_internal: string = ''; // track to avoid re-creating ISF instance
   let isfAssignment: ClipAssignment | null = null;
 
+  // The active clip, read through the store *textually* so Svelte tracks it.
+  // Previously the reactive block below only called activePerformerLayerState(),
+  // whose store access is hidden inside the function body — so it never re-ran
+  // when Performer launched a new clip, and the SHADER tab kept showing the
+  // built-in shader's dials instead of the clip's own params.
+  $: performerActiveClip = performerTargetDeck($vjClipLauncher) === 'B'
+    ? $vjClipLauncher.bankBLayerStates[assignedVJLayer]?.activeClip
+    : $vjClipLauncher.layerStates[assignedVJLayer]?.activeClip;
+
+  /** True while the layer's active clip is Performer's own cell or a clip
+   *  Performer launched. Firing any other clip on that row hands the layer
+   *  back to the deck. */
+  $: performerOwnsLayer = performerActiveClip?.type === 'synthvision'
+    || !!(performerActiveClip as any)?._performerOwned;
+
+  /** Last clip Performer put on air, replayed when its cell is fired again so
+   *  reopening the panel resumes instead of coming back empty. */
+  let lastLaunchedClip: VJClip | null = null;
+  let wasVisible = false;
+  $: if (visible !== wasVisible) {
+    wasVisible = visible;
+    if (visible) resumePerformerOutput();
+  }
+
+  /** Put Performer back on air with the clip it was last running. Firing the
+   *  Performer cell replaces the layer's active clip with the (contentless)
+   *  Performer clip, which is why reopening used to come back blank. */
+  function resumePerformerOutput() {
+    if (lastLaunchedClip) {
+      // Fresh id so the core treats it as a new launch and restarts cleanly.
+      vjClipLauncher.launchTransientClip(
+        assignedVJLayer,
+        { ...lastLaunchedClip, id: `performer-resume-${generateUUID()}` },
+        activePerformerDeck(),
+      );
+    }
+    publishNativeWorldOverlay();
+  }
+
   // Reactive: parse ISF inputs from active ISF shader (inside SV or VJ clip)
   $: {
+    // Referenced so this block re-runs whenever Performer swaps clips.
+    performerActiveClip;
     if (isfActive && isfShaderInstance) {
       // ISF is rendering inside SynthVision pipeline
       const inputs = isfShaderInstance.metadata?.INPUTS || [];
@@ -123,8 +194,7 @@
       activeISFShaderCode = isfShaderCode_internal;
     } else {
       // Fallback: check VJ clip launcher for ISF clips
-      const vjState = $vjClipLauncher;
-      const clip = vjState.layerStates[assignedVJLayer]?.activeClip;
+      const clip = performerActiveClip;
       if (clip?.type === 'shader' && clip.shaderCode && clip.shaderCode !== activeISFShaderCode) {
         try {
           const parsed = parseISF(clip.shaderCode);
@@ -146,17 +216,24 @@
     }
   }
 
-  // Get current value for an ISF input
-  function getISFValue(input: ISFInput): number | boolean | number[] {
+  /** Live shader values of the clip Performer is driving. Referenced directly
+   *  in the template so Svelte re-renders the controls when they change. */
+  $: performerShaderValues = (performerActiveClip?.shaderValues ?? {}) as Record<string, any>;
+
+  // Get current value for an ISF input. `values` is passed in rather than read
+  // from the store here: a store read inside a function body is invisible to
+  // Svelte's dependency tracking, so the readouts never updated when a slider
+  // (or a Tab scramble) wrote a new value.
+  function getISFValue(
+    input: ISFInput,
+    values: Record<string, any> = performerShaderValues,
+  ): number | boolean | number[] {
     if (isfActive && isfShaderInstance) {
       // Read directly from ISF shader instance uniforms
       const u = isfShaderInstance.uniforms[input.NAME];
       if (u !== undefined && u.value !== undefined) return u.value as number | boolean | number[];
-    } else {
-      const clip = $vjClipLauncher.layerStates[assignedVJLayer]?.activeClip;
-      if (clip?.shaderValues && input.NAME in clip.shaderValues) {
-        return clip.shaderValues[input.NAME];
-      }
+    } else if (values && input.NAME in values) {
+      return values[input.NAME];
     }
     return getInputDefault(input);
   }
@@ -171,13 +248,28 @@
         setBaseValue(assignedVJLayer, inputName, value);
       }
     } else {
-      vjClipLauncher.updateActiveClipShaderValue(assignedVJLayer, inputName, value);
+      vjClipLauncher.updateActiveClipShaderValue(assignedVJLayer, inputName, value, activePerformerDeck());
     }
   }
 
-  // ─── Layer Effects Management ─────────────────────────
-  // Reactive: current layer effects on the SynthVision VJ layer
-  $: svLayerEffects = $vjClipLauncher.layerStates[assignedVJLayer]?.effects ?? [];
+  // ─── Performer Effects Management ─────────────────────────
+  // Performer owns this chain (synthVisionStore.performerEffects). It cannot
+  // live on the VJ layer — that row is shared with grid clips — nor on the
+  // active clip, because Performer swaps its transient clip every time a new
+  // shader/world/media is launched, which orphaned the chain. Instead the
+  // list is stamped onto whichever clip Performer currently drives, so it
+  // renders through the normal clip.effects path.
+  $: svLayerEffects = $synthVisionStore.performerEffects;
+
+  /** Push the Performer chain onto the clip it is currently driving. */
+  function syncPerformerEffectsToClip() {
+    const effects = get(synthVisionStore).performerEffects;
+    vjClipLauncher.setActiveClipEffects(assignedVJLayer, effects, activePerformerDeck());
+  }
+  // Re-stamp whenever the chain changes or Performer moves to another clip.
+  $: if ($synthVisionStore.performerEffects || activePerformerLayerState()?.activeClip?.id) {
+    syncPerformerEffectsToClip();
+  }
 
   function handleEffectPickerAdd(types: EffectType[]) {
     for (const type of types) {
@@ -187,22 +279,26 @@
         enabled: true,
         params: getRendererDefaultEffectParams(type),
       };
-      vjClipLauncher.addLayerEffect(assignedVJLayer, newEffect);
+      synthVisionStore.addPerformerEffect(newEffect);
     }
     showEffectPicker = false;
+    syncPerformerEffectsToClip();
   }
 
   function toggleSvEffect(effectId: string) {
-    vjClipLauncher.toggleLayerEffect(assignedVJLayer, effectId);
+    synthVisionStore.togglePerformerEffect(effectId);
+    syncPerformerEffectsToClip();
   }
 
   function deleteSvEffect(effectId: string) {
-    vjClipLauncher.removeLayerEffect(assignedVJLayer, effectId);
+    synthVisionStore.removePerformerEffect(effectId);
     expandedEffectId = null;
+    syncPerformerEffectsToClip();
   }
 
   function updateSvEffectParam(effectId: string, paramName: string, value: number | boolean) {
-    vjClipLauncher.updateLayerEffectParams(assignedVJLayer, effectId, { [paramName]: value });
+    synthVisionStore.updatePerformerEffectParams(effectId, { [paramName]: value });
+    syncPerformerEffectsToClip();
   }
 
   // Shader param modulation — thin wrapper for getter, shared setters from modulation.ts
@@ -232,9 +328,9 @@
   let shaderCanvas: HTMLCanvasElement;
   let threeCanvas: HTMLCanvasElement;
 
-  // VJ Layer assignment
+  // VJ layer assignment — follows the clip's host layer.
   let assignedVJLayer: number = 0; // 0-3 for layers 1-4
-  let svClipId = `synthvision-${Date.now()}`;
+  $: assignedVJLayer = hostLayer;
 
   // WebGL2 context for 2D shaders
   let gl: WebGL2RenderingContext | null = null;
@@ -282,6 +378,7 @@
   // Reactive state
   let state: SVState;
   const unsub = synthVisionStore.subscribe(s => { state = s; });
+  $: synthVisionStore.setKeyboardActive(visible);
 
   // Camera stream for live cam layer
   let camVideo: HTMLVideoElement;
@@ -2145,6 +2242,11 @@ void main() {
   function getBlend(): THREE.Blending { return BLEND_MAP[activeLayer().blend] || THREE.AdditiveBlending; }
 
   function sCol(u: number): THREE.Color {
+    const scheme = worldPaletteIndex(state.worldParams[activeLayer().world]?.palette ?? 0);
+    if (scheme > 0) {
+      const colors = WORLD_PALETTES[scheme].colors;
+      return new THREE.Color(colors[0]).lerp(new THREE.Color(colors[1]), 0.5 + 0.5 * Math.sin(u * 6.2831853));
+    }
     const c = activeLayer().p.color;
     const s = activeLayer().style;
     const col = new THREE.Color();
@@ -3467,7 +3569,7 @@ void main() {
           setISFInputValue(isfShaderInstance, 'effectStyle', newStyle);
         }
         // Still cycle world for 3D variety
-        synthVisionStore.cycleWorld(1);
+        cycleNativeWorld(1);
       } else {
         synthVisionStore.doRandom();
       }
@@ -3501,7 +3603,7 @@ void main() {
     }
 
     // Update 3D world (skip if worlds disabled)
-    if (worldsEnabled) {
+    if (worldsEnabled && !NATIVE_ENGINE_ONLY) {
       updateWorld(dt);
       updateCamera(dt);
     }
@@ -3591,7 +3693,7 @@ void main() {
     // Render Three.js (skip if worlds disabled). Goes through the
     // post chain (bloom + ACES tone map) when composer is up;
     // falls back to direct render if anything in initThree failed.
-    if (worldsEnabled && renderer && scene && camera) {
+    if (worldsEnabled && !NATIVE_ENGINE_ONLY && renderer && scene && camera) {
       if (composer) {
         composer.render();
       } else {
@@ -3647,7 +3749,7 @@ void main() {
       compCtx.globalCompositeOperation = 'source-over';
       compCtx.drawImage(shaderCanvas, 0, 0, outputCanvas.width, outputCanvas.height);
       // Use additive blending for 3D layer (skip if worlds disabled)
-      if (worldsEnabled) {
+      if (worldsEnabled && !NATIVE_ENGINE_ONLY) {
         compCtx.globalCompositeOperation = 'lighter';
         compCtx.drawImage(threeCanvas, 0, 0, outputCanvas.width, outputCanvas.height);
         compCtx.globalCompositeOperation = 'source-over';
@@ -3752,6 +3854,72 @@ void main() {
     activeISFShaderCode = '';
   }
 
+  function publishNativeWorldOverlay(deck: VJDeck = activePerformerDeck()) {
+    // Performer only paints its layer while it owns the active clip there.
+    // Without this the world overlay kept rendering after the operator fired
+    // an ordinary clip on the same row, so Performer stayed on screen.
+    if (!NATIVE_ENGINE_ONLY || !worldsEnabled || !state || !performerOwnsLayer) {
+      nativePerformerWorldOverlays.clearAll();
+      lastNativeWorldDeck = null;
+      return;
+    }
+
+    if (lastNativeWorldDeck && lastNativeWorldDeck !== deck) {
+      nativePerformerWorldOverlays.clear(lastNativeWorldDeck);
+    }
+    lastNativeWorldDeck = deck;
+
+    const layerState = state.layers[state.focus];
+    const worldIndex = layerState?.world ?? 0;
+    const worldDefinition = SV_WORLD_DEFS[worldIndex];
+    const worldValues = state.worldParams[worldIndex] ?? {};
+    nativePerformerWorldOverlays.setOverlay({
+      deck,
+      layerIndex: assignedVJLayer,
+      enabled: true,
+      worldIndex,
+      spaceIndex: layerState?.space ?? 0,
+      x: Math.max(0, Math.min(1, state.mx ?? 0.5)),
+      y: Math.max(0, Math.min(1, state.my ?? 0.5)),
+      pointerDown: !!state.mDown,
+      params: [...(worldDefinition?.params ?? []).map((param) =>
+        Number(worldValues[param.k] ?? param.d),
+      ), Number(worldValues.palette ?? 0)],
+      pump: Math.max(0, Number(state.pump ?? 0)),
+    });
+  }
+
+  function activateNativeWorld(worldIndex: number) {
+    synthVisionStore.setWorld(worldIndex);
+    publishNativeWorldOverlay();
+  }
+
+  function cycleNativeWorld(delta: number) {
+    const current = state.layers[state.focus].world;
+    const next = ((current + delta) % SV_WORLDS.length + SV_WORLDS.length) % SV_WORLDS.length;
+    activateNativeWorld(next);
+  }
+
+  function toggleNativeWorlds() {
+    worldsEnabled = !worldsEnabled;
+    if (worldsEnabled) {
+      publishNativeWorldOverlay();
+      return;
+    }
+    nativePerformerWorldOverlays.clearAll();
+    lastNativeWorldDeck = null;
+  }
+
+  $: {
+    // Referenced so this re-runs the moment another clip takes the layer —
+    // that is what withdraws the overlay. publishNativeWorldOverlay() decides
+    // whether to paint or clear based on the same flag.
+    performerOwnsLayer;
+    if (NATIVE_ENGINE_ONLY && worldsEnabled && state?.worldParams) {
+      publishNativeWorldOverlay();
+    }
+  }
+
   function bridgeSVParamsToISF(mixP: Record<string, number>) {
     if (!isfShaderInstance) return;
     // Map SV globals to ISF uniform names (silently skip if uniform doesn't exist)
@@ -3810,56 +3978,96 @@ void main() {
         };
       }
     }
-    // Force re-creation of ISF instance so any edits to the library's shader
-    // code are always picked up (both for click and keyboard launches).
-    isfShaderCode_internal = '';
-    // Render ISF inside SynthVision pipeline instead of replacing SV on VJ layer
-    activateISFShader(liveAssignment);
+    const clip = createNativePerformerShaderClip(
+      liveAssignment,
+      `performer-shader-${generateUUID()}`,
+    );
+    if (!clip) return;
+
+    // Performer clips use the same native VJ clip contract as the main deck.
+    // A unique launch id guarantees that repeated triggers replace/restart the
+    // active source instead of being treated as a grid-cell re-click.
+    deactivateISF();
+    const deck = performerAssignmentDeck(liveAssignment);
+    lastLaunchedClip = clip;
+    vjClipLauncher.launchTransientClip(assignedVJLayer, clip, deck);
+    publishNativeWorldOverlay(deck);
   }
 
-  // ─── Random All: ISF Params + Layer Effects ─────────────────────────
+  // ─── Random All (Tab) ───────────────────────────────────────────────
+  // Scrambles everything that is audibly/visually "live": the active shader's
+  // params, every effect param on the Performer clip AND on its layer, and
+  // the built-in world/style/space system.
+  function randomEffectPatch(type: EffectType): Record<string, number> {
+    const defs = EFFECT_PARAM_DEFS[type] || [];
+    const patch: Record<string, number> = {};
+    for (const pd of defs) {
+      if (pd.type === 'color' && pd.colorParams) {
+        patch[pd.colorParams.r] = Math.random();
+        patch[pd.colorParams.g] = Math.random();
+        patch[pd.colorParams.b] = Math.random();
+      } else if (pd.type === 'select' && pd.options) {
+        patch[pd.param] = pd.options[Math.floor(Math.random() * pd.options.length)].value;
+      } else {
+        patch[pd.param] = pd.min + Math.random() * (pd.max - pd.min);
+      }
+    }
+    return patch;
+  }
+
+  function randomISFValue(input: ISFInput): number | boolean | number[] | null {
+    switch (input.TYPE) {
+      case 'float': {
+        const min = (input.MIN as number) ?? 0;
+        const max = (input.MAX as number) ?? 1;
+        return min + Math.random() * (max - min);
+      }
+      case 'long':
+        return input.VALUES?.length
+          ? input.VALUES[Math.floor(Math.random() * input.VALUES.length)]
+          : null;
+      case 'bool':
+        return Math.random() < 0.5;
+      case 'color':
+        return [Math.random(), Math.random(), Math.random(), 1];
+      case 'point2D':
+        return [Math.random(), Math.random()];
+      default:
+        return null;
+    }
+  }
+
   function randomizeAll() {
-    // 1. Randomize ISF shader params (if ISF active)
-    if (isfActive && isfShaderInstance) {
-      const inputs = isfShaderInstance.metadata?.INPUTS || [];
-      for (const input of inputs) {
-        if (input.NAME.startsWith('sv')) continue; // skip bridge params
-        if (input.TYPE === 'float') {
-          const min = (input.MIN as number) ?? 0;
-          const max = (input.MAX as number) ?? 1;
-          setISFInputValue(isfShaderInstance, input.NAME, min + Math.random() * (max - min));
-        } else if (input.TYPE === 'long' && input.VALUES) {
-          const idx = Math.floor(Math.random() * input.VALUES.length);
-          setISFInputValue(isfShaderInstance, input.NAME, input.VALUES[idx]);
-        }
-      }
+    const deck = activePerformerDeck();
+
+    // 1. Active shader params. setISFValue routes to the live ISF instance
+    //    when one is running and to the active clip's shaderValues otherwise,
+    //    so this covers the clip actually on screen — the old code only
+    //    touched the standalone ISF instance, which the clip path never uses.
+    for (const input of activeISFInputs) {
+      if (input.NAME.startsWith('sv')) continue; // bridge params stay put
+      const value = randomISFValue(input);
+      if (value !== null) setISFValue(input.NAME, value);
     }
 
-    // 2. Randomize layer effects params
-    const effects = $vjClipLauncher.layerStates[assignedVJLayer]?.effects ?? [];
-    for (const effect of effects) {
-      const defs = EFFECT_PARAM_DEFS[effect.type] || [];
-      const patch: Record<string, number> = {};
-      for (const pd of defs) {
-        if (pd.type === 'color' && pd.colorParams) {
-          // Randomize RGB color components
-          patch[pd.colorParams.r] = Math.random();
-          patch[pd.colorParams.g] = Math.random();
-          patch[pd.colorParams.b] = Math.random();
-        } else if (pd.type === 'select' && pd.options) {
-          // Pick a random option value
-          const opt = pd.options[Math.floor(Math.random() * pd.options.length)];
-          patch[pd.param] = opt.value;
-        } else {
-          patch[pd.param] = pd.min + Math.random() * (pd.max - pd.min);
-        }
-      }
+    // 2. Every effect in play: Performer's own chain plus any layer-level
+    //    effects on the row it is hosted by.
+    for (const effect of get(synthVisionStore).performerEffects) {
+      const patch = randomEffectPatch(effect.type);
       if (Object.keys(patch).length > 0) {
-        vjClipLauncher.updateLayerEffectParams(assignedVJLayer, effect.id, patch);
+        synthVisionStore.updatePerformerEffectParams(effect.id, patch);
+      }
+    }
+    syncPerformerEffectsToClip();
+    const layerEffects = activePerformerLayerState()?.effects ?? [];
+    for (const effect of layerEffects) {
+      const patch = randomEffectPatch(effect.type);
+      if (Object.keys(patch).length > 0) {
+        vjClipLauncher.updateLayerEffectParams(assignedVJLayer, effect.id, patch, deck);
       }
     }
 
-    // 3. Still do world/shader cycling via the store
+    // 3. Worlds / style / space / global params.
     synthVisionStore.doFullRandom();
   }
 
@@ -3896,9 +4104,6 @@ void main() {
     const assignment = clipAssignments[clipPos];
     if (!assignment) { console.log('[SV triggerClip] no assignment at', clipPos); return; }
 
-    // Re-activate SynthVision clip on VJ layer if STOP ALL cleared it
-    ensureSVClipActive();
-
     if (assignment.type === 'media' && assignment.mediaSrc) {
       applyMediaClip(assignment);
     } else if (assignment.type === 'shader' && assignment.shaderCode) {
@@ -3907,27 +4112,17 @@ void main() {
     }
   }
 
-  /** Ensure the synthvision clip is active on the VJ layer (re-triggers after STOP ALL) */
-  function ensureSVClipActive() {
-    const layerState = $vjClipLauncher.layerStates[assignedVJLayer];
-    if (!layerState?.activeClip || layerState.activeClip.id !== svClipId) {
-      // SynthVision clip was cleared (e.g. by STOP ALL) — re-set and re-trigger it
-      const svClip: VJClip = {
-        id: svClipId,
-        type: 'synthvision',
-        name: 'PERFORMER',
-        src: '',
-        synthVisionCanvas: outputCanvas
-      };
-      vjClipLauncher.setClip(assignedVJLayer, 0, svClip);
-      vjClipLauncher.triggerClip(assignedVJLayer, 0);
-    }
-  }
-
   function applyMediaClip(assignment: ClipAssignment) {
-    if (!assignment.mediaSrc) return;
+    // Assignments restored from an older session can arrive with a dead or
+    // blanked mediaSrc; the AssetRef is the durable identity, so rebuild
+    // from it before giving up on the key.
+    const mediaSrc = assignment.mediaSrc
+      || resolveAssetRefForRuntime((assignment as any)._assetRef, undefined, '')
+      || '';
+    if (!mediaSrc) return;
     const layerIdx = assignedVJLayer;
     const clipId = `perf-media-${assignment.mediaId || Date.now()}`;
+    const deck = performerAssignmentDeck(assignment);
 
     if (assignment.mediaType === 'video') {
       // Reuse library item's <video> element if available so rapid
@@ -3938,7 +4133,7 @@ void main() {
       let video = libraryItem?.videoElement as HTMLVideoElement | undefined;
       if (!video) {
         video = document.createElement('video');
-        video.src = assignment.mediaSrc;
+        video.src = mediaSrc;
       }
       video.loop = true;
       video.muted = true;
@@ -3951,23 +4146,28 @@ void main() {
         id: clipId,
         type: 'video',
         name: assignment.mediaName || 'Media Clip',
-        src: assignment.mediaSrc,
+        src: mediaSrc,
         thumbnail: assignment.mediaThumbnail || libraryItem?.thumbnail,
         videoElement: video,
+        _assetRef: (assignment as any)._assetRef,
+        _performerOwned: true,
       };
-      vjClipLauncher.setClip(layerIdx, 0, clip);
-      vjClipLauncher.triggerClip(layerIdx, 0);
+      lastLaunchedClip = clip;
+      vjClipLauncher.launchTransientClip(layerIdx, clip, deck);
     } else if (assignment.mediaType === 'image') {
       const clip: VJClip = {
         id: clipId,
         type: 'image',
         name: assignment.mediaName || 'Image Clip',
-        src: assignment.mediaSrc,
-        thumbnail: assignment.mediaThumbnail || assignment.mediaSrc,
+        src: mediaSrc,
+        thumbnail: assignment.mediaThumbnail || mediaSrc,
+        _assetRef: (assignment as any)._assetRef,
+        _performerOwned: true,
       };
-      vjClipLauncher.setClip(layerIdx, 0, clip);
-      vjClipLauncher.triggerClip(layerIdx, 0);
+      lastLaunchedClip = clip;
+      vjClipLauncher.launchTransientClip(layerIdx, clip, deck);
     }
+    publishNativeWorldOverlay(deck);
   }
 
   // ─── Drag-Drop Assignment Handlers ─────────────────────
@@ -3992,6 +4192,9 @@ void main() {
         mediaSrc: item.src,
         mediaType: item.type,
         mediaThumbnail,
+        // Carry the library item's durable file identity onto the key, or
+        // the assignment is a blob: URL that dies with the session.
+        _assetRef: (item as any)._assetRef,
       }));
     }
     e.dataTransfer.effectAllowed = 'copy';
@@ -4016,6 +4219,7 @@ void main() {
       if (data.type === 'shader') {
         clipAssignments[clipPos] = {
           type: 'shader',
+          performerDeck: activePerformerDeck(),
           shaderId: data.id,
           shaderName: data.name,
           shaderSrc: data.src,
@@ -4028,11 +4232,13 @@ void main() {
       } else if (data.type === 'media') {
         clipAssignments[clipPos] = {
           type: 'media',
+          performerDeck: activePerformerDeck(),
           mediaId: data.mediaId,
           mediaName: data.mediaName,
           mediaSrc: data.mediaSrc,
           mediaType: data.mediaType,
           mediaThumbnail: data.mediaThumbnail || (data.mediaType === 'image' ? data.mediaSrc : undefined),
+          _assetRef: data._assetRef,
         };
         clipAssignments = { ...clipAssignments };
         clipsDirty = true;
@@ -4135,7 +4341,12 @@ void main() {
     showLoading('Loading Preset...');
     // Dismiss splash if still showing
     if (state.showSplash) dismissSplash();
-    clipAssignments = JSON.parse(JSON.stringify(preset.assignments));
+    const loadedAssignments = JSON.parse(JSON.stringify(preset.assignments));
+    // A preset can outlive the session that made it, so its mediaSrc values
+    // may be dead blob: URLs (or blanked by save-time stripping). Rebuild
+    // them from each assignment's AssetRef before the keys go live.
+    resolveAssetTreeInPlace(loadedAssignments);
+    clipAssignments = loadedAssignments;
     activePresetId = preset.id;
     clipsDirty = false;
     // Hide loading after next frame renders
@@ -4181,6 +4392,7 @@ void main() {
   function getClipLabel(clipPos: number, assignments: Record<number, ClipAssignment>): { name: string; desc: string; isMedia: boolean; isAssigned: boolean; thumbnail?: string } {
     const assignment = assignments[clipPos];
     if (!assignment) return { name: '', desc: 'EMPTY', isMedia: false, isAssigned: false };
+    const deck = performerAssignmentDeck(assignment);
     if (assignment.type === 'media') {
       let thumb = assignment.mediaThumbnail;
       if (!thumb && assignment.mediaId) {
@@ -4191,7 +4403,7 @@ void main() {
       if (!thumb && assignment.mediaType === 'image') thumb = assignment.mediaSrc;
       return {
         name: assignment.mediaName || 'Media',
-        desc: assignment.mediaType === 'video' ? 'VIDEO' : 'IMAGE',
+        desc: `${deck} ${assignment.mediaType === 'video' ? 'VIDEO' : 'IMAGE'}`,
         isMedia: true,
         isAssigned: true,
         thumbnail: thumb,
@@ -4199,68 +4411,80 @@ void main() {
     }
     return {
       name: assignment.shaderName || 'Shader',
-      desc: 'SHADER',
+      desc: `${deck} SHADER`,
       isMedia: false,
       isAssigned: true,
       thumbnail: assignment.shaderThumbnail,
     };
   }
 
-  const CODE_TO_CLIP: Record<string, number> = {};
-  SV_ALL_CLIPS.forEach((c, i) => { CODE_TO_CLIP[c.code] = i; });
   function handleKeydown(e: KeyboardEvent) {
-    if (!state.active) return;
-    // Don't capture if typing in an input
-    if ((e.target as HTMLElement)?.tagName === 'INPUT' || (e.target as HTMLElement)?.tagName === 'TEXTAREA') return;
+    if (!visible || !state.keyboardActive) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+
+    const action = resolvePerformerKeyboardAction(e, performerEditMode);
+    if (!action) return;
 
     // Dismiss splash on first interaction
     if (state.showSplash) dismissSplash();
 
-    const code = e.code;
-    const kl = e.key.toLowerCase();
-    const sh = e.shiftKey;
+    e.preventDefault();
+    e.stopPropagation();
 
-    // Clip trigger (all 36 keys)
-    if (CODE_TO_CLIP[code] !== undefined && !sh) {
-      e.preventDefault();
-      const clipPos = CODE_TO_CLIP[code];
-      if (clipPos !== undefined) triggerClip(clipPos);
-      return;
+    switch (action.type) {
+      case 'clip':
+        pressedClipPosition = action.clipPosition;
+        triggerClip(action.clipPosition);
+        break;
+      case 'randomize':
+        randomizeAll();
+        break;
+      case 'xfade':
+        synthVisionStore.nudgeXfade(action.delta);
+        break;
+      case 'space':
+        synthVisionStore.cycleSpace(action.delta);
+        break;
+      case 'world':
+        cycleNativeWorld(action.delta);
+        break;
+      case 'spaceFx':
+        synthVisionStore.triggerSpaceFx();
+        tapBPM();
+        break;
+      case 'focus':
+        synthVisionStore.toggleFocus();
+        break;
+      case 'invert':
+        synthVisionStore.toggleInvert();
+        break;
+      case 'blackout':
+        synthVisionStore.doBlackout();
+        break;
+      case 'glitch':
+        synthVisionStore.doGlitch();
+        break;
+      case 'drift':
+        synthVisionStore.toggleDrift();
+        break;
+      case 'resetMomentaries':
+        synthVisionStore.update(s => ({ ...s, blackout: 0, whiteout: 0, invert: false }));
+        break;
     }
+  }
 
-    if (e.repeat) return;
+  function handleKeyup(e: KeyboardEvent) {
+    if (!visible || !state.keyboardActive) return;
+    const clipPosition = performerClipIndexForCode(e.code);
+    if (clipPosition === null || pressedClipPosition !== clipPosition) return;
+    pressedClipPosition = null;
+    e.preventDefault();
+    e.stopPropagation();
+  }
 
-    // Tab = full random (shader, world, style, space, params, effects)
-    if (code === 'Tab') { e.preventDefault(); randomizeAll(); return; }
-
-    // Arrow left/right = crossfade nudge
-    if (code === 'ArrowLeft') { e.preventDefault(); synthVisionStore.nudgeXfade(-.05); return; }
-    if (code === 'ArrowRight') { e.preventDefault(); synthVisionStore.nudgeXfade(.05); return; }
-
-    // ; ' = space
-    if (code === 'Semicolon') { synthVisionStore.cycleSpace(-1); return; }
-    if (code === 'Quote') { synthVisionStore.cycleSpace(1); return; }
-
-    // , . = world (comma/period)
-    if (code === 'Comma') { synthVisionStore.cycleWorld(-1); return; }
-    if (code === 'Period') { synthVisionStore.cycleWorld(1); return; }
-
-    // Space = trigger selected spacebar effect + tap tempo
-    if (code === 'Space') { e.preventDefault(); synthVisionStore.triggerSpaceFx(); tapBPM(); return; }
-
-    // Backtick = toggle focus
-    if (code === 'Backquote') { synthVisionStore.toggleFocus(); return; }
-
-    // Actions
-    if (kl === 'n') { synthVisionStore.toggleInvert(); return; }
-    if (kl === 'b') { synthVisionStore.doBlackout(); return; }
-    if (kl === 'm') { synthVisionStore.doGlitch(); return; }
-    if (kl === 'x') { synthVisionStore.toggleDrift(); return; }
-    if (kl === 'c') { randomizeAll(); return; }
-    if (code === 'Escape') {
-      synthVisionStore.update(s => ({ ...s, blackout: 0, whiteout: 0, invert: false }));
-      return;
-    }
+  function handleKeyboardBlur() {
+    pressedClipPosition = null;
   }
 
   // Tap tempo
@@ -4344,32 +4568,8 @@ void main() {
   // ================================================================
   //  VJ Layer Assignment
   // ================================================================
-  function assignToVJLayer(layerIdx: number) {
-    if (!outputCanvas) { console.error('[SV] assignToVJLayer: outputCanvas is null!'); return; }
-    console.log('[SV] assignToVJLayer:', layerIdx, 'canvas:', outputCanvas.width, 'x', outputCanvas.height, 'clipId:', svClipId);
-    assignedVJLayer = layerIdx;
-
-    // Create Performer clip for VJ layer
-    const svClip: VJClip = {
-      id: svClipId,
-      type: 'synthvision',
-      name: 'PERFORMER',
-      src: '',
-      synthVisionCanvas: outputCanvas
-    };
-
-    // Set clip in first column of the target layer and trigger it
-    vjClipLauncher.setClip(layerIdx, 0, svClip);
-    vjClipLauncher.triggerClip(layerIdx, 0);
-
-    // Update store
-    synthVisionStore.setAssignedLayer(layerIdx);
-    console.log('[SV] assignToVJLayer complete, activeClip:', $vjClipLauncher.layerStates[layerIdx]?.activeClip?.id);
-  }
-
   function unassignFromVJLayer() {
     if (assignedVJLayer !== null) {
-      vjClipLauncher.clearClip(assignedVJLayer, 0);
       synthVisionStore.setAssignedLayer(null);
     }
   }
@@ -4444,8 +4644,10 @@ void main() {
       // initCamShaders(); -- will be called on first camera activation
 
       showLoading('Building 3D scene...');
-      initThree();
-      buildWorld(0);
+      if (!NATIVE_ENGINE_ONLY) {
+        initThree();
+        buildWorld(0);
+      }
     } catch (initErr) {
       console.error('SynthVision: Init failed, clearing loading overlay:', initErr);
       hideLoading();
@@ -4457,15 +4659,18 @@ void main() {
     lastTime = performance.now();
     animFrame = requestAnimationFrame(renderFrame);
 
-    document.addEventListener('keydown', handleKeydown);
+    document.addEventListener('keydown', handleKeydown, true);
+    document.addEventListener('keyup', handleKeyup, true);
+    window.addEventListener('blur', handleKeyboardBlur);
     document.addEventListener('mousemove', xfMouseMove);
     document.addEventListener('mouseup', xfMouseUp);
 
     compCtx = outputCanvas.getContext('2d', { alpha: false });
 
-    // Assign to restored VJ layer (or default layer 0) — defer to ensure canvas is bound
-    const targetVJLayer = restoredVJLayer;
-    setTimeout(() => assignToVJLayer(targetVJLayer), 100);
+    // Layer now comes from the clip's host cell (hostLayer prop), so there
+    // is nothing to restore here — publishing it keeps the store in step for
+    // anything still reading synthVisionStore.assignedLayer.
+    setTimeout(() => synthVisionStore.setAssignedLayer(assignedVJLayer), 100);
 
     // Load ISF shader library — use module-level cache if available
     // Keep loading indicator visible until shader library is ready
@@ -4576,10 +4781,15 @@ void main() {
 
     // Unassign from VJ layer
     unassignFromVJLayer();
+    nativePerformerWorldOverlays.clearAll();
+    lastNativeWorldDeck = null;
 
     synthVisionStore.deactivate();
     if (animFrame) cancelAnimationFrame(animFrame);
-    document.removeEventListener('keydown', handleKeydown);
+    synthVisionStore.setKeyboardActive(false);
+    document.removeEventListener('keydown', handleKeydown, true);
+    document.removeEventListener('keyup', handleKeyup, true);
+    window.removeEventListener('blur', handleKeyboardBlur);
     document.removeEventListener('mousemove', xfMouseMove);
     document.removeEventListener('mouseup', xfMouseUp);
     _detachDialListeners();
@@ -4758,14 +4968,14 @@ void main() {
 </script>
 
 <!-- Hidden canvases for rendering (output goes to VJ layer) -->
-<div class="sv-hidden-canvases">
+<div data-help-page="synthvision" class="sv-hidden-canvases">
   <canvas bind:this={shaderCanvas}></canvas>
   <canvas bind:this={threeCanvas}></canvas>
   <canvas bind:this={outputCanvas}></canvas>
   <canvas bind:this={camCanvas}></canvas>
 </div>
 
-<div class="sv-root" on:click={() => { if (state.showSplash) dismissSplash(); }}>
+<div data-help-page="synthvision" class="sv-root" on:click={() => { if (state.showSplash) dismissSplash(); }}>
   <!-- HEADER -->
   <div class="sv-header">
     <div class="sv-logo">PERFORMER</div>
@@ -4773,13 +4983,6 @@ void main() {
       <button class="sv-deck-tab active" title="Shader clip instrument">SHADER MODE</button>
     </div>
 
-    <!-- VJ Layer Assignment -->
-    <div class="sv-vj-assign">
-      <span class="sv-vj-lbl">VJ LAYER</span>
-      {#each Array($vjClipLauncher.numLayers) as _, i}
-        <button class="sv-vj-btn" class:on={assignedVJLayer === i} on:click={() => assignToVJLayer(i)}>{i + 1}</button>
-      {/each}
-    </div>
 
     <!-- BPM Section -->
     <div class="sv-bpm-section"
@@ -4927,6 +5130,7 @@ void main() {
                   class:assigned={label.isAssigned && !label.isMedia}
                   class:media-assigned={label.isMedia}
                   class:has-thumb={!!label.thumbnail}
+                  class:keyboard-pressed={pressedClipPosition === i}
                   class:drag-over={performerEditMode && dragOverClipSlot === i}
                   style={label.thumbnail ? `background-image:url('${label.thumbnail}')` : ''}
                   on:click={() => { if (!performerEditMode) triggerClip(i); }}
@@ -4952,6 +5156,7 @@ void main() {
                   class:assigned={label.isAssigned && !label.isMedia}
                   class:media-assigned={label.isMedia}
                   class:has-thumb={!!label.thumbnail}
+                  class:keyboard-pressed={pressedClipPosition === clipPos}
                   class:drag-over={performerEditMode && dragOverClipSlot === clipPos}
                   style={label.thumbnail ? `background-image:url('${label.thumbnail}')` : ''}
                   on:click={() => { if (!performerEditMode) triggerClip(clipPos); }}
@@ -4977,6 +5182,7 @@ void main() {
                   class:assigned={label.isAssigned && !label.isMedia}
                   class:media-assigned={label.isMedia}
                   class:has-thumb={!!label.thumbnail}
+                  class:keyboard-pressed={pressedClipPosition === clipPos}
                   class:drag-over={performerEditMode && dragOverClipSlot === clipPos}
                   style={label.thumbnail ? `background-image:url('${label.thumbnail}')` : ''}
                   on:click={() => { if (!performerEditMode) triggerClip(clipPos); }}
@@ -5002,6 +5208,7 @@ void main() {
                   class:assigned={label.isAssigned && !label.isMedia}
                   class:media-assigned={label.isMedia}
                   class:has-thumb={!!label.thumbnail}
+                  class:keyboard-pressed={pressedClipPosition === clipPos}
                   class:drag-over={performerEditMode && dragOverClipSlot === clipPos}
                   style={label.thumbnail ? `background-image:url('${label.thumbnail}')` : ''}
                   on:click={() => { if (!performerEditMode) triggerClip(clipPos); }}
@@ -5034,13 +5241,13 @@ void main() {
             {#each SV_WORLDS as world, i}
               <button class="sv-world-btn" class:on={worldsEnabled && focusedLayer && focusedLayer.world === i}
                 class:worlds-off={!worldsEnabled}
-                on:click={() => { if (worldsEnabled) synthVisionStore.setWorld(i); }}>
+                on:click={() => { if (worldsEnabled) void activateNativeWorld(i); }}>
                 {world}
               </button>
             {/each}
           </div>
           <button class="sv-worlds-toggle" class:on={worldsEnabled}
-            on:click={() => worldsEnabled = !worldsEnabled}>
+            on:click={toggleNativeWorlds}>
             {worldsEnabled ? '3D ON' : '3D OFF'}
           </button>
         </div>
@@ -5074,7 +5281,7 @@ void main() {
                   </button>
                   <span class="sv-fx-name">{effect.type}</span>
                   <span class="sv-fx-expand">{expandedEffectId === effect.id ? '▼' : '▶'}</span>
-                  <button class="sv-fx-delete"
+                  <button aria-label="Delete this effect" class="sv-fx-delete"
                     on:click|stopPropagation={() => deleteSvEffect(effect.id)}>×</button>
                 </div>
                 {#if expandedEffectId === effect.id}
@@ -5143,7 +5350,7 @@ void main() {
           </div>
           <div class="sv-isf-controls">
             {#each activeISFInputs as input}
-              {@const val = getISFValue(input)}
+              {@const val = getISFValue(input, performerShaderValues)}
               {@const canModulate = input.TYPE === 'float' || (input.TYPE === 'long' && !input.VALUES)}
               {@const mod = canModulate ? getSvShaderMod(input.NAME) : undefined}
               {@const isModulated = mod && mod.source !== 'manual'}
@@ -5281,6 +5488,12 @@ void main() {
         <div class="sv-shader-info world">
           <span class="sv-shader-name world">{worldDef?.name ?? 'WORLD'}</span>
         </div>
+        <label class="sv-world-palette">Color scheme
+          <select aria-label="World color scheme" value={worldPaletteIndex(worldParams.palette ?? 0)}
+            on:change={e => synthVisionStore.setWorldParam(currentWorldIdx, 'palette', Number(e.currentTarget.value) / (WORLD_PALETTES.length - 1))}>
+            {#each WORLD_PALETTES as palette, index}<option value={index}>{palette.name}</option>{/each}
+          </select>
+        </label>
         <div class="sv-dial-grid sv-world-params">
           {#if worldDef?.params}
             {#each worldDef.params as param}
@@ -5416,7 +5629,7 @@ void main() {
 </div>
 
 <!-- Hidden video element for camera -->
-<video bind:this={camVideo} class="sv-cam-video" playsinline muted></video>
+<video data-help-page="synthvision" bind:this={camVideo} class="sv-cam-video" playsinline muted></video>
 
 <!-- Effect Picker Modal (full catalog, multi-select, 3-col grid) -->
 <EffectPickerModal
@@ -5426,6 +5639,9 @@ void main() {
 />
 
 <style>
+  .sv-world-palette { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0; color: #adb9ce; font-size: 12px; }
+  .sv-world-palette select { min-width: 0; padding: 6px 9px; border: 1px solid #344568; border-radius: 6px; background: #121c30; color: #e3ecff; font: inherit; }
+
   :root {
     /* Use global theme variables for consistent styling */
     --sv-c: var(--accent-primary, #FF6B6B);
@@ -5458,7 +5674,7 @@ void main() {
     height: 100%;
     background: var(--sv-bg);
     color: #fff;
-    font-family: 'IBM Plex Mono', 'Consolas', monospace;
+    font-family: 'Geist Mono', 'Consolas', monospace;
     user-select: none;
     overflow: hidden;
   }
@@ -5516,39 +5732,6 @@ void main() {
   .sv-deck-tab.geo.active {
     border-color: var(--sv-g);
     color: var(--sv-g);
-  }
-
-  /* VJ Layer Assignment */
-  .sv-vj-assign {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-left: 8px;
-  }
-  .sv-vj-lbl {
-    font-size: 10px;
-    opacity: .4;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-  }
-  .sv-vj-btn {
-    width: 28px;
-    height: 24px;
-    background: rgba(255,255,255,.04);
-    border: 1px solid var(--sv-brd);
-    color: rgba(255,255,255,.4);
-    font-family: 'Orbitron', sans-serif;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: all .1s;
-  }
-  .sv-vj-btn:hover { border-color: rgba(255,255,255,.2); color: #fff; }
-  .sv-vj-btn.on {
-    background: rgba(187,134,252,.15);
-    border-color: var(--sv-c);
-    color: var(--sv-c);
-    box-shadow: 0 0 8px rgba(187,134,252,.2);
   }
 
   /* BPM Section */
@@ -6147,6 +6330,12 @@ void main() {
     overflow: hidden;
   }
   .sv-clip-btn:hover { border-color: rgba(255,255,255,.25); background-color: rgba(255,255,255,.05); }
+  .sv-clip-btn.keyboard-pressed {
+    border-color: var(--sv-c);
+    background-color: rgba(187,134,252,.2);
+    box-shadow: 0 0 16px rgba(187,134,252,.42);
+    transform: translateY(1px);
+  }
   .sv-clip-btn.on {
     border-color: var(--sv-c);
     background-color: rgba(187,134,252,.12);

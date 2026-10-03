@@ -153,7 +153,7 @@
   });
 </script>
 
-<div class="ss-panel">
+<div data-help-page="gpu-instruments" class="ss-panel">
   <div class="ss-header">
     <span class="ss-title">Stem Routing</span>
     <span class="ss-sub">multi-channel input → bass / mid / treb</span>
@@ -328,7 +328,7 @@
   .ss-stem-label {
     font-size: 11px;
     color: var(--text-secondary, #aaa);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

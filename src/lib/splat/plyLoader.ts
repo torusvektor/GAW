@@ -30,12 +30,16 @@ export interface PLYVertex {
   // UV texture coordinates (optional, from file)
   texture_u?: number;
   texture_v?: number;
+  f_rest?: number[];
 }
 
 export interface PLYData {
   vertices: PLYVertex[];
   sourceVertexCount: number;
   wasDecimated: boolean;
+  faces?: number[][];
+  sphericalHarmonicsDegree?: number;
+  sphericalHarmonicsCoefficientCount?: number;
   dataType: SplatDataType;
   scaleEncoding?: 'log' | 'linear';
   hasUVs: boolean;
@@ -999,3 +1003,555 @@ export async function loadPLYFromFile(file: File, options: PLYLoadOptions = {}):
   await yieldToBrowser();
   return parsePLYBufferProgressive(buffer, options);
 }
+
+// ─── Native renderer point-buffer layer (carried from the native branch) ───
+
+export interface PLYPointBufferData {
+  positions: Float32Array;
+  colors: Float32Array;
+  alpha: Float32Array;
+  splatScale?: Float32Array;
+  splatRotation?: Float32Array;
+  sphericalHarmonicsRest?: Float32Array;
+  sphericalHarmonicsRestStride: number;
+  sphericalHarmonicsDegree: number;
+  sphericalHarmonicsCoefficientCount: number;
+  gaussian: boolean;
+  dataType: SplatDataType;
+  sourceVertexCount: number;
+  sampleCount: number;
+  boundingBox: PLYData['boundingBox'];
+  center: PLYData['center'];
+}
+
+export interface PLYPointBufferOptions {
+  maxPoints?: number;
+  maxGaussianPoints?: number;
+  sphericalHarmonicsRestStride?: number;
+}
+
+interface ParsedPropertyValue {
+  name: string;
+  value: number;
+  type: string;
+}
+
+const END_HEADER_BYTES = new Uint8Array([101, 110, 100, 95, 104, 101, 97, 100, 101, 114]);
+
+const PLY_HEADER_DECODER = new TextDecoder('ascii');
+
+const RED_PROPERTY_NAMES = [
+  'red', 'r', 'diffuse_red', 'diffuse_r', 'base_color_red', 'base_color_r', 'color_red', 'scalar_red', 'scalar_Red'
+];
+
+const GREEN_PROPERTY_NAMES = [
+  'green', 'g', 'diffuse_green', 'diffuse_g', 'base_color_green', 'base_color_g', 'color_green', 'scalar_green', 'scalar_Green'
+];
+
+const BLUE_PROPERTY_NAMES = [
+  'blue', 'b', 'diffuse_blue', 'diffuse_b', 'base_color_blue', 'base_color_b', 'color_blue', 'scalar_blue', 'scalar_Blue'
+];
+
+const ALPHA_PROPERTY_NAMES = [
+  'alpha', 'a', 'opacity', 'diffuse_alpha', 'base_color_alpha', 'color_alpha'
+];
+
+function normalizePLYType(type: string): string {
+  switch (type.toLowerCase()) {
+    case 'int8_t': return 'int8';
+    case 'uint8_t': return 'uint8';
+    case 'int16_t': return 'int16';
+    case 'uint16_t': return 'uint16';
+    case 'int32_t': return 'int32';
+    case 'uint32_t': return 'uint32';
+    case 'float32_t': return 'float32';
+    case 'float64_t': return 'float64';
+    default: return type.toLowerCase();
+  }
+}
+
+function isFloatType(type: string): boolean {
+  const normalized = normalizePLYType(type);
+  return normalized === 'float' || normalized === 'float32' || normalized === 'double' || normalized === 'float64';
+}
+
+function sigmoid(value: number): number {
+  if (value >= 0) {
+    const z = Math.exp(-value);
+    return 1 / (1 + z);
+  }
+  const z = Math.exp(value);
+  return z / (1 + z);
+}
+
+function gaussianDcToByte(value: number): number {
+  return clampByte((0.5 + SH_C0 * value) * 255);
+}
+
+function normalizeColorValue(value: number, type: string): number {
+  if (isFloatType(type) && value >= 0 && value <= 1) return clampByte(value * 255);
+  return clampByte(value);
+}
+
+function normalizeAlphaValue(value: number, type: string, propertyName: string, gaussian: boolean): number {
+  if (propertyName === 'opacity' && gaussian) {
+    return clampByte(sigmoid(value) * 255);
+  }
+  if (isFloatType(type) && value >= 0 && value <= 1) return clampByte(value * 255);
+  return clampByte(value);
+}
+
+function getIndexedProperty(
+  values: number[],
+  propIndices: Record<string, number>,
+  properties: PLYProperty[],
+  names: string[]
+): ParsedPropertyValue | undefined {
+  for (const name of names) {
+    const index = propIndices[name];
+    if (index === undefined) continue;
+    const value = values[index];
+    if (!Number.isFinite(value)) continue;
+    return { name, value, type: properties[index]?.type ?? 'float' };
+  }
+  return undefined;
+}
+
+function getBinaryProperty(
+  propOffsets: Record<string, { offset: number; type: string }>,
+  getValue: (name: string) => number | undefined,
+  names: string[]
+): ParsedPropertyValue | undefined {
+  for (const name of names) {
+    const info = propOffsets[name];
+    if (!info) continue;
+    const value = getValue(name);
+    if (value === undefined || !Number.isFinite(value)) continue;
+    return { name, value, type: info.type };
+  }
+  return undefined;
+}
+
+function sphericalHarmonicsRestPropertyNames(properties: PLYProperty[]): string[] {
+  return properties
+    .map((property) => {
+      const match = /^f_rest_(\d+)$/.exec(property.name);
+      return match ? { name: property.name, index: Number(match[1]) } : null;
+    })
+    .filter((entry): entry is { name: string; index: number } => !!entry && Number.isFinite(entry.index))
+    .sort((a, b) => a.index - b.index)
+    .map((entry) => entry.name);
+}
+
+function sphericalHarmonicsDegreeForRestCount(restCoefficientCount: number): number {
+  if (restCoefficientCount <= 0 || restCoefficientCount % 3 !== 0) return 0;
+  const basisCount = restCoefficientCount / 3 + 1;
+  const degree = Math.sqrt(basisCount) - 1;
+  const rounded = Math.round(degree);
+  return Math.abs(degree - rounded) < 1e-4 ? rounded : 0;
+}
+
+function makeColorChannels(
+  red: ParsedPropertyValue | undefined,
+  green: ParsedPropertyValue | undefined,
+  blue: ParsedPropertyValue | undefined,
+  fDc0: ParsedPropertyValue | undefined,
+  fDc1: ParsedPropertyValue | undefined,
+  fDc2: ParsedPropertyValue | undefined
+): { r: number; g: number; b: number } {
+  return {
+    r: red ? normalizeColorValue(red.value, red.type) : (fDc0 ? gaussianDcToByte(fDc0.value) : 255),
+    g: green ? normalizeColorValue(green.value, green.type) : (fDc1 ? gaussianDcToByte(fDc1.value) : 255),
+    b: blue ? normalizeColorValue(blue.value, blue.type) : (fDc2 ? gaussianDcToByte(fDc2.value) : 255),
+  };
+}
+
+function sourceIndexForSample(sampleIndex: number, sampleCount: number, sourceCount: number): number {
+  if (sourceCount <= 0) return 0;
+  if (sourceCount <= sampleCount || sampleCount <= 1) {
+    return Math.min(sourceCount - 1, Math.max(0, Math.floor(sampleIndex)));
+  }
+  return Math.min(
+    sourceCount - 1,
+    Math.floor(sampleIndex * (sourceCount - 1) / (sampleCount - 1)),
+  );
+}
+
+function maxSampleCountForPLYData(
+  sourceVertexCount: number,
+  gaussian: boolean,
+  options: PLYPointBufferOptions,
+): number {
+  const defaultMax = sourceVertexCount;
+  const requested = gaussian
+    ? (options.maxGaussianPoints ?? options.maxPoints ?? defaultMax)
+    : (options.maxPoints ?? defaultMax);
+  const finiteRequested = Number.isFinite(requested) ? Math.floor(requested) : defaultMax;
+  return Math.max(0, Math.min(sourceVertexCount, Math.max(1, finiteRequested)));
+}
+
+function emptyPointBufferData(
+  dataType: SplatDataType = 'pointcloud',
+  sourceVertexCount = 0,
+): PLYPointBufferData {
+  return {
+    positions: new Float32Array(0),
+    colors: new Float32Array(0),
+    alpha: new Float32Array(0),
+    sphericalHarmonicsRestStride: 0,
+    sphericalHarmonicsDegree: 0,
+    sphericalHarmonicsCoefficientCount: 0,
+    gaussian: dataType === 'gaussian',
+    dataType,
+    sourceVertexCount,
+    sampleCount: 0,
+    boundingBox: {
+      min: { x: 0, y: 0, z: 0 },
+      max: { x: 0, y: 0, z: 0 },
+    },
+    center: { x: 0, y: 0, z: 0 },
+  };
+}
+
+function extractPLYHeader(buffer: ArrayBuffer): { text: string; headerLength: number } {
+  const bytes = new Uint8Array(buffer);
+  let markerIndex = -1;
+
+  for (let i = 0; i <= bytes.length - END_HEADER_BYTES.length; i++) {
+    let matches = true;
+    for (let j = 0; j < END_HEADER_BYTES.length; j++) {
+      if (bytes[i + j] !== END_HEADER_BYTES[j]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      const before = i > 0 ? bytes[i - 1] : 10;
+      const after = bytes[i + END_HEADER_BYTES.length] ?? 10;
+      const lineStart = before === 10 || before === 13;
+      const lineEnd = after === 10 || after === 13;
+      if (!lineStart || !lineEnd) continue;
+      markerIndex = i;
+      break;
+    }
+  }
+
+  if (markerIndex < 0) {
+    throw new Error('PLY file is missing end_header');
+  }
+
+  let headerLength = markerIndex + END_HEADER_BYTES.length;
+  if (bytes[headerLength] === 13 && bytes[headerLength + 1] === 10) {
+    headerLength += 2;
+  } else if (bytes[headerLength] === 10 || bytes[headerLength] === 13) {
+    headerLength += 1;
+  }
+
+  return {
+    text: PLY_HEADER_DECODER.decode(buffer.slice(0, headerLength)),
+    headerLength,
+  };
+}
+
+function parseASCIIFaces(
+  text: string,
+  headerLength: number,
+  elements: PLYElement[]
+): number[][] {
+  const faceElement = elements.find(e => e.name === 'face');
+  if (!faceElement) return [];
+
+  const dataLines = text.substring(headerLength).trim().split('\n');
+  let lineIndex = 0;
+  for (const element of elements) {
+    if (element.name === 'face') break;
+    lineIndex += element.count;
+  }
+
+  const faces: number[][] = [];
+  for (let i = 0; i < faceElement.count && lineIndex + i < dataLines.length; i++) {
+    const values = dataLines[lineIndex + i].trim().split(/\s+/).map(Number);
+    let cursor = 0;
+    let face: number[] = [];
+
+    for (const prop of faceElement.properties) {
+      if (prop.isList) {
+        const count = values[cursor++] ?? 0;
+        const indices = values.slice(cursor, cursor + count).map((value) => Math.trunc(value));
+        cursor += count;
+        if (prop.name === 'vertex_indices' || prop.name === 'vertex_index' || face.length === 0) {
+          face = indices;
+        }
+      } else {
+        cursor += 1;
+      }
+    }
+
+    if (face.length >= 3) faces.push(face);
+  }
+
+  return faces;
+}
+
+function getElementFixedOffsets(element: PLYElement): {
+  stride: number;
+  propOffsets: Record<string, { offset: number; type: string }>;
+} | null {
+  if (element.properties.some((prop) => prop.isList)) return null;
+  let stride = 0;
+  const propOffsets: Record<string, { offset: number; type: string }> = {};
+  for (const prop of element.properties) {
+    propOffsets[prop.name] = { offset: stride, type: prop.type };
+    stride += getTypeSize(prop.type);
+  }
+  return { stride, propOffsets };
+}
+
+export function pointCloudBuffersFromPLYData(
+  data: PLYData,
+  options: PLYPointBufferOptions = {},
+): PLYPointBufferData {
+  const vertices = data.vertices ?? [];
+  const sourceVertexCount = vertices.length;
+  const gaussian = data.dataType === 'gaussian' ||
+    vertices.some((v) => Number.isFinite(v.scale_0) || Number.isFinite(v.scale_1) || Number.isFinite(v.scale_2));
+  const sampleCount = maxSampleCountForPLYData(sourceVertexCount, gaussian, options);
+  if (sampleCount <= 0) return emptyPointBufferData(data.dataType, sourceVertexCount);
+
+  const positions = new Float32Array(sampleCount * 3);
+  const colors = new Float32Array(sampleCount * 3);
+  const alpha = new Float32Array(sampleCount);
+  const splatScale = gaussian ? new Float32Array(sampleCount * 3) : undefined;
+  const splatRotation = gaussian ? new Float32Array(sampleCount * 4) : undefined;
+  const shCoeffCount = data.sphericalHarmonicsCoefficientCount ?? 0;
+  const requestedShRestStride = Math.max(0, Math.floor(options.sphericalHarmonicsRestStride ?? 9));
+  const shRestStride = shCoeffCount >= requestedShRestStride && requestedShRestStride > 0
+    ? requestedShRestStride
+    : 0;
+  const shRest = shRestStride > 0 ? new Float32Array(sampleCount * shRestStride) : undefined;
+
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const sourceIndex = sourceIndexForSample(i, sampleCount, sourceVertexCount);
+    const v = vertices[sourceIndex];
+    const dst = i * 3;
+    const x = Number.isFinite(v.x) ? v.x : 0;
+    const y = Number.isFinite(v.y) ? v.y : 0;
+    const z = Number.isFinite(v.z) ? v.z : 0;
+    positions[dst + 0] = x;
+    positions[dst + 1] = y;
+    positions[dst + 2] = z;
+    colors[dst + 0] = Math.max(0, Math.min(1, (v.r ?? 255) / 255));
+    colors[dst + 1] = Math.max(0, Math.min(1, (v.g ?? 255) / 255));
+    colors[dst + 2] = Math.max(0, Math.min(1, (v.b ?? 255) / 255));
+    alpha[i] = Math.max(0, Math.min(1, (v.a ?? 255) / 255));
+
+    if (splatScale) {
+      splatScale[dst + 0] = Number.isFinite(v.scale_0) ? v.scale_0! : 0;
+      splatScale[dst + 1] = Number.isFinite(v.scale_1) ? v.scale_1! : 0;
+      splatScale[dst + 2] = Number.isFinite(v.scale_2) ? v.scale_2! : 0;
+    }
+    if (splatRotation) {
+      const rotOff = i * 4;
+      splatRotation[rotOff + 0] = Number.isFinite(v.rot_0) ? v.rot_0! : 1;
+      splatRotation[rotOff + 1] = Number.isFinite(v.rot_1) ? v.rot_1! : 0;
+      splatRotation[rotOff + 2] = Number.isFinite(v.rot_2) ? v.rot_2! : 0;
+      splatRotation[rotOff + 3] = Number.isFinite(v.rot_3) ? v.rot_3! : 0;
+    }
+    if (shRest && v.f_rest?.length) {
+      const shOff = i * shRestStride;
+      const copyCount = Math.min(shRestStride, v.f_rest.length);
+      for (let j = 0; j < copyCount; j++) {
+        const coeff = v.f_rest[j];
+        shRest[shOff + j] = Number.isFinite(coeff) ? coeff : 0;
+      }
+    }
+
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+  }
+
+  return {
+    positions,
+    colors,
+    alpha,
+    splatScale,
+    splatRotation,
+    sphericalHarmonicsRest: shRest,
+    sphericalHarmonicsRestStride: shRestStride,
+    sphericalHarmonicsDegree: data.sphericalHarmonicsDegree ?? 0,
+    sphericalHarmonicsCoefficientCount: shCoeffCount,
+    gaussian,
+    dataType: gaussian ? 'gaussian' : data.dataType,
+    sourceVertexCount,
+    sampleCount,
+    boundingBox: {
+      min: { x: minX, y: minY, z: minZ },
+      max: { x: maxX, y: maxY, z: maxZ },
+    },
+    center: {
+      x: (minX + maxX) / 2,
+      y: (minY + maxY) / 2,
+      z: (minZ + maxZ) / 2,
+    },
+  };
+}
+
+export function parsePLYPointBuffers(
+  buffer: ArrayBuffer,
+  options: PLYPointBufferOptions = {},
+): PLYPointBufferData {
+  const { text: headerText, headerLength } = extractPLYHeader(buffer);
+  const { elements, format } = parseHeader(headerText);
+  const vertexElement = elements.find(e => e.name === 'vertex');
+  if (!vertexElement) {
+    throw new Error('PLY file does not contain vertex element');
+  }
+
+  const gaussian = isGaussianSplat(vertexElement.properties);
+  const dataType: SplatDataType = gaussian ? 'gaussian' : 'pointcloud';
+  const sourceVertexCount = vertexElement.count;
+  const sampleCount = maxSampleCountForPLYData(sourceVertexCount, gaussian, options);
+  if (sampleCount <= 0) return emptyPointBufferData(dataType, sourceVertexCount);
+
+  if (format === 'ascii') {
+    return pointCloudBuffersFromPLYData(parsePLYBuffer(buffer), options);
+  }
+
+  const fixedOffsets = getElementFixedOffsets(vertexElement);
+  if (!fixedOffsets) {
+    return pointCloudBuffersFromPLYData(parsePLYBuffer(buffer), options);
+  }
+
+  const littleEndian = format === 'binary_little_endian';
+  const view = new DataView(buffer, headerLength);
+  let vertexStartOffset = 0;
+  for (const element of elements) {
+    if (element.name === 'vertex') break;
+    vertexStartOffset = skipBinaryElement(view, vertexStartOffset, element, littleEndian);
+  }
+
+  const { stride, propOffsets } = fixedOffsets;
+  const shRestPropertyNames = sphericalHarmonicsRestPropertyNames(vertexElement.properties);
+  const shCoeffCount = shRestPropertyNames.length;
+  const shDegree = sphericalHarmonicsDegreeForRestCount(shCoeffCount);
+  const requestedShRestStride = Math.max(0, Math.floor(options.sphericalHarmonicsRestStride ?? 9));
+  const shRestStride = shCoeffCount >= requestedShRestStride && requestedShRestStride > 0
+    ? requestedShRestStride
+    : 0;
+  const positions = new Float32Array(sampleCount * 3);
+  const colors = new Float32Array(sampleCount * 3);
+  const alpha = new Float32Array(sampleCount);
+  const splatScale = gaussian ? new Float32Array(sampleCount * 3) : undefined;
+  const splatRotation = gaussian ? new Float32Array(sampleCount * 4) : undefined;
+  const shRest = shRestStride > 0 ? new Float32Array(sampleCount * shRestStride) : undefined;
+
+  const readAt = (baseOffset: number, name: string): number | undefined => {
+    const info = propOffsets[name];
+    if (!info) return undefined;
+    const offset = baseOffset + info.offset;
+    if (offset < 0 || offset + getTypeSize(info.type) > view.byteLength) return undefined;
+    return readValue(view, offset, info.type, littleEndian);
+  };
+  const readProperty = (
+    baseOffset: number,
+    names: string[],
+  ): ParsedPropertyValue | undefined => getBinaryProperty(
+    propOffsets,
+    (name) => readAt(baseOffset, name),
+    names,
+  );
+
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const sourceIndex = sourceIndexForSample(i, sampleCount, sourceVertexCount);
+    const baseOffset = vertexStartOffset + sourceIndex * stride;
+    const dst = i * 3;
+    const fDc0 = readProperty(baseOffset, ['f_dc_0']);
+    const fDc1 = readProperty(baseOffset, ['f_dc_1']);
+    const fDc2 = readProperty(baseOffset, ['f_dc_2']);
+    const color = makeColorChannels(
+      readProperty(baseOffset, RED_PROPERTY_NAMES),
+      readProperty(baseOffset, GREEN_PROPERTY_NAMES),
+      readProperty(baseOffset, BLUE_PROPERTY_NAMES),
+      fDc0,
+      fDc1,
+      fDc2,
+    );
+    const alphaProperty = readProperty(baseOffset, ALPHA_PROPERTY_NAMES);
+    const x = readAt(baseOffset, 'x') ?? 0;
+    const y = readAt(baseOffset, 'y') ?? 0;
+    const z = readAt(baseOffset, 'z') ?? 0;
+
+    positions[dst + 0] = x;
+    positions[dst + 1] = y;
+    positions[dst + 2] = z;
+    colors[dst + 0] = color.r / 255;
+    colors[dst + 1] = color.g / 255;
+    colors[dst + 2] = color.b / 255;
+    alpha[i] = alphaProperty
+      ? normalizeAlphaValue(alphaProperty.value, alphaProperty.type, alphaProperty.name, gaussian) / 255
+      : 1;
+
+    if (splatScale) {
+      splatScale[dst + 0] = readAt(baseOffset, 'scale_0') ?? 0;
+      splatScale[dst + 1] = readAt(baseOffset, 'scale_1') ?? 0;
+      splatScale[dst + 2] = readAt(baseOffset, 'scale_2') ?? 0;
+    }
+    if (splatRotation) {
+      const rotOff = i * 4;
+      splatRotation[rotOff + 0] = readAt(baseOffset, 'rot_0') ?? 1;
+      splatRotation[rotOff + 1] = readAt(baseOffset, 'rot_1') ?? 0;
+      splatRotation[rotOff + 2] = readAt(baseOffset, 'rot_2') ?? 0;
+      splatRotation[rotOff + 3] = readAt(baseOffset, 'rot_3') ?? 0;
+    }
+    if (shRest) {
+      const shOff = i * shRestStride;
+      for (let j = 0; j < shRestStride; j++) {
+        const value = readAt(baseOffset, shRestPropertyNames[j]);
+        shRest[shOff + j] = Number.isFinite(value) ? value! : 0;
+      }
+    }
+
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+  }
+
+  return {
+    positions,
+    colors,
+    alpha,
+    splatScale,
+    splatRotation,
+    sphericalHarmonicsRest: shRest,
+    sphericalHarmonicsRestStride: shRestStride,
+    sphericalHarmonicsDegree: shDegree,
+    sphericalHarmonicsCoefficientCount: shCoeffCount,
+    gaussian,
+    dataType,
+    sourceVertexCount,
+    sampleCount,
+    boundingBox: {
+      min: { x: minX, y: minY, z: minZ },
+      max: { x: maxX, y: maxY, z: maxZ },
+    },
+    center: {
+      x: (minX + maxX) / 2,
+      y: (minY + maxY) / 2,
+      z: (minZ + maxZ) / 2,
+    },
+  };
+}
+

@@ -36,7 +36,25 @@
 #include <napi.h>
 #include <Processing.NDI.Lib.h>
 
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurface.h>
+#elif defined(_WIN32)
+// Windows zero-copy receiver groundwork: received BGRA frames are
+// uploaded into a D3D11 texture created with a NAMED NT shared handle,
+// mirroring the shapes win_capture_addon.cpp / spout_addon.cpp produce
+// for the render core's shared_name import path (main.js requires a
+// named handle for process-local scopes — see canPublish… in main.js).
+#include <windows.h>
+#include <d3d11_1.h>
+#include <dxgi1_2.h>
+#pragma comment(lib, "d3d11.lib")
+#endif
+
+#include <atomic>
+#include <cstdio>
 #include <map>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -52,6 +70,7 @@ struct NdiSender {
   // frame's storage rather than pushing the caller's V8 buffer (which
   // could be GC'd between calls).
   std::vector<uint8_t> frameStorage;
+  std::vector<uint8_t> nextFrameStorage;
 };
 
 std::map<std::string, std::unique_ptr<NdiSender>> g_senders;
@@ -97,7 +116,7 @@ Napi::Value CreateSender(const Napi::CallbackInfo& info) {
   NDIlib_send_create_t desc = {};
   desc.p_ndi_name = name.c_str();
   desc.p_groups = nullptr;
-  desc.clock_video = true;   // pace at the configured framerate
+  desc.clock_video = false;  // The output pump owns pacing; don't block Electron.
   desc.clock_audio = false;
 
   auto sender = std::make_unique<NdiSender>();
@@ -173,21 +192,32 @@ Napi::Value SendImage(const Napi::CallbackInfo& info) {
   // send retains the buffer until the next send call returns; using
   // the caller's V8 buffer directly would be a use-after-free since
   // GC could reclaim it between calls.
-  sender->frameStorage.assign(data.Data(), data.Data() + expected);
+  // Keep the previous buffer intact until async send returns. Reassigning
+  // frameStorage first overwrote bytes still owned by NDI (or freed them on
+  // resize). Swap only after the SDK releases its previous frame.
+  auto& nextFrame = sender->nextFrameStorage;
+  nextFrame.assign(data.Data(), data.Data() + expected);
 
   NDIlib_video_frame_v2_t frame = {};
   frame.xres = width;
   frame.yres = height;
   frame.FourCC = NDIlib_FourCC_type_BGRA;
   frame.line_stride_in_bytes = width * 4;
-  frame.p_data = sender->frameStorage.data();
+  frame.p_data = nextFrame.data();
   frame.frame_format_type = NDIlib_frame_format_type_progressive;
+  const double fps = opts.Has("fps") && opts.Get("fps").IsNumber()
+      ? opts.Get("fps").As<Napi::Number>().DoubleValue() : 60.0;
+  frame.frame_rate_N = (fps >= 1 && fps <= 60) ? static_cast<int>(fps * 1000) : 60000;
+  frame.frame_rate_D = 1000;
+  frame.picture_aspect_ratio = static_cast<float>(width) / height;
+  frame.timecode = NDIlib_send_timecode_synthesize;
 
   // Async send pumps the network IO on the SDK's own thread. We
   // return immediately; next send_send_video call blocks if the
   // previous one is still in flight, which gives us natural back-
   // pressure without needing a per-sender inFlight flag.
   NDIlib_send_send_video_async_v2(sender->instance, &frame);
+  sender->frameStorage.swap(nextFrame);
   return Napi::Boolean::New(env, true);
 }
 
@@ -222,7 +252,108 @@ struct NdiReceiver {
   // Monotonic counter so callers can detect "is there a NEW frame?"
   // without comparing pixel content.
   uint64_t framesReceived = 0;
+#if defined(__APPLE__)
+  IOSurfaceRef sharedSurface = nullptr;
+#elif defined(_WIN32)
+  // DXGI twin of the Apple IOSurface path. The texture carries
+  // D3D11_RESOURCE_MISC_SHARED_NTHANDLE and a *named* shared handle so
+  // the render core (D3D12 OpenSharedHandleByName) can import it
+  // cross-process without HANDLE duplication. Untested on hardware —
+  // groundwork only; the CPU receiveFrame() fallback stays primary.
+  ID3D11Device* d3dDevice = nullptr;
+  ID3D11DeviceContext* d3dContext = nullptr;
+  ID3D11Texture2D* sharedTexture = nullptr;
+  HANDLE sharedHandle = nullptr;
+  std::string sharedName;
+  int sharedWidth = 0;
+  int sharedHeight = 0;
+#endif
 };
+
+#if defined(_WIN32)
+void ReleaseReceiverD3D(NdiReceiver* recv) {
+  if (!recv) return;
+  if (recv->sharedHandle) { CloseHandle(recv->sharedHandle); recv->sharedHandle = nullptr; }
+  if (recv->sharedTexture) { recv->sharedTexture->Release(); recv->sharedTexture = nullptr; }
+  if (recv->d3dContext) { recv->d3dContext->Release(); recv->d3dContext = nullptr; }
+  if (recv->d3dDevice) { recv->d3dDevice->Release(); recv->d3dDevice = nullptr; }
+  recv->sharedName.clear();
+  recv->sharedWidth = 0;
+  recv->sharedHeight = 0;
+}
+
+// (Re)build the named shared texture at the incoming frame size.
+// Returns false on any HRESULT failure; callers fall back to the CPU
+// frame path so a D3D hiccup never breaks reception.
+bool EnsureReceiverSharedTexture(NdiReceiver* recv, int width, int height) {
+  if (recv->sharedTexture && recv->sharedWidth == width && recv->sharedHeight == height) {
+    return true;
+  }
+  // Size change: drop texture + handle, keep the device.
+  if (recv->sharedHandle) { CloseHandle(recv->sharedHandle); recv->sharedHandle = nullptr; }
+  if (recv->sharedTexture) { recv->sharedTexture->Release(); recv->sharedTexture = nullptr; }
+  recv->sharedName.clear();
+
+  if (!recv->d3dDevice) {
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    D3D_FEATURE_LEVEL got;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                                   &recv->d3dDevice, &got, &recv->d3dContext);
+    if (FAILED(hr) || !recv->d3dDevice) return false;
+  }
+
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = static_cast<UINT>(width);
+  desc.Height = static_cast<UINT>(height);
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  // Same rationale as win_capture_addon.cpp: NT handle because the
+  // core's D3D12 import only accepts NT handles; D3D11 mandates
+  // KEYEDMUTEX alongside NTHANDLE. The core reads without acquiring —
+  // torn frames self-correct on the next update.
+  desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+  HRESULT hr = recv->d3dDevice->CreateTexture2D(&desc, nullptr, &recv->sharedTexture);
+  if (FAILED(hr) || !recv->sharedTexture) return false;
+
+  IDXGIResource1* dxgi1 = nullptr;
+  hr = recv->sharedTexture->QueryInterface(__uuidof(IDXGIResource1), (void**)&dxgi1);
+  if (FAILED(hr) || !dxgi1) {
+    recv->sharedTexture->Release();
+    recv->sharedTexture = nullptr;
+    return false;
+  }
+  // Named handle — main.js's process-local import path resolves shared
+  // textures by name (sendTextureByName / OpenSharedHandleByName), so
+  // an anonymous handle would be unusable across processes. Name is
+  // unique per receiver object + size generation.
+  static std::atomic<uint64_t> g_ndi_shared_serial{0};
+  char nameBuf[128];
+  snprintf(nameBuf, sizeof(nameBuf), "GhostArcade.NDI.Recv.%p.%llu",
+           static_cast<void*>(recv),
+           static_cast<unsigned long long>(++g_ndi_shared_serial));
+  std::wstring wname(nameBuf, nameBuf + strlen(nameBuf));
+  hr = dxgi1->CreateSharedHandle(nullptr,
+                                 DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                 wname.c_str(), &recv->sharedHandle);
+  dxgi1->Release();
+  if (FAILED(hr) || !recv->sharedHandle) {
+    recv->sharedTexture->Release();
+    recv->sharedTexture = nullptr;
+    return false;
+  }
+  recv->sharedName = nameBuf;
+  recv->sharedWidth = width;
+  recv->sharedHeight = height;
+  return true;
+}
+#endif
 std::map<std::string, std::unique_ptr<NdiReceiver>> g_receivers;
 std::mutex g_recv_mutex;
 bool g_cleanup_hook_registered = false;
@@ -235,6 +366,14 @@ void CleanupAddonResources() {
         NDIlib_recv_destroy(entry.second->instance);
         entry.second->instance = nullptr;
       }
+#if defined(__APPLE__)
+      if (entry.second && entry.second->sharedSurface) {
+        CFRelease(entry.second->sharedSurface);
+        entry.second->sharedSurface = nullptr;
+      }
+#elif defined(_WIN32)
+      ReleaseReceiverD3D(entry.second.get());
+#endif
     }
     g_receivers.clear();
   }
@@ -353,6 +492,14 @@ Napi::Value CreateReceiver(const Napi::CallbackInfo& info) {
     auto it = g_receivers.find(sourceName);
     if (it != g_receivers.end() && it->second->instance) {
       NDIlib_recv_destroy(it->second->instance);
+#if defined(__APPLE__)
+      if (it->second->sharedSurface) {
+        CFRelease(it->second->sharedSurface);
+        it->second->sharedSurface = nullptr;
+      }
+#elif defined(_WIN32)
+      ReleaseReceiverD3D(it->second.get());
+#endif
       g_receivers.erase(it);
     }
     g_receivers[sourceName] = std::move(receiver);
@@ -373,7 +520,127 @@ Napi::Value DestroyReceiver(const Napi::CallbackInfo& info) {
     g_receivers.erase(it);
   }
   if (recv && recv->instance) NDIlib_recv_destroy(recv->instance);
+#if defined(__APPLE__)
+  if (recv && recv->sharedSurface) {
+    CFRelease(recv->sharedSurface);
+    recv->sharedSurface = nullptr;
+  }
+#elif defined(_WIN32)
+  ReleaseReceiverD3D(recv.get());
+#endif
   return Napi::Boolean::New(env, true);
+}
+
+#if defined(__APPLE__)
+IOSurfaceRef EnsureReceiverSurface(NdiReceiver* recv, int width, int height) {
+  if (recv->sharedSurface &&
+      IOSurfaceGetWidth(recv->sharedSurface) == static_cast<size_t>(width) &&
+      IOSurfaceGetHeight(recv->sharedSurface) == static_cast<size_t>(height)) {
+    return recv->sharedSurface;
+  }
+  if (recv->sharedSurface) {
+    CFRelease(recv->sharedSurface);
+    recv->sharedSurface = nullptr;
+  }
+
+  CFMutableDictionaryRef properties = CFDictionaryCreateMutable(
+    kCFAllocatorDefault,
+    0,
+    &kCFTypeDictionaryKeyCallBacks,
+    &kCFTypeDictionaryValueCallBacks
+  );
+  int bytesPerElement = 4;
+  int bytesPerRow = width * bytesPerElement;
+  int allocSize = bytesPerRow * height;
+  uint32_t pixelFormat = static_cast<uint32_t>(NDIlib_FourCC_type_BGRA);
+  CFNumberRef widthValue = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
+  CFNumberRef heightValue = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
+  CFNumberRef elementValue = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bytesPerElement);
+  CFNumberRef rowValue = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bytesPerRow);
+  CFNumberRef sizeValue = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &allocSize);
+  CFNumberRef formatValue = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixelFormat);
+  CFDictionarySetValue(properties, kIOSurfaceWidth, widthValue);
+  CFDictionarySetValue(properties, kIOSurfaceHeight, heightValue);
+  CFDictionarySetValue(properties, kIOSurfaceBytesPerElement, elementValue);
+  CFDictionarySetValue(properties, kIOSurfaceBytesPerRow, rowValue);
+  CFDictionarySetValue(properties, kIOSurfaceAllocSize, sizeValue);
+  CFDictionarySetValue(properties, kIOSurfacePixelFormat, formatValue);
+  recv->sharedSurface = IOSurfaceCreate(properties);
+  CFRelease(widthValue);
+  CFRelease(heightValue);
+  CFRelease(elementValue);
+  CFRelease(rowValue);
+  CFRelease(sizeValue);
+  CFRelease(formatValue);
+  CFRelease(properties);
+  return recv->sharedSurface;
+}
+#endif
+
+bool CaptureReceiverFrame(NdiReceiver* recv, bool keepCpuFrame) {
+  NDIlib_video_frame_v2_t videoFrame = {};
+  NDIlib_frame_type_e ft = NDIlib_recv_capture_v2(recv->instance, &videoFrame, nullptr, nullptr, 0);
+  if (ft != NDIlib_frame_type_video) return false;
+
+  const int width = videoFrame.xres;
+  const int height = videoFrame.yres;
+  const size_t sourceStride = videoFrame.line_stride_in_bytes > 0
+    ? static_cast<size_t>(videoFrame.line_stride_in_bytes)
+    : static_cast<size_t>(width) * 4;
+  const size_t rowBytes = static_cast<size_t>(width) * 4;
+
+  if (keepCpuFrame) {
+    recv->lastFrame.resize(rowBytes * static_cast<size_t>(height));
+    for (int row = 0; row < height; row++) {
+      memcpy(
+        recv->lastFrame.data() + static_cast<size_t>(row) * rowBytes,
+        videoFrame.p_data + static_cast<size_t>(row) * sourceStride,
+        rowBytes
+      );
+    }
+  }
+
+#if defined(__APPLE__)
+  IOSurfaceRef surface = EnsureReceiverSurface(recv, width, height);
+  if (surface) {
+    IOSurfaceLock(surface, 0, nullptr);
+    auto* destination = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(surface));
+    const size_t destinationStride = IOSurfaceGetBytesPerRow(surface);
+    for (int row = 0; row < height; row++) {
+      memcpy(
+        destination + static_cast<size_t>(row) * destinationStride,
+        videoFrame.p_data + static_cast<size_t>(row) * sourceStride,
+        rowBytes
+      );
+    }
+    IOSurfaceUnlock(surface, 0, nullptr);
+  }
+#elif defined(_WIN32)
+  // DXGI twin of the IOSurface mirror above: keep a named shared
+  // D3D11 texture updated with the latest frame so the render core can
+  // import it zero-copy by name. Failures fall through silently — the
+  // CPU lastFrame path above remains the source of truth.
+  if (EnsureReceiverSharedTexture(recv, width, height)) {
+    IDXGIKeyedMutex* mtx = nullptr;
+    recv->sharedTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&mtx);
+    bool locked = mtx && SUCCEEDED(mtx->AcquireSync(0, 0));
+    if (!mtx || locked) {
+      recv->d3dContext->UpdateSubresource(
+        recv->sharedTexture, 0, nullptr,
+        videoFrame.p_data,
+        static_cast<UINT>(sourceStride), 0);
+      recv->d3dContext->Flush();
+    }
+    if (locked) mtx->ReleaseSync(0);
+    if (mtx) mtx->Release();
+  }
+#endif
+
+  recv->lastWidth = width;
+  recv->lastHeight = height;
+  recv->framesReceived++;
+  NDIlib_recv_free_video_v2(recv->instance, &videoFrame);
+  return true;
 }
 
 // Pull the next frame from a receiver. Returns:
@@ -396,26 +663,8 @@ Napi::Value ReceiveFrame(const Napi::CallbackInfo& info) {
     recv = it->second.get();
   }
 
-  NDIlib_video_frame_v2_t videoFrame = {};
-  // Timeout 0 = non-blocking. We poll from the renderer at frame rate.
-  NDIlib_frame_type_e ft = NDIlib_recv_capture_v2(recv->instance, &videoFrame, nullptr, nullptr, 0);
-  if (ft != NDIlib_frame_type_video) {
-    // Audio / metadata / nothing — caller polls again next tick.
-    if (ft == NDIlib_frame_type_audio || ft == NDIlib_frame_type_metadata) {
-      // Free non-video frames immediately; we don't expose them.
-      NDIlib_recv_free_video_v2(recv->instance, &videoFrame);
-    }
-    return env.Null();
-  }
-  // Copy the BGRA pixels into our persistent buffer THEN free the NDI
-  // frame — keeping NDI's buffer around violates the "free before
-  // next capture" contract and breaks bandwidth.
-  size_t bytes = static_cast<size_t>(videoFrame.xres) * videoFrame.yres * 4;
-  recv->lastFrame.assign(videoFrame.p_data, videoFrame.p_data + bytes);
-  recv->lastWidth = videoFrame.xres;
-  recv->lastHeight = videoFrame.yres;
-  recv->framesReceived++;
-  NDIlib_recv_free_video_v2(recv->instance, &videoFrame);
+  if (!CaptureReceiverFrame(recv, true)) return env.Null();
+  const size_t bytes = static_cast<size_t>(recv->lastWidth) * recv->lastHeight * 4;
 
   Napi::Object out = Napi::Object::New(env);
   out.Set("width",  Napi::Number::New(env, recv->lastWidth));
@@ -426,6 +675,65 @@ Napi::Value ReceiveFrame(const Napi::CallbackInfo& info) {
   // can hold the data across ticks.
   out.Set("data", Napi::Buffer<uint8_t>::Copy(env, recv->lastFrame.data(), bytes));
   return out;
+}
+
+Napi::Value ReceiveTextureInfo(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsObject()) return env.Null();
+  const std::string sourceName = info[0].As<Napi::Object>().Get("sourceName").As<Napi::String>().Utf8Value();
+
+  NdiReceiver* recv = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_recv_mutex);
+    auto it = g_receivers.find(sourceName);
+    if (it == g_receivers.end()) return env.Null();
+    recv = it->second.get();
+  }
+  CaptureReceiverFrame(recv, false);
+
+#if defined(__APPLE__)
+  if (!recv->sharedSurface || recv->lastWidth <= 0 || recv->lastHeight <= 0) return env.Null();
+  IOSurfaceID surfaceID = IOSurfaceGetID(recv->sharedSurface);
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("available", Napi::Boolean::New(env, true));
+  out.Set("handle", Napi::Buffer<uint8_t>::Copy(
+    env,
+    reinterpret_cast<uint8_t*>(&surfaceID),
+    sizeof(surfaceID)
+  ));
+  out.Set("width", Napi::Number::New(env, recv->lastWidth));
+  out.Set("height", Napi::Number::New(env, recv->lastHeight));
+  out.Set("frame", Napi::Number::New(env, static_cast<double>(recv->framesReceived)));
+  out.Set("format", Napi::Number::New(env, 80));
+  out.Set("senderName", Napi::String::New(env, recv->sourceName));
+  return out;
+#elif defined(_WIN32)
+  // Groundwork (untested on hardware): mirrors the shape the native
+  // renderer publishes for its own DXGI output export (main.rs
+  // get_output_shared_texture, windows branch) so the existing
+  // shared_name import path in main.js can consume it unchanged.
+  if (!recv->sharedTexture || recv->sharedName.empty() ||
+      recv->lastWidth <= 0 || recv->lastHeight <= 0) return env.Null();
+  const uint64_t handleValue = reinterpret_cast<uint64_t>(recv->sharedHandle);
+  Napi::Object out = Napi::Object::New(env);
+  out.Set("available", Napi::Boolean::New(env, true));
+  out.Set("platform", Napi::String::New(env, "dxgi"));
+  out.Set("preferred_transport", Napi::String::New(env, "shared_name"));
+  out.Set("name", Napi::String::New(env, recv->sharedName));
+  out.Set("shared_name", Napi::String::New(env, recv->sharedName));
+  out.Set("handle", Napi::String::New(env, std::to_string(handleValue)));
+  out.Set("handle_encoding", Napi::String::New(env, "integer"));
+  out.Set("handle_scope", Napi::String::New(env, "process-local"));
+  out.Set("handle_byte_length", Napi::Number::New(env, 8));
+  out.Set("width", Napi::Number::New(env, recv->lastWidth));
+  out.Set("height", Napi::Number::New(env, recv->lastHeight));
+  out.Set("format", Napi::String::New(env, "bgra8unorm"));
+  out.Set("frame", Napi::Number::New(env, static_cast<double>(recv->framesReceived)));
+  out.Set("senderName", Napi::String::New(env, recv->sourceName));
+  return out;
+#else
+  return env.Null();
+#endif
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -444,6 +752,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("createReceiver",  Napi::Function::New(env, CreateReceiver));
   exports.Set("destroyReceiver", Napi::Function::New(env, DestroyReceiver));
   exports.Set("receiveFrame",    Napi::Function::New(env, ReceiveFrame));
+  exports.Set("receiveTextureInfo", Napi::Function::New(env, ReceiveTextureInfo));
   return exports;
 }
 

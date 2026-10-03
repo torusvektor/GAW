@@ -71,6 +71,83 @@ if(WIN32)
         CXX_STANDARD 17
     )
 
+    # --- WINDOWS: embedded native preview presenter (DXGI twin of
+    # native_preview_addon.mm). Presents the render core's named D3D12 shared
+    # texture into a child HWND parented to the Electron window.
+    add_library(dxgi_preview_addon SHARED
+        dxgi_preview_addon.cpp
+        ${CMAKE_JS_SRC}
+    )
+
+    target_include_directories(dxgi_preview_addon PRIVATE
+        ${CMAKE_JS_INC}
+        ${NODE_ADDON_API_DIR}
+    )
+
+    target_link_libraries(dxgi_preview_addon PRIVATE
+        ${CMAKE_JS_LIB}
+        d3d11
+        dxgi
+        dxguid
+    )
+
+    if(MSVC)
+        target_compile_options(dxgi_preview_addon PRIVATE /W0)
+    endif()
+
+    target_compile_definitions(dxgi_preview_addon PRIVATE
+        UNICODE
+        _UNICODE
+        NAPI_VERSION=9
+        NODE_ADDON_API_DISABLE_DEPRECATED
+    )
+
+    set_target_properties(dxgi_preview_addon PROPERTIES
+        PREFIX ""
+        SUFFIX ".node"
+        CXX_STANDARD 17
+    )
+
+    # --- WINDOWS: native live capture (webcam via Media Foundation, screen
+    # via DXGI Desktop Duplication). DXGI twin of live_capture_addon.mm —
+    # returns a shared D3D11 texture HANDLE that the broker duplicates into
+    # the render-core process.
+    add_library(win_capture_addon SHARED
+        win_capture_addon.cpp
+        ${CMAKE_JS_SRC}
+    )
+    target_include_directories(win_capture_addon PRIVATE
+        ${CMAKE_JS_INC}
+        ${NODE_ADDON_API_DIR}
+    )
+    target_link_libraries(win_capture_addon PRIVATE
+        ${CMAKE_JS_LIB}
+        d3d11
+        dxgi
+        dxguid
+        mf
+        mfplat
+        mfreadwrite
+        mfuuid
+        ole32
+        # Windows.Graphics.Capture (C++/WinRT) — screen + per-window capture.
+        WindowsApp
+    )
+    if(MSVC)
+        target_compile_options(win_capture_addon PRIVATE /W0)
+    endif()
+    target_compile_definitions(win_capture_addon PRIVATE
+        UNICODE
+        _UNICODE
+        NAPI_VERSION=9
+        NODE_ADDON_API_DISABLE_DEPRECATED
+    )
+    set_target_properties(win_capture_addon PROPERTIES
+        PREFIX ""
+        SUFFIX ".node"
+        CXX_STANDARD 17
+    )
+
 elseif(APPLE)
     # --- macOS: Syphon ---
     set(ADDON_NAME "syphon_addon")
@@ -178,6 +255,97 @@ elseif(APPLE)
         COMMENT "Rewriting Syphon install_name to @rpath, staging Syphon.framework, and re-signing for Apple Silicon"
     )
 
+    # --- macOS: embedded native editor preview presenter ---
+    add_library(native_preview_addon SHARED
+        native_preview_addon.mm
+        ${CMAKE_JS_SRC}
+    )
+
+    find_library(QUARTZCORE_FRAMEWORK QuartzCore)
+    find_library(METAL_FRAMEWORK Metal)
+    find_library(IOSURFACE_FRAMEWORK IOSurface)
+    find_library(COREVIDEO_FRAMEWORK CoreVideo)
+
+    target_include_directories(native_preview_addon PRIVATE
+        ${CMAKE_JS_INC}
+        ${NODE_ADDON_API_DIR}
+    )
+
+    target_link_libraries(native_preview_addon PRIVATE
+        ${CMAKE_JS_LIB}
+        ${COCOA_FRAMEWORK}
+        ${QUARTZCORE_FRAMEWORK}
+        ${METAL_FRAMEWORK}
+        ${IOSURFACE_FRAMEWORK}
+        ${COREVIDEO_FRAMEWORK}
+    )
+
+    target_compile_definitions(native_preview_addon PRIVATE
+        NAPI_VERSION=9
+        NODE_ADDON_API_DISABLE_DEPRECATED
+    )
+
+    set_target_properties(native_preview_addon PROPERTIES
+        PREFIX ""
+        SUFFIX ".node"
+        CXX_STANDARD 17
+    )
+
+    set_source_files_properties(native_preview_addon.mm PROPERTIES
+        COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
+    )
+
+    add_custom_command(TARGET native_preview_addon POST_BUILD
+        COMMAND codesign --force --sign - "$<TARGET_FILE:native_preview_addon>" || true
+        COMMENT "Re-signing native_preview_addon for Apple Silicon"
+    )
+
+    # --- macOS: native webcam + ScreenCaptureKit source acquisition ---
+    add_library(live_capture_addon SHARED
+        live_capture_addon.mm
+        ${CMAKE_JS_SRC}
+    )
+
+    find_library(AVFOUNDATION_FRAMEWORK AVFoundation)
+    find_library(COREMEDIA_FRAMEWORK CoreMedia)
+    find_library(SCREENCAPTUREKIT_FRAMEWORK ScreenCaptureKit)
+
+    target_include_directories(live_capture_addon PRIVATE
+        ${CMAKE_JS_INC}
+        ${NODE_ADDON_API_DIR}
+    )
+
+    target_link_libraries(live_capture_addon PRIVATE
+        ${CMAKE_JS_LIB}
+        ${COCOA_FRAMEWORK}
+        ${AVFOUNDATION_FRAMEWORK}
+        ${COREMEDIA_FRAMEWORK}
+        ${COREVIDEO_FRAMEWORK}
+        ${IOSURFACE_FRAMEWORK}
+        ${METAL_FRAMEWORK}
+        ${SCREENCAPTUREKIT_FRAMEWORK}
+    )
+
+    target_compile_definitions(live_capture_addon PRIVATE
+        NAPI_VERSION=9
+        NODE_ADDON_API_DISABLE_DEPRECATED
+    )
+
+    set_target_properties(live_capture_addon PROPERTIES
+        PREFIX ""
+        SUFFIX ".node"
+        CXX_STANDARD 17
+    )
+
+    set_source_files_properties(live_capture_addon.mm PROPERTIES
+        COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
+    )
+
+    add_custom_command(TARGET live_capture_addon POST_BUILD
+        COMMAND codesign --force --sign - "$<TARGET_FILE:live_capture_addon>" || true
+        COMMENT "Re-signing live_capture_addon for Apple Silicon"
+    )
+
 endif()
 
 # ============================================================
@@ -270,6 +438,8 @@ if(APPLE)
     endforeach()
 elseif(WIN32)
     list(APPEND NDI_SDK_CANDIDATES
+        "C:/Program Files/NDI/NDI 6 SDK"
+        "C:/Program Files/NDI/NDI 5 SDK"
         "C:/Program Files/NDI/NDI Advanced SDK"
         "C:/Program Files/NDI/NDI SDK"
         "C:/Program Files/NewTek/NDI SDK"
@@ -334,6 +504,10 @@ if(NDI_FOUND)
     )
 
     if(APPLE)
+        target_link_libraries(ndi_addon PRIVATE
+            "-framework CoreFoundation"
+            "-framework IOSurface"
+        )
         # libndi.dylib's install_name points at the SDK install path.
         # Rewrite to @rpath for local developer testing. Release packaging
         # excludes NDI runtime binaries unless we replace this with a proper

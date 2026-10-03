@@ -55,12 +55,34 @@ const DEFAULT_OPTS: Required<MediaPipeStartOptions> = {
 
 // Public CDN URLs for the model files. Phase 1 fetches them at runtime
 // — Phase 2 can optionally bundle a local copy for offline use.
-const HAND_MODEL_URL    = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
-const GESTURE_MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task';
+// Models are BUNDLED (public/mediapipe/models/) and served from our origin —
+// runtime CDN fetches were the "MediaPipe not loading" failure (offline/CSP/
+// firewall kills storage.googleapis.com and HandFX silently never starts).
+// The CDN URLs remain as a fallback if the local copies are missing.
+const HAND_MODEL_CDN_URL    = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const GESTURE_MODEL_CDN_URL = 'https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task';
+
+function localModelUrl(name: string): string {
+  // Same document-relative resolution as the WASM path below (see comment):
+  // works in dev (http://localhost:1420) and Electron prod (file://…/dist).
+  return new URL(`./mediapipe/models/${name}`, document.baseURI).toString();
+}
+
+async function resolveModelUrl(name: string, cdnFallback: string): Promise<string> {
+  const local = localModelUrl(name);
+  try {
+    const probe = await fetch(local, { method: 'HEAD' });
+    if (probe.ok) return local;
+  } catch {
+    /* local copy missing — fall through to CDN */
+  }
+  console.warn(`[MediaPipe] bundled model ${name} unavailable, falling back to CDN`);
+  return cdnFallback;
+}
 
 export type GestureListener = (signal: SignalFrame) => void;
 
-class MediaPipeSource {
+export class MediaPipeSource {
   private worker: Worker | null = null;
   private workerReady = false;
   private video: HTMLVideoElement | null = null;
@@ -85,13 +107,19 @@ class MediaPipeSource {
   private frameCounter = 0;
   private startToken = 0;
 
+  /** The preview and inference must use the same selfie convention. */
+  isMirrored(): boolean { return this.opts.mirror; }
+  setMirror(mirror: boolean): void { this.opts.mirror = mirror; }
+
   /** Start the pipeline. Idempotent — calling while running with the
    *  same opts is a no-op; with different opts, stops and restarts. */
   async start(opts: MediaPipeStartOptions = {}): Promise<void> {
     const next: Required<MediaPipeStartOptions> = { ...DEFAULT_OPTS, ...opts };
+    // Render sync can request startup every frame while camera/model loading
+    // is pending. Join that attempt instead of launching another camera/worker.
+    if (this.pendingStart) return this.pendingStart;
     if (this.running && optsEqual(this.opts, next)) return;
     if (this.running) await this.stop();
-    if (this.pendingStart) await this.pendingStart.catch(() => {});
     const token = ++this.startToken;
     this.pendingStart = this._startInternal(next, token).finally(() => { this.pendingStart = null; });
     return this.pendingStart;
@@ -131,6 +159,7 @@ class MediaPipeSource {
   }
 
   isRunning(): boolean { return this.running; }
+  isStarting(): boolean { return this.pendingStart !== null; }
   getError(): string | null { return this.error; }
   getLastFrame(): SignalFrame { return this.lastFrame; }
   getVideoElement(): HTMLVideoElement | null { return this.video; }
@@ -235,11 +264,15 @@ class MediaPipeSource {
         };
         localWorker!.addEventListener('message', onMsg);
       });
+      const [handModelUrl, gestureModelUrl] = await Promise.all([
+        resolveModelUrl('hand_landmarker.task', HAND_MODEL_CDN_URL),
+        resolveModelUrl('gesture_recognizer.task', GESTURE_MODEL_CDN_URL),
+      ]);
       localWorker.postMessage({
         type: 'init',
         wasmUrl,
-        handModelUrl: HAND_MODEL_URL,
-        gestureModelUrl: GESTURE_MODEL_URL,
+        handModelUrl,
+        gestureModelUrl,
         useGesture: opts.useGesture,
         numHands: opts.numHands,
       });

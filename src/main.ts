@@ -6,7 +6,7 @@ import { silenceThreeSerializationNoise } from './lib/utils/silenceThreePatches'
 // land before any markup mounts.
 import './lib/theming/store';
 // Theme-aware webfonts. The app uses two families globally: Space
-// Grotesk for UI/display and IBM Plex Mono for technical readouts.
+// Grotesk for UI/display and Geist Mono for technical readouts.
 import './lib/theming/fonts.css';
 // Global skin overrides — re-skins the existing markup to the v10
 // visual identity (toolbar chips, layer rows, faders, status bar) so
@@ -195,7 +195,10 @@ async function init() {
       target: document.getElementById('app')!,
     });
   } else {
-    // Normal mode: full UI
+    // Normal mode: full UI. Keep interactive help out of projection outputs.
+    const { installContextHelp } = await import('./lib/help/contextHelp');
+    const disposeHelp = installContextHelp();
+    import.meta.hot?.dispose(disposeHelp);
     const { default: App } = await import('./App.svelte');
     mount(App, {
       target: document.getElementById('app')!,

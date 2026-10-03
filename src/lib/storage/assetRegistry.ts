@@ -71,6 +71,19 @@ function blobToDataUrl(blob: Blob): Promise<string> {
  * The returned `runtimeUrl` is a `blob:` URL the caller can hand to <video>,
  * <img>, Three.js loaders, etc. immediately.
  */
+/**
+ * Does this ref point at something that still exists after the session ends?
+ *
+ * A ref carrying only name/mime/size is a husk: enough to label a clip in the
+ * UI, nothing to reload it from. That is the difference between a project that
+ * reopens and one that reopens empty, so the check lives next to the AssetRef
+ * definition rather than being restated per call site.
+ */
+export function hasDurableAssetLocation(ref: AssetRef | null | undefined): ref is AssetRef {
+  const durableUrl = ref?.url && !ref.url.startsWith('blob:');
+  return !!(ref?.projectPath || ref?.originalPath || ref?.dataUrl || durableUrl);
+}
+
 export function createAssetRefFromFile(file: File): CapturedAsset {
   const w = window as any;
   const electronPath: string | null = w.electronAPI?.getPathForFile?.(file) || null;
@@ -151,6 +164,87 @@ export async function createAssetRefFromGeneratedBlob(
 }
 
 /**
+ * Capture an AssetRef for a picked File that is durable even when the file has
+ * no path on disk.
+ *
+ * createAssetRefFromFile leans on webUtils.getPathForFile, which returns '' for
+ * anything that did not come from the OS filesystem — a drag out of a browser
+ * window, a sandboxed source, or any browser build. That empty path produced a
+ * ref with no originalPath and no dataUrl, so the clip saved with nothing but a
+ * session blob: URL and reopened dead. Dragging media straight into the deck is
+ * the most direct way to hit it.
+ *
+ * The sync path stays the fast path: a real OS file keeps its disk path and
+ * nothing is copied. Only when that fails do we pay to persist the bytes, which
+ * is the same route generated media already takes.
+ */
+export async function createDurableAssetRefFromFile(file: File): Promise<CapturedAsset> {
+  const captured = createAssetRefFromFile(file);
+  if (hasDurableAssetLocation(captured.assetRef)) return captured;
+  // Reuse the runtime URL already created above so this does not leak a second
+  // object URL for the same file.
+  return createAssetRefFromGeneratedBlob(
+    file,
+    file.name,
+    file.type || undefined,
+    captured.runtimeUrl,
+  );
+}
+
+/**
+ * Rebuild runtime URLs from AssetRefs anywhere in an arbitrary object tree.
+ *
+ * The project import path resolves each known field explicitly, but several
+ * subtrees are copied through wholesale — stage presets, SV keyboard presets,
+ * global presets in localStorage. Those hold the same layer/media shapes, and
+ * because save-time blob-stripping blanks a runtime URL whenever an AssetRef
+ * exists, a tree that never gets resolved comes back with empty `src` fields
+ * and renders nothing. This walker is the catch-all for those trees.
+ *
+ * `resolve` lets the caller supply a project-dir-aware resolver (the import
+ * path has one, and it also handles legacy relative paths); the default is
+ * plain AssetRef resolution with no project directory.
+ */
+export type AssetFieldResolver = (ref: unknown, currentValue: string) => string;
+
+const ASSET_TREE_FIELDS: Array<[field: string, refKey: string]> = [
+  ['src', '_assetRef'],
+  ['mediaSrc', '_assetRef'],
+  ['modelData', '_assetRef'],
+  ['filePath', '_assetRef'],
+  ['texturePath', '_textureAssetRef'],
+  ['sourceUrl', '_sourceAssetRef'],
+  // Projection-sim imported models (ProjectionSimObject).
+  ['assetUrl', 'assetRef'],
+  ['url', 'assetRef'],
+];
+
+export function resolveAssetTreeInPlace(root: unknown, resolve?: AssetFieldResolver): void {
+  const resolveField: AssetFieldResolver =
+    resolve ?? ((ref, current) => resolveAssetRefForRuntime(ref as AssetRef, undefined, current) ?? current);
+  const seen = new WeakSet<object>();
+  const walk = (node: any) => {
+    if (!node || typeof node !== 'object') return;
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    for (const [field, refKey] of ASSET_TREE_FIELDS) {
+      if (!(field in node)) continue;
+      const ref = node[refKey] ?? (refKey === 'assetRef' ? node._assetRef : undefined);
+      if (!ref || typeof ref !== 'object') continue;
+      const current = typeof node[field] === 'string' ? node[field] : '';
+      const resolved = resolveField(ref, current);
+      if (resolved) node[field] = resolved;
+    }
+    for (const value of Object.values(node)) walk(value);
+  };
+  walk(root);
+}
+
+/**
  * Convert a Windows or Unix absolute path to a renderer-loadable URL.
  *
  * Why not file://: Chromium blocks file:// in the renderer ("Not allowed
@@ -210,7 +304,9 @@ export function resolveAssetRefForRuntime(
   }
   // Legacy fallback — relative-path projects from before AssetRef shipped.
   if (fallbackSrc) {
-    if (/^(https?:|blob:|data:|ghost-asset:)/i.test(fallbackSrc)) return fallbackSrc;
+    // Drive letters before schemes: `C:\clip.mp4` looks like one, but a real
+    // scheme is two or more characters and a drive is exactly one.
+    if (/^[A-Za-z]:[\\/]/.test(fallbackSrc)) return pathToFileUrl(fallbackSrc);
     if (/^file:/i.test(fallbackSrc)) {
       const m = fallbackSrc.match(/^file:\/\/+(.*)$/i);
       if (!m) return fallbackSrc;
@@ -220,7 +316,12 @@ export function resolveAssetRefForRuntime(
         return fallbackSrc;
       }
     }
-    if (/^[A-Za-z]:\\/.test(fallbackSrc) || fallbackSrc.startsWith('/')) {
+    /* Any other scheme passes through untouched. Listing only
+       https/blob/data/ghost-asset meant `builtin:grid` and `live://webcam/<id>`
+       fell through to the projectDir join below and came back as paths to
+       files that do not exist. */
+    if (/^[A-Za-z][A-Za-z0-9+.-]+:/.test(fallbackSrc)) return fallbackSrc;
+    if (fallbackSrc.startsWith('/')) {
       return pathToFileUrl(fallbackSrc);
     }
     if (projectDir) {

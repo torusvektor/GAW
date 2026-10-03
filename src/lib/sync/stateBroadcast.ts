@@ -15,6 +15,7 @@ import { settings } from '$lib/stores/settings';
 import { vjClipLauncher } from '$lib/stores/vjClipLauncher';
 import { vjLayerSequencer } from '$lib/stores/vjLayerSequencer';
 import { stage3dScene } from '$lib/stage3d/store';
+import { DEFAULT_ATMOSPHERE, DEFAULT_LIGHTING } from '$lib/stage3d/types';
 import { invoke, isDesktopApp } from '$lib/bridge';
 
 const CHANNEL_NAME = 'ghostarcade-state-sync';
@@ -56,6 +57,21 @@ let lastLayerOpacities: Record<string, number> = {};
 let lastLayerMeshGrids: Record<string, any> = {};
 let lastLayerSignatures: Record<string, string> = {};
 let lastLayerIds = '';
+// Stage Designer surfaces (slice geometry, Stage FX effect lists,
+// activeEffectId, automation). A stage-effect trigger changes ONLY
+// project.surfaces — without this signature the diff below reports
+// 'none' and receivers (Stage 3D window) never hear about it, so the
+// popout latches on whatever effect was active when it opened.
+let lastSurfacesSignature = '';
+
+function surfacesSyncSignature(projectState = get(project)): string {
+  const p = projectState as any;
+  try {
+    return JSON.stringify([p.surfaces ?? null, p.activeSurfaceId ?? null]);
+  } catch {
+    return '';
+  }
+}
 let pendingLayerPatches = new Map<string, { id: string; corners?: any; opacity?: number; meshGrid?: any }>();
 let patchThrottle: ReturnType<typeof setTimeout> | null = null;
 
@@ -110,6 +126,7 @@ function resetLayerPatchSnapshot(projectState = get(project)) {
   lastLayerOpacities = nextOpacities;
   lastLayerMeshGrids = nextMeshGrids;
   lastLayerSignatures = nextSignatures;
+  lastSurfacesSignature = surfacesSyncSignature(projectState);
 }
 
 function flushLayerPatches() {
@@ -139,6 +156,10 @@ function diffProjectForSync():
   const currentLayers = get(project).layers;
   const currentIds = currentLayers.map(layer => layer.id).join('|');
   if (!lastLayerIds || currentIds !== lastLayerIds) return { kind: 'full' };
+
+  // Stage FX triggers / slice edits live in project.surfaces, not in
+  // any layer — they need a full export or receivers never see them.
+  if (surfacesSyncSignature() !== lastSurfacesSignature) return { kind: 'full' };
 
   for (const layer of currentLayers) {
     if (lastLayerSignatures[layer.id] !== layerPatchSignature(layer)) return { kind: 'full' };
@@ -825,22 +846,69 @@ function applyStage3DScenePayload(data: any, sourceLabel: string) {
 }
 
 /** Merge an incoming stage3D scene payload while keeping the local
- *  window's editing surface intact. The fields below are owned by the
- *  window currently displaying the 3D viewport (lighting, scenery,
- *  per-screen tweaks, user-placed elements) — they survive every
- *  cross-window broadcast and never get reset by clip-change side
- *  effects. Everything else (camera, environment, schema bumps) takes
- *  the incoming value. */
+ *  viewport's editing surface intact. A fresh Stage 3D popout starts
+ *  with the built-in fallback scene and should accept the sender's scene.
+ *  Once the local viewport has real venue/shapes/lighting edits, those
+ *  local scene fields survive clip-change broadcasts from the editor. */
+function isEmptyRecord(value: any): boolean {
+  return !value || (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0);
+}
+
+function sameSerializable(a: any, b: any): boolean {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
+
+function withDefaults<T extends Record<string, any>>(defaults: T, value: any): T {
+  return { ...defaults, ...(value ?? {}) } as T;
+}
+
+function isPristineFallbackStage3DScene(scene: any): boolean {
+  if (!scene?.schemaVersion || scene.schemaVersion !== 1 || !Array.isArray(scene.nodes)) return false;
+  const venue = scene.venue ?? 'festival';
+  const basePreset = scene.basePreset ?? 'festival';
+  return venue === 'festival'
+    && basePreset === 'festival'
+    && scene.nodes.length === 0
+    && (!Array.isArray(scene.userElements) || scene.userElements.length === 0)
+    && isEmptyRecord(scene.screenOverrides)
+    && isEmptyRecord(scene.sceneryOverrides)
+    && !scene.platform
+    && sameSerializable(scene.camera, { position: [12, 6, 14], target: [0, 2, 0], fov: 50 })
+    && sameSerializable(scene.environment, {
+      background: '#06060a',
+      ambient: 0.4,
+      showGround: true,
+      groundColor: '#15151b',
+    })
+    && sameSerializable(withDefaults(DEFAULT_LIGHTING, scene.lighting), DEFAULT_LIGHTING)
+    && sameSerializable(withDefaults(DEFAULT_ATMOSPHERE, scene.atmosphere), DEFAULT_ATMOSPHERE);
+}
+
 function mergeStage3DScenePreservingLocal(incoming: any): void {
   const current: any = get(stage3dScene);
+  if (isPristineFallbackStage3DScene(current)) {
+    stage3dScene.loadScene(incoming);
+    return;
+  }
   const merged: any = {
     ...incoming,
     // Local-owned: keep ours over incoming. `??` so an undefined local
-    // (e.g. fresh popout) still inherits whatever the sender had.
+    // (e.g. legacy project shape) still inherits whatever the sender had.
+    id:                current.id                ?? incoming.id,
+    name:              current.name              ?? incoming.name,
+    environment:       current.environment       ?? incoming.environment,
+    platform:          current.platform          ?? incoming.platform,
+    camera:            current.camera            ?? incoming.camera,
+    nodes:             current.nodes             ?? incoming.nodes,
+    lightingCueId:     current.lightingCueId     ?? incoming.lightingCueId,
+    basePreset:        current.basePreset        ?? incoming.basePreset,
+    venue:             current.venue             ?? incoming.venue,
     lighting:          current.lighting          ?? incoming.lighting,
+    atmosphere:        current.atmosphere        ?? incoming.atmosphere,
     sceneryOverrides:  current.sceneryOverrides  ?? incoming.sceneryOverrides,
     screenOverrides:   current.screenOverrides   ?? incoming.screenOverrides,
     userElements:      current.userElements      ?? incoming.userElements,
+    meta:              current.meta              ?? incoming.meta,
   };
   stage3dScene.loadScene(merged);
 }

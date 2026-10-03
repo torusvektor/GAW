@@ -1,26 +1,66 @@
 <script lang="ts">
-  import { project, layers, selectedLayer, selectedLayerId, selectedLayerIds, getGroupLayers } from '../stores/layers';
+  import VideoPlaybackDirection from './VideoPlaybackDirection.svelte';
+  import VideoPlaybackModes from './VideoPlaybackModes.svelte';
+  import { nativeVideoTransportSnapshot, nativeVideoLaunchTime } from '../media/nativeTransport';
+  import { project, layers, selectedLayer, selectedLayerId, selectedLayerIds, getGroupLayers, scheduleHistorySnapshot } from '../stores/layers';
+
+  // updateEffectParams itself stays un-hooked in the store: the audio-reactive
+  // modulation engine (src/lib/audio/autoEngine.ts, src/lib/audio/modulation.ts)
+  // calls it continuously too, and a store-level debounce would never quiet
+  // down while modulation is active. This wraps every UI-driven call in this
+  // panel so slider/dropdown edits still get recorded.
+  function updateEffectParamsTracked(layerId: string, effectId: string, params: Record<string, any>) {
+    project.updateEffectParams(layerId, effectId, params);
+    scheduleHistorySnapshot();
+  }
   import { confirmDeleteIfSafeMode } from '../utils/safeMode';
+  import { layerRenderMeshGrid } from '../utils/meshWarp';
   // import AutoMapPanel from './AutoMapPanel.svelte';
   import { vjClipLauncher } from '../stores/vjClipLauncher';
-  import type { BlendMode, MediaSource, Effect, EffectType, ContentFitMode, VideoPlaybackMode, StageEffectType } from '../types';
+  import { probeHasAudioTrack } from '../audio/clipAudioBus';
+  import type { BlendMode, MediaSource, Effect, EffectType, ContentFitMode, VideoPlaybackMode, StageEffectType, Layer } from '../types';
   import { createDefaultMappingCompositionState, generateUUID, VJ_MIX_SOURCE_INDEX } from '../types';
   import { onDestroy, onMount } from 'svelte';
   // ShapeType import removed — Lines layer uses pen tools instead of shape library
   import { getDefaultEffectParams } from '../renderer/effects';
   import { applyPresetToEffect, getEffectPresets, getNumericEffectParams, effectParamLabels } from '../effects/effectUX';
   import { EFFECT_CATALOG } from '../effects/effectCatalog';
+  import { isNativeSelectableEffect } from '../renderer/nativeEffectCoverage';
+  import { isNativeReadyGpuShaderId } from '../renderer/gpuShaderCatalog';
   import { createDefaultStageEffect, getEffectDef, STAGE_EFFECT_CATALOG } from '../stores/stageEffects';
   import EffectPickerModal from './EffectPickerModal.svelte';
+  import EffectChainPresets from './EffectChainPresets.svelte';
   import EdgeEffectsPanel from './EdgeEffectsPanel.svelte';
+  import LooksGallery from './LooksGallery.svelte';
+  import LooksIcon from './LooksIcon.svelte';
+  import StageFxChaseControls from './StageFxChaseControls.svelte';
+  import { isLookTarget } from '../looks/edgeLooks';
   import EffectParamRow from './EffectParamRow.svelte';
+  import CubeLutControls from './CubeLutControls.svelte';
   import PluginIcon from './PluginIcon.svelte';
   import SourceCropModal from './SourceCropModal.svelte';
   import { generateCachedThumbnail } from '../isf/thumbnail';
   import { webgpuSupportedStore } from '../renderer/webgpuCapability';
-  import { createAssetRefFromFile } from '../storage/assetRegistry';
+  import { createDurableAssetRefFromFile } from '../storage/assetRegistry';
+  import { NATIVE_ENGINE_ONLY, settings } from '../stores/settings';
+  import { nativeRendererRuntime, nativeFailedRouteLayers } from '../stores/nativeRenderer';
+  import { createNativeVideoScrubber } from '../renderer/nativeVideoScrubber';
+  import { showToast } from '../stores/errorToast';
   import { maskEditingLayerId } from '../stores/maskEditing';
-  import { syncTrimmedVideoPlayback } from '../utils/videoTrimPlayback';
+  import { paintBrush, paintMaskLayerId, PAINT_BRUSH_SIZE_MAX, PAINT_BRUSH_SIZE_MIN } from '../stores/paintMaskTool';
+  import { nativeUnsupportedEffectTypes, nativeUnsupportedSourceReason } from '../sync/nativeRendererSync';
+  import { nativeEffectChainWarning } from '../renderer/nativeEffectChainPolicy';
+  import MapSurfaceControls from './MapSurfaceControls.svelte';
+
+  /** Which non-group layers offer the VJ Source select. See the call site. */
+  function layerShowsVJSource(layer: Layer): boolean {
+    // Screens have their own "Slice source" select further down, writing the
+    // same vjLayerIndex/vjGroupId. Showing this one too gave a Screen two
+    // selects for one setting.
+    if (layer.type === 'screen' || layer.type === 'mask') return false;
+    // Legacy assignment: keep the control so it can be undone.
+    return layer.vjLayerIndex != null || !!layer.vjGroupId;
+  }
 
   // WebGPU capability — reactive store, NOT a snapshot. The probe is
   // async and may not have resolved when this panel first mounts;
@@ -29,8 +69,72 @@
   // until the next remount.
 
   // Shader thumbnail cache: layerId -> { url, codeSnippet }
+  /*
+   * Per-layer render scale. The empty value is the default and clears the
+   * override, so a layer that has never been touched reads as inheriting
+   * rather than claiming to be pinned at 100% -- which is what "Full" said
+   * before, on every layer, whatever the global tier was set to.
+   *
+   * The first four match the global tiers so the two controls speak the same
+   * language; the last two go below any global tier, for the one heavy
+   * raymarcher that needs to come down on its own.
+   */
+  const LAYER_RENDER_QUALITY_OPTIONS = [
+    { value: '', label: 'Match global' },
+    { value: '1.0', label: 'Native (100%)' },
+    { value: '0.9', label: 'Ultra (90%)' },
+    { value: '0.72', label: 'Balanced (72%)' },
+    { value: '0.56', label: 'Performance (56%)' },
+    { value: '0.4', label: 'Low (40%)' },
+    { value: '0.25', label: 'Minimum (25%)' },
+  ];
+
   let shaderThumbnails: Record<string, string> = {};
   let shaderThumbCodes: Record<string, string> = {}; // track which code generated the thumb
+  $: nativeInventoryLocked = NATIVE_ENGINE_ONLY && Boolean($settings.experimental?.outputNativeCore);
+
+  function nativeEffectPending(effectType: EffectType | string): boolean {
+    return nativeInventoryLocked && !isNativeSelectableEffect(effectType);
+  }
+
+  function toggleLayerEffectIfNativeReady(layerId: string, effect: Effect) {
+    if (nativeEffectPending(effect.type) && !effect.enabled) return;
+    project.toggleEffect(layerId, effect.id);
+  }
+
+  function toggleCompositionEffectIfNativeReady(effect: Effect) {
+    if (nativeEffectPending(effect.type) && !effect.enabled) return;
+    project.toggleMappingCompositionEffect(effect.id);
+  }
+
+  function nativeLayerPendingReason(layer: any): string | null {
+    if (!nativeInventoryLocked) return null;
+    if ($nativeFailedRouteLayers.includes(layer?.id)) {
+      return `gpu-shader:${layer?.gpuLayerContent?.shaderId ?? 'layer'}:route-failed`;
+    }
+    const effects = nativeUnsupportedEffectTypes(layer);
+    if (effects.length > 0) return `effect:${effects.join(',')}:not-native`;
+    const sourceReason = nativeUnsupportedSourceReason(layer, false, {
+      nativeVideoDecodePumpReady: $nativeRendererRuntime.fullV2Ready,
+    });
+    if (
+      layer?.type === 'gpu' &&
+      typeof sourceReason === 'string' &&
+      sourceReason.endsWith(':route-unavailable') &&
+      isNativeReadyGpuShaderId(layer.gpuLayerContent?.shaderId)
+    ) {
+      // Transient: routes report unavailable for a moment during startup
+      // shader warm-up; a badge here would flash on every boot. The
+      // PERMANENT variant (`:route-failed`, the 3-failure kill switch) is
+      // deliberately NOT suppressed — that layer will stay blank and the
+      // operator needs to see it.
+      return null;
+    }
+    return sourceReason;
+  }
+
+  const nativeGeneratedLayerPendingTitle =
+    'Pending native renderer implementation. Use local media or GPU Shader layers in native v2.';
 
   // Reactively generate thumbnails for shader layers
   $: {
@@ -51,7 +155,11 @@
 
   // Layer type dropdown state
   let showAddLayerMenu = false;
+  let showLooks = false;
+  // Invite a first pick: shapes drawn but none dressed yet.
+  $: looksInvite = !showLooks && $project.layers.some(isLookTarget) && !$project.layers.some((layer) => layer.edgeEffects?.effects?.length);
   let addMenuPos = { top: 0, left: 0 };
+  let addLayerBtnEl: HTMLElement | null = null;
   let showSourceCropModal = false;
   $: sourceCropLayer = showSourceCropModal ? $selectedLayer : null;
   // Context menu state. We snapshot the multi-selection IDs at the moment
@@ -235,26 +343,66 @@
 
   // ─── Video Timeline State ───────────────────────────────────────────
   let videoCurrentTime = 0;
+  let videoCurrentDirection = 1;
   let videoDuration = 0;
   let trimDragging: 'start' | 'end' | null = null;
   let timelineScrubbing = false;
   let timelineEl: HTMLDivElement | null = null;
   let videoTickFrame: number | null = null;
+  const videoScrubber = createNativeVideoScrubber();
+  let videoStepBusy = false;
+  let videoScrubRevision = 0;
+  let videoScrubSelection = '';
+  let stopTimelineDrag: (() => void) | null = null;
+  type VideoScrubPatch = {
+    isPlaying: boolean;
+    _nativePlaybackTimeSeconds: number;
+    _nativePlaybackUpdatedAtMs: number;
+    _nativePlaybackSeekSeq: number;
+  };
 
   function formatTime(seconds: number): string {
-    if (!isFinite(seconds) || isNaN(seconds)) return '0:00';
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
-    return `${m}:${s.toString().padStart(2, '0')}`;
+    const millis = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds * 1000)) : 0;
+    const minutes = Math.floor(millis / 60000);
+    const secondsPart = String(Math.floor(millis / 1000) % 60).padStart(2, '0');
+    return `${minutes}:${secondsPart}.${String(millis % 1000).padStart(3, '0')}`;
+  }
+
+  function sourceDuration(source: MediaSource): number {
+    const duration = Number(source.durationSeconds ?? source.videoElement?.duration);
+    return Number.isFinite(duration) && duration > 0 ? duration : 0;
+  }
+
+  function sourcePlaybackTime(source: MediaSource, now = performance.now()): number {
+    return nativeVideoTransportSnapshot(source, now).timeSeconds;
+  }
+
+  function setNativePlaybackTime(layerId: string, source: MediaSource, time: number) {
+    const duration = sourceDuration(source);
+    const nextTime = Math.max(0, duration > 0 ? Math.min(duration, time) : time);
+    source.durationSeconds = duration || source.durationSeconds;
+    source._nativePlaybackDirection = (source.playbackRate ?? 1) < 0 ? -1 : 1;
+    source._nativePlaybackTimeSeconds = nextTime;
+    source._nativePlaybackUpdatedAtMs = performance.now();
+    source._nativePlaybackSeekSeq = Math.max(0, source._nativePlaybackSeekSeq ?? 0) + 1;
+    videoCurrentTime = nextTime;
+    if (source.audioPlayback && source.videoElement) {
+      try { source.videoElement.currentTime = nextTime; } catch { /* native transport remains authoritative */ }
+    }
+    project.updateLayer(layerId, { source: { ...source } });
   }
 
   function startVideoTick() {
     if (videoTickFrame !== null) return;
     function tick() {
       const layer = $selectedLayer;
-      if (layer?.source?.type === 'video' && layer.source.videoElement) {
-        videoCurrentTime = layer.source.videoElement.currentTime;
-        videoDuration = layer.source.videoElement.duration || 0;
+      if (layer?.source?.type === 'video') {
+        videoDuration = sourceDuration(layer.source);
+        if (!timelineScrubbing && !videoStepBusy) {
+          const transport = nativeVideoTransportSnapshot(layer.source);
+          videoCurrentTime = transport.timeSeconds;
+          videoCurrentDirection = transport.direction;
+        }
       }
       videoTickFrame = requestAnimationFrame(tick);
     }
@@ -269,50 +417,168 @@
   }
 
   // Start tick when selected layer is a video
-  $: if ($selectedLayer?.source?.type === 'video' && $selectedLayer.source.videoElement) {
+  $: if ($selectedLayer?.source?.type === 'video') {
     startVideoTick();
   } else {
     stopVideoTick();
   }
 
-  onDestroy(() => stopVideoTick());
+  onDestroy(() => {
+    stopVideoTick();
+    cancelVideoScrub();
+  });
 
   function setPlaybackMode(layerId: string, source: MediaSource, mode: VideoPlaybackMode) {
+    source._nativePlaybackTimeSeconds = sourcePlaybackTime(source);
+    source._nativePlaybackUpdatedAtMs = performance.now();
+    source._nativePlaybackDirection = (source.playbackRate ?? 1) < 0 ? -1 : 1;
+    source._nativePlaybackSeekSeq = (source._nativePlaybackSeekSeq ?? 0) + 1;
     source.playbackMode = mode;
     source._lastFrameTime = performance.now();
-    if (source.videoElement) syncTrimmedVideoPlayback(source.videoElement, source);
-    project.updateLayer(layerId, {});
+    project.updateLayer(layerId, { source: { ...source } });
   }
 
   function setPlaybackRate(layerId: string, source: MediaSource, rate: number) {
-    source.playbackRate = rate;
-    project.updateLayer(layerId, {});
+    cancelVideoScrub();
+    project.updateLayer(layerId, { source: {
+      ...source,
+      _nativePlaybackTimeSeconds: sourcePlaybackTime(source),
+      _nativePlaybackUpdatedAtMs: performance.now(),
+      _nativePlaybackDirection: rate < 0 ? -1 : 1,
+      _nativePlaybackSeekSeq: (source._nativePlaybackSeekSeq ?? 0) + 1,
+      playbackRate: rate,
+    } });
+  }
+
+  /** Opt this media layer in/out of audio playback.
+   *
+   *  layers.ts owns the actual attach/detach — it reconciles the clip audio
+   *  bus against the project on every change, so all this has to do is flip
+   *  the flag and re-anchor the native transport. Re-anchoring matters
+   *  because the audio element is about to start (or stop) chasing the render
+   *  clock, and without a fresh anchor its first correction would be an
+   *  audible hard seek from wherever the element happened to be. */
+  function setSourceAudioPlayback(layerId: string, source: MediaSource, enabled: boolean) {
+    const transport = nativeVideoTransportSnapshot(source);
+    source._nativePlaybackTimeSeconds = transport.timeSeconds;
+    source._nativePlaybackUpdatedAtMs = performance.now();
+    source._nativePlaybackSeekSeq = Math.max(0, source._nativePlaybackSeekSeq ?? 0) + 1;
+    source._nativePlaybackDirection = transport.direction;
+    source.audioPlayback = enabled;
+    source.audioVolume = source.audioVolume ?? 1;
+    source.audioMuted = source.audioMuted === true;
+    project.updateLayer(layerId, { source: { ...source } });
+  }
+
+  /** Volume / mute only — no transport re-anchor needed, these are pure
+   *  gain writes on an already-attached clip. */
+  function setSourceAudioLevels(
+    layerId: string,
+    source: MediaSource,
+    updates: { audioVolume?: number; audioMuted?: boolean },
+  ) {
+    if (updates.audioVolume !== undefined) source.audioVolume = updates.audioVolume;
+    if (updates.audioMuted !== undefined) source.audioMuted = updates.audioMuted;
+    project.updateLayer(layerId, { source: { ...source } });
+  }
+
+  function cancelVideoScrub() {
+    videoScrubRevision++;
+    stopTimelineDrag?.();
+    stopTimelineDrag = null;
+    videoScrubber.cancel();
+    videoStepBusy = false;
+  }
+
+  function syncVideoScrubSelection(key: string) {
+    if (key === videoScrubSelection) return;
+    videoScrubSelection = key;
+    cancelVideoScrub();
+  }
+
+  $: syncVideoScrubSelection(JSON.stringify([
+    $selectedLayer?.id, $selectedLayer?.source?.id, $selectedLayer?.source?.src, $selectedLayer?.source?.type,
+  ]));
+
+  function currentScrubSource(layerId: string, source: MediaSource, revision: number): MediaSource | null {
+    const current = $selectedLayer;
+    return revision === videoScrubRevision && current?.id === layerId
+      && current.source?.type === 'video' && current.source.id === source.id && current.source.src === source.src
+      ? current.source : null;
+  }
+
+  function commitVideoScrub(layerId: string, source: MediaSource, revision: number, patch: VideoScrubPatch) {
+    const current = currentScrubSource(layerId, source, revision);
+    if (!current || Number(current._nativePlaybackSeekSeq ?? 0) > patch._nativePlaybackSeekSeq) return;
+    videoCurrentTime = patch._nativePlaybackTimeSeconds;
+    project.updateLayer(layerId, { source: { ...current, ...patch } });
   }
 
   function handleTimelineMouseDown(e: MouseEvent, layerId: string, source: MediaSource) {
-    if (!timelineEl || !source.videoElement) return;
+    if (!timelineEl || e.button !== 0 || videoStepBusy) return;
     e.stopPropagation();
+    e.preventDefault();
+    cancelVideoScrub();
+    const revision = videoScrubRevision;
+    const wasPlaying = source.isPlaying !== false;
+    const timeline = timelineEl;
+    timeline.focus();
     timelineScrubbing = true;
-    seekToPosition(e, source);
-
-    const onMove = (me: MouseEvent) => seekToPosition(me, source);
-    const onUp = () => {
+    let latestTime = sourcePlaybackTime(source);
+    const commit = (patch: VideoScrubPatch) => commitVideoScrub(layerId, source, revision, patch);
+    const seek = (event: MouseEvent, playing = false, flush = false) => {
+      const current = currentScrubSource(layerId, source, revision);
+      if (!current) return;
+      const rect = timeline.getBoundingClientRect();
+      const pct = Math.max(current.trimStart ?? 0, Math.min(current.trimEnd ?? 1,
+        (event.clientX - rect.left) / (rect.width || 1)));
+      latestTime = pct * sourceDuration(current);
+      videoCurrentTime = latestTime;
+      videoScrubber.seek(current, latestTime, commit, { playing, flush });
+    };
+    const cleanup = () => {
       timelineScrubbing = false;
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onBlur);
+      if (stopTimelineDrag === cleanup) stopTimelineDrag = null;
     };
+    const onMove = (event: MouseEvent) => seek(event);
+    const onUp = (event: MouseEvent) => { seek(event, wasPlaying, true); cleanup(); };
+    const onBlur = () => {
+      const current = currentScrubSource(layerId, source, revision);
+      if (current) videoScrubber.seek(current, latestTime, commit, { playing: wasPlaying, flush: true });
+      cleanup();
+    };
+    stopTimelineDrag = cleanup;
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onBlur);
+    seek(e);
   }
 
-  function seekToPosition(e: MouseEvent, source: MediaSource) {
-    if (!timelineEl || !source.videoElement) return;
-    const rect = timelineEl.getBoundingClientRect();
-    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / (rect.width || 1)));
-    const trimStart = source.trimStart ?? 0;
-    const trimEnd = source.trimEnd ?? 1;
-    const clamped = Math.max(trimStart, Math.min(trimEnd, pct));
-    source.videoElement.currentTime = clamped * (source.videoElement.duration || 0);
+  async function stepVideoFrame(layerId: string, source: MediaSource, direction: -1 | 1) {
+    if (videoStepBusy || timelineScrubbing) return;
+    cancelVideoScrub();
+    const revision = videoScrubRevision;
+    videoStepBusy = true;
+    try {
+      await videoScrubber.step(source, direction,
+        patch => commitVideoScrub(layerId, source, revision, patch));
+    } catch (error) {
+      if (currentScrubSource(layerId, source, revision)) {
+        showToast(error instanceof Error ? error.message : 'Could not step to the next video frame.', 'error');
+      }
+    } finally {
+      if (revision === videoScrubRevision) videoStepBusy = false;
+    }
+  }
+
+  function handleTimelineKeyDown(e: KeyboardEvent, layerId: string, source: MediaSource) {
+    if (e.target !== e.currentTarget || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void stepVideoFrame(layerId, source, e.key === 'ArrowLeft' ? -1 : 1);
   }
 
   function handleTrimMouseDown(e: MouseEvent, which: 'start' | 'end', layerId: string, source: MediaSource) {
@@ -330,8 +596,7 @@
       } else {
         source.trimEnd = Math.max(pct, (source.trimStart ?? 0) + 0.02);
       }
-      if (source.videoElement) syncTrimmedVideoPlayback(source.videoElement, source);
-      project.updateLayer(layerId, {});
+      project.updateLayer(layerId, { source: { ...source } });
     };
 
     const onUp = () => {
@@ -354,7 +619,7 @@
   async function createMediaSource(file: File): Promise<MediaSource> {
     // Capture both runtime URL and durable AssetRef so this layer's source
     // survives save+reload (the blob URL alone won't).
-    const { assetRef, runtimeUrl: url } = createAssetRefFromFile(file);
+    const { assetRef, runtimeUrl: url } = await createDurableAssetRefFromFile(file);
     const mediaType = getMediaType(file);
 
     const source: MediaSource = {
@@ -369,7 +634,7 @@
       const video = document.createElement('video');
       // crossOrigin BEFORE src — order matters on Chromium 130.
       video.crossOrigin = 'anonymous';
-      video.loop = false;
+      video.loop = true;
       video.muted = true;
       video.playsInline = true;
       video.preload = 'auto';
@@ -392,7 +657,10 @@
       // Autoplay the video immediately
       source.videoElement = video;
       source.isPlaying = true;
-      syncTrimmedVideoPlayback(video, source);
+      source.durationSeconds = Number.isFinite(video.duration) ? video.duration : undefined;
+      source._nativePlaybackTimeSeconds = 0;
+      source._nativePlaybackUpdatedAtMs = performance.now();
+      source._nativePlaybackSeekSeq = 1;
       try {
         await video.play();
       } catch (err) {
@@ -486,7 +754,7 @@
     if (Number.isNaN(presetIndex)) return;
     const patch = applyPresetToEffect(effect as any, presetIndex);
     if (!patch) return;
-    project.updateEffectParams(layerId, effect.id, patch);
+    updateEffectParamsTracked(layerId, effect.id, patch);
   }
 
   function toggleMappingCompositionEnabled(enabled: boolean) {
@@ -630,12 +898,26 @@
     else releaseMappingStageEffectHold(effectId);
   }
 
+  // Canvas's empty-state "Add Layer to Get Started" button opens this
+  // panel's Add Layer menu via a window event — the two components have
+  // no direct parent/child relationship.
+  function handleOpenAddLayerMenuEvent() {
+    const btn = addLayerBtnEl;
+    if (btn) {
+      const rect = btn.getBoundingClientRect();
+      addMenuPos = { top: rect.bottom + 4, left: Math.max(8, rect.right - 170) };
+    }
+    showAddLayerMenu = true;
+  }
+
   onMount(() => {
     window.addEventListener('map-stage-effect-hold', handleMappingStageEffectHoldEvent);
+    window.addEventListener('ghost:open-add-layer-menu', handleOpenAddLayerMenuEvent);
   });
 
   onDestroy(() => {
     window.removeEventListener('map-stage-effect-hold', handleMappingStageEffectHoldEvent);
+    window.removeEventListener('ghost:open-add-layer-menu', handleOpenAddLayerMenuEvent);
     releaseAllMappingStageEffectHolds();
   });
 
@@ -646,7 +928,7 @@
     if (!eff) return;
     const binding = layerMacroBindings[effectId]?.[macro];
     if (!binding) return;
-    project.updateEffectParams(selected.id, effectId, { [binding]: value } as any);
+    updateEffectParamsTracked(selected.id, effectId, { [binding]: value } as any);
   }
 
   function onLayerMacro1Change(v: number) {
@@ -714,22 +996,42 @@
       })
     );
   }
+
+  // Picking a shape drops straight into its warp workflow: circle/triangle
+  // get on-canvas warp handles immediately; other shapes leave warp mode.
+  function chooseLayerShape(layerId: string, type: import('../types').LayerShapeType) {
+    project.setLayerShape(layerId, type);
+    const warpable = type === 'circle' || type === 'triangle' || type === 'ellipse' || type === 'polygon' || type === 'star';
+    if (warpable !== shapeWarpEditing) {
+      toggleShapeWarpEditing();
+    }
+  }
+
+  function resetShapeWarp(layerId: string) {
+    project.resetShapeControlPoints(layerId);
+  }
 </script>
 
-<div class="layer-panel">
+<div data-help-page="layers" class="layer-panel">
   <!-- Layers Section (top half when effects are shown) -->
-  <div class="layers-section">
+  <div class="layers-section" class:composition-open={mappingComposition.enabled && compositionPanelOpen}>
     <div class="panel-header">
       <h3>Layers</h3>
+      <button class="btn-add btn-looks" class:invite={looksInvite} class:active={showLooks} type="button"
+        title="One-click beat-synced looks for your shapes" aria-expanded={showLooks}
+        onclick={() => { showLooks = !showLooks; showAddLayerMenu = false; }}>
+        <LooksIcon /> Looks
+      </button>
+      {#if showLooks}<LooksGallery onClose={() => (showLooks = false)} />{/if}
       <div class="add-layer-wrapper">
-        <button class="btn-add" onclick={(e) => {
+        <button class="btn-add" bind:this={addLayerBtnEl} onclick={(e) => {
           showAddLayerMenu = !showAddLayerMenu;
           if (showAddLayerMenu) {
             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
             addMenuPos = { top: rect.bottom + 4, left: Math.max(8, rect.right - 170) };
           }
         }}>
-          + Add Layer
+          <span class="btn-add__plus" aria-hidden="true">+</span> Add Layer
         </button>
         {#if showAddLayerMenu}
           <div class="add-layer-backdrop" onclick={() => showAddLayerMenu = false}></div>
@@ -742,7 +1044,10 @@
               </svg>
               Media Layer
             </button>
-            <button onclick={() => { project.addLayer(undefined, 'media', 'custom'); showAddLayerMenu = false; }}>
+            <button
+              title="Add custom shape media layer"
+              onclick={() => { project.addLayer(undefined, 'media', 'custom'); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polygon points="4,18 2,8 8,2 18,4 22,14 16,20" />
                 <circle cx="4" cy="18" r="1.5" fill="currentColor"/>
@@ -754,11 +1059,14 @@
               </svg>
               Custom Shape
             </button>
-            <button onclick={() => {
-              const id = project.addLayer(undefined, 'mask');
-              if (id) maskEditingLayerId.set(id);
-              showAddLayerMenu = false;
-            }}>
+            <button
+              title="Add mask layer — masks every layer below it"
+              onclick={() => {
+                const id = project.addLayer(undefined, 'mask');
+                if (id) maskEditingLayerId.set(id);
+                showAddLayerMenu = false;
+              }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18Z"/>
                 <path d="M12 3v18"/>
@@ -766,21 +1074,30 @@
               </svg>
               Mask Layer
             </button>
-            <button onclick={() => { project.addLinesLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add lines layer"
+              onclick={() => { project.addLinesLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="4 17 10 7 16 13 20 6"/>
                 <line x1="4" y1="20" x2="20" y2="20"/>
               </svg>
               Lines Layer
             </button>
-            <button onclick={() => { project.addSVGLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add SVG layer"
+              onclick={() => { project.addSVGLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polygon points="12,2 22,20 2,20"/>
                 <polygon points="12,8 17,16 7,16"/>
               </svg>
               SVG Layer
             </button>
-            <button onclick={() => { project.addLightPaintingLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add light painting layer"
+              onclick={() => { project.addLightPaintingLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M9 2L7.17 4H4c-1.1 0-2 .9-2 2v0c0 1.1.9 2 2 2h.5"/>
                 <path d="M12 2c3 4 7 5 7 10a7 7 0 1 1-14 0c0-5 4-6 7-10z"/>
@@ -800,7 +1117,10 @@
             </button>
             -->
 
-            <button onclick={() => { project.addTextLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add text layer"
+              onclick={() => { project.addTextLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="4 7 4 4 20 4 20 7"/>
                 <line x1="9" y1="20" x2="15" y2="20"/>
@@ -808,7 +1128,10 @@
               </svg>
               Text Layer
             </button>
-            <button onclick={() => { project.addSplatLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add splat / point cloud layer"
+              onclick={() => { project.addSplatLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <circle cx="12" cy="12" r="2"/>
                 <circle cx="6" cy="6" r="1.5"/>
@@ -823,7 +1146,10 @@
               </svg>
               Splat / Point Cloud
             </button>
-            <button onclick={() => { project.addModel3DLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add 3D model layer"
+              onclick={() => { project.addModel3DLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M12 2L2 7L12 12L22 7L12 2Z"/>
                 <path d="M2 17L12 22L22 17"/>
@@ -842,17 +1168,20 @@
             </button>
             -->
 
-            {#if $webgpuSupportedStore}
+            {#if $webgpuSupportedStore || nativeInventoryLocked}
               <button onclick={() => { project.addGPULayer(); showAddLayerMenu = false; }}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <circle cx="12" cy="12" r="9"/>
                   <ellipse cx="12" cy="12" rx="9" ry="3.2"/>
                   <path d="M3 12 a9 9 0 0 0 18 0"/>
                 </svg>
-                GPU Shader <span style="font-size:10px; opacity:0.7; padding:1px 4px; background:linear-gradient(135deg,#1e3a8a,#7c2d12); border-radius:2px; margin-left:4px;">WebGPU</span>
+                GPU Shader
               </button>
             {/if}
-            <button onclick={() => { project.addScreenLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add screen layer"
+              onclick={() => { project.addScreenLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="2" y="3" width="20" height="14" rx="2"/>
                 <line x1="8" y1="21" x2="16" y2="21"/>
@@ -860,7 +1189,10 @@
               </svg>
               Screen (VJ Output)
             </button>
-            <button onclick={() => { project.addGroupLayer(); showAddLayerMenu = false; }}>
+            <button
+              title="Add group layer"
+              onclick={() => { project.addGroupLayer(); showAddLayerMenu = false; }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="3" y="3" width="7" height="7" rx="1"/>
                 <rect x="14" y="3" width="7" height="7" rx="1"/>
@@ -891,13 +1223,17 @@
     </div>
 
     {#if mappingComposition.enabled && compositionPanelOpen}
-      <div class="mapping-composition-panel">
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex (Focusable scroll region supports keyboard scrolling.) -->
+      <div class="mapping-composition-panel" data-help-page="effects" role="region" aria-label="Composition effects controls" tabindex="0">
         <div class="composition-tabs">
           <button class:active={compositionTab === 'effects'} onclick={() => compositionTab = 'effects'}>Effects</button>
           <button class:active={compositionTab === 'stage'} onclick={() => compositionTab = 'stage'}>Screen FX</button>
         </div>
 
         {#if compositionTab === 'effects'}
+          {#if nativeInventoryLocked && nativeEffectChainWarning(mappingComposition.effects)}
+            <p class="effect-chain-warning" role="status">{nativeEffectChainWarning(mappingComposition.effects)}</p>
+          {/if}
           <div class="composition-section-header">
             <span>Output Effects</span>
             <button
@@ -910,15 +1246,24 @@
             >+ Add</button>
           </div>
 
+          <EffectChainPresets effects={mappingComposition.effects} nativeOnly={nativeInventoryLocked}
+            onApply={(effects) => project.setEffectChain(null, effects)} />
           {#if mappingComposition.effects.length > 0}
             <div class="composition-effect-list">
               {#each mappingComposition.effects as effect, index (effect.id)}
-                <div class="composition-effect-item" class:disabled={!effect.enabled}>
+                {@const pendingNativeEffect = nativeEffectPending(effect.type)}
+                <div
+                  class="composition-effect-item"
+                  class:disabled={!effect.enabled}
+                  class:native-pending={pendingNativeEffect}
+                >
                   <div class="composition-effect-header">
                     <input
                       type="checkbox"
                       checked={effect.enabled}
-                      onchange={() => project.toggleMappingCompositionEffect(effect.id)}
+                      disabled={pendingNativeEffect && !effect.enabled}
+                      title={pendingNativeEffect ? 'Pending native port' : (effect.enabled ? 'Disable effect' : 'Enable effect')}
+                      onchange={() => toggleCompositionEffectIfNativeReady(effect)}
                     />
                     <button
                       class="composition-effect-name"
@@ -950,6 +1295,11 @@
 
                   {#if expandedCompositionEffectId === effect.id}
                     <div class="composition-effect-params">
+                      {#if pendingNativeEffect}
+                        <div class="native-effect-lockout">
+                          Pending native port. Disable or remove this effect to keep the composition renderable in native v2.
+                        </div>
+                      {/if}
                       <div class="effect-mix-row">
                         <div class="effect-opacity-ctrl">
                           <span class="param-label">Opacity</span>
@@ -966,7 +1316,9 @@
                         <div class="effect-blend-ctrl">
                           <span class="param-label">Blend</span>
                           <select
-                            value={effect.blendMode ?? 'normal'}
+                            value={nativeInventoryLocked ? 'normal' : effect.blendMode ?? 'normal'}
+                            disabled={nativeInventoryLocked}
+                            title={nativeInventoryLocked ? 'Per-effect blend modes are not available in the native renderer. Use effect opacity or the layer blend mode.' : 'Blend the effect result with its input'}
                             onchange={(e) => project.updateMappingCompositionEffect(effect.id, { blendMode: (e.target as HTMLSelectElement).value as BlendMode })}
                           >
                             {#each blendModes as mode}
@@ -998,6 +1350,9 @@
                         </details>
                       {/if}
 
+                      {#if effect.type === 'cubeLut'}
+                        <CubeLutControls lut={effect.params.cubeLut} contextKey={`mapping-comp:${effect.id}`} onChange={(cubeLut) => project.updateMappingCompositionEffectParams(effect.id, { cubeLut })} />
+                      {/if}
                       {#each [effectParamLabels[effect.type]] as paramMeta}
                         <details open>
                           <summary>Controls</summary>
@@ -1025,36 +1380,17 @@
                                   />
                                 </div>
                               {:else}
-                                <div class="param-row">
-                                  <span class="param-label">{meta.label}</span>
-                                  <input
-                                    type="range"
-                                    min={meta.min as number}
-                                    max={meta.max as number}
-                                    step={meta.step as number}
-                                    value={(effect.params as Record<string, number>)[paramKey] ?? meta.default}
-                                    oninput={(e) => project.updateMappingCompositionEffectParams(effect.id, { [paramKey]: parseFloat((e.target as HTMLInputElement).value) })}
-                                  />
-                                  <span class="param-value">
-                                    {((effect.params as Record<string, number>)[paramKey] ?? meta.default).toFixed(2)}
-                                  </span>
-                                </div>
+                                <EffectParamRow label={meta.label} value={(effect.params as Record<string, number>)[paramKey] ?? meta.default}
+                                  min={meta.min as number} max={meta.max as number} step={meta.step as number}
+                                  layerIndex={0} effectId={effect.id} paramName={paramKey} mappingComposition
+                                  onChange={(value) => project.updateMappingCompositionEffectParams(effect.id, { [paramKey]: value })} />
                               {/if}
                             {/each}
                           {:else}
                             {#each getNumericEffectParams(effect.type) as paramKey}
-                              <div class="param-row">
-                                <span class="param-label">{paramKey}</span>
-                                <input
-                                  type="range"
-                                  min="0"
-                                  max="1"
-                                  step="0.01"
-                                  value={(effect.params as Record<string, number>)[paramKey] ?? 0.5}
-                                  oninput={(e) => project.updateMappingCompositionEffectParams(effect.id, { [paramKey]: parseFloat((e.target as HTMLInputElement).value) })}
-                                />
-                                <span class="param-value">{((effect.params as Record<string, number>)[paramKey] ?? 0.5).toFixed(2)}</span>
-                              </div>
+                              <EffectParamRow label={paramKey} value={(effect.params as Record<string, number>)[paramKey] ?? 0.5}
+                                min={0} max={1} step={0.01} layerIndex={0} effectId={effect.id} paramName={paramKey} mappingComposition
+                                onChange={(value) => project.updateMappingCompositionEffectParams(effect.id, { [paramKey]: value })} />
                             {/each}
                           {/if}
                         </details>
@@ -1183,6 +1519,7 @@
 
                   {#if expandedMappingStageEffectId === eff.id}
                     <div class="effect-params">
+                      {#if def?.description}<p class="stage-effect-description">{def.description}</p>{/if}
                       <div class="param-row">
                         <span class="param-label">Opacity</span>
                         <input
@@ -1209,6 +1546,7 @@
                           <span class="param-value">{(eff.params[spec.key] ?? def?.defaultParams[spec.key] ?? 0).toFixed(2)}</span>
                         </div>
                       {/each}
+                      <StageFxChaseControls effect={eff} target="mapping" onUpdate={(patch) => project.updateMappingStageEffect(eff.id, patch)} />
                     </div>
                   {/if}
                 </div>
@@ -1227,6 +1565,7 @@
       {@const isChild = !!layer.parentGroupId}
       {@const parentGroup = isChild ? $layers.find(l => l.id === layer.parentGroupId) : null}
       {@const isHiddenByCollapse = isChild && parentGroup?.groupCollapsed}
+      {@const nativeLayerReason = nativeLayerPendingReason(layer)}
       {#if !isHiddenByCollapse}
       <div
         class="layer-item"
@@ -1238,6 +1577,7 @@
         class:drag-over-into={dragOverIndex === index && draggedIndex !== index && dragOverZone === 'into'}
         class:group-layer={layer.type === 'group'}
         class:group-child={isChild}
+        class:native-pending={!!nativeLayerReason}
         onclick={(e) => selectLayerWithModifiers(layer.id, index, e)}
         oncontextmenu={(e) => handleLayerContextMenu(layer.id, e)}
         role="button"
@@ -1515,6 +1855,9 @@
           <!-- ── Group Properties ── -->
           <div class="layer-properties">
             <h4>Properties (Group)</h4>
+            <!-- Source: own content, a VJ row, the deck mix or a VJ group.
+                 A live source is the master feed for every child. -->
+            <MapSurfaceControls {layer} />
 
             <div class="property-row">
               <label>Shader Mode</label>
@@ -1556,26 +1899,6 @@
             <div class="property-row">
               <label>Children</label>
               <span class="property-value">{$layers.filter(l => l.parentGroupId === layer.id).length} layers</span>
-            </div>
-
-            <!-- VJ Source for group (available always, not just when VJ live) -->
-            <div class="property-row vj-source-row">
-              <label>VJ Source</label>
-              <select
-                class="vj-source-select"
-                value={layer.vjLayerIndex !== undefined ? String(layer.vjLayerIndex) : ''}
-                onchange={(e) => {
-                  const val = (e.target as HTMLSelectElement).value;
-                  project.setLayerVJIndex(layer.id, val === '' ? undefined : parseInt(val));
-                }}
-              >
-                <option value="">None (use shader/media)</option>
-                <option value={String(VJ_MIX_SOURCE_INDEX)}>VJ Mix</option>
-                {#each Array($vjClipLauncher.numLayers) as _, i}
-                  {@const activeClip = $vjClipLauncher.layerStates[i]?.activeClip}
-                  <option value={String(i)}>VJ Layer {i + 1}{activeClip ? ` — ${activeClip.name}` : ''}</option>
-                {/each}
-              </select>
             </div>
 
             <!-- Group source (shader/media drop) -->
@@ -1643,17 +1966,15 @@
               <div class="property-row">
                 <label>Render Quality</label>
                 <select
-                  value={String(layer.renderQuality ?? 1.0)}
+                  value={layer.renderQuality == null ? '' : String(layer.renderQuality)}
                   onchange={(e) => {
-                    const val = parseFloat((e.target as HTMLSelectElement).value);
-                    project.setRenderQuality(layer.id, val);
+                    const raw = (e.target as HTMLSelectElement).value;
+                    project.setRenderQuality(layer.id, raw === '' ? undefined : parseFloat(raw));
                   }}
                 >
-                  <option value="1.0">Full (100%)</option>
-                  <option value="0.75">High (75%)</option>
-                  <option value="0.5">Medium (50%)</option>
-                  <option value="0.35">Low (35%)</option>
-                  <option value="0.25">Very Low (25%)</option>
+                  {#each LAYER_RENDER_QUALITY_OPTIONS as opt}
+                    <option value={opt.value}>{opt.label}</option>
+                  {/each}
                 </select>
               </div>
             {/if}
@@ -1689,57 +2010,22 @@
           {/if}
           {:else}
 
-          <div class="layer-properties">
-        <h4>Properties ({layer.type === 'mask' ? 'Mask' : layer.type === 'lines' ? 'Lines' : layer.type === 'svg' ? 'SVG' : layer.type === 'color' ? 'Color' : layer.type === 'splat' ? 'Point Cloud' : layer.type === 'model3d' ? '3D Model' : 'Media'})</h4>
+          <div class="layer-properties media-properties">
+        <h4>Properties ({layer.type === 'lines' ? 'Lines' : layer.type === 'svg' ? 'SVG' : layer.type === 'color' ? 'Color' : layer.type === 'splat' ? 'Point Cloud' : layer.type === 'model3d' ? '3D Model' : 'Media'})</h4>
+        <!-- Source picks where a surface's picture comes from, so it only
+             belongs on the layers that route someone else's feed. A media or
+             custom-shape layer draws its own content -- video, shader,
+             plugin -- and offering to replace that with a VJ row here was
+             confusing, because the layer already has a source. Groups get
+             theirs in the group branch above; Screens get "Slice source"
+             below, which sets the same fields.
 
-        <!-- VJ Source dropdown — only on screen/VJ-slice layers, NOT standard media layers -->
-        <!-- Group layers and screen layers have their own VJ source selectors -->
+             The exception is a layer that already carries a VJ assignment
+             from before this rule: hiding the control would leave it stuck on
+             a VJ feed with no way back, so it stays visible until set back to
+             Own content. -->
+        <MapSurfaceControls {layer} showSource={layerShowsVJSource(layer)} />
 
-
-        <!-- Orientation Arrows (all layer types) -->
-        <div class="orientation-controls">
-          <span class="orient-label">Flip</span>
-          <button
-            class="orient-btn"
-            class:active={!layer.flipV}
-            onclick={() => { if (layer.flipV) project.toggleLayerFlipV(layer.id); }}
-            title="Normal vertical"
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M12 19V5M5 12l7-7 7 7"/>
-            </svg>
-          </button>
-          <button
-            class="orient-btn"
-            class:active={layer.flipV}
-            onclick={() => { if (!layer.flipV) project.toggleLayerFlipV(layer.id); }}
-            title="Flip vertically"
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M12 5v14M5 12l7 7 7-7"/>
-            </svg>
-          </button>
-          <button
-            class="orient-btn"
-            class:active={layer.flipH}
-            onclick={() => { if (!layer.flipH) project.toggleLayerFlipH(layer.id); }}
-            title="Flip horizontally"
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M19 12H5M12 5l-7 7 7 7"/>
-            </svg>
-          </button>
-          <button
-            class="orient-btn"
-            class:active={!layer.flipH}
-            onclick={() => { if (layer.flipH) project.toggleLayerFlipH(layer.id); }}
-            title="Normal horizontal"
-          >
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <path d="M5 12h14M12 5l7 7-7 7"/>
-            </svg>
-          </button>
-        </div>
 
         {#if layer.type === 'color' && layer.colorContent}
           <!-- Solid color layer controls -->
@@ -1851,20 +2137,26 @@
         {:else if layer.type === 'screen'}
           <!-- Screen layer: VJ Layer assignment -->
           <div class="screen-layer-config">
-            <label class="screen-label">VJ Layer Source</label>
+            <label class="screen-label">Slice source</label>
             <select
               class="screen-vj-select"
-              value={String(layer.vjLayerIndex ?? 0)}
-              onchange={(e) => project.setLayerVJIndex(layer.id, parseInt(e.currentTarget.value))}
+              value={layer.vjGroupId ? `group:${layer.vjGroupId}` : String(layer.vjLayerIndex ?? 0)}
+              onchange={(e) => {
+                const value = e.currentTarget.value;
+                if (value.startsWith('group:')) project.setLayerVJGroup(layer.id, value.slice(6));
+                else project.setLayerVJIndex(layer.id, parseInt(value));
+              }}
             >
               <option value={String(VJ_MIX_SOURCE_INDEX)}>VJ Mix</option>
+              {#if layer.vjGroupId && !($vjClipLauncher.groups ?? []).some(group => group.id === layer.vjGroupId)}
+                <option value={`group:${layer.vjGroupId}`}>Unavailable group</option>
+              {/if}
+              {#each $vjClipLauncher.groups ?? [] as group}<option value={`group:${group.id}`}>{group.name} · Group</option>{/each}
               {#each Array($vjClipLauncher.numLayers) as _, i}
                 <option value={String(i)}>VJ Layer {i + 1}</option>
               {/each}
             </select>
           </div>
-        {:else if layer.type === 'mask'}
-          <!-- Mask-only layers deliberately have no media source. -->
         {:else}
           <!-- Media layer: Source (not shown for shader sources) -->
           {#if layer.source?.type !== 'shader'}
@@ -1905,15 +2197,19 @@
         {/if}
 
         <!-- Video Controls (only for video sources) -->
-        {#if layer.type === 'media' && layer.source?.type === 'video' && layer.source.videoElement}
+        {#if layer.type === 'media' && layer.source?.type === 'video'}
           {@const vSrc = layer.source}
-          {@const vEl = layer.source.videoElement}
           {@const vMode = vSrc.playbackMode || 'loop'}
           {@const vRate = vSrc.playbackRate ?? 1.0}
           {@const vTrimS = vSrc.trimStart ?? 0}
           {@const vTrimE = vSrc.trimEnd ?? 1}
+          {@const vAudioOn = vSrc.audioPlayback === true}
+          {@const vAudioVolume = vSrc.audioVolume ?? 1}
+          {@const vAudioMuted = vSrc.audioMuted === true}
+          {@const vHasAudioTrack = probeHasAudioTrack(vSrc.videoElement)}
 
           <div class="video-controls-panel">
+            <div class="inspector-section-title">Playback</div>
             <!-- Transport row -->
             <div class="vt-transport">
               <button
@@ -1924,17 +2220,22 @@
                 data-midi-max="1"
                 data-midi-mode="toggle"
                 onclick={() => {
+                  cancelVideoScrub();
                   const playing = vSrc.isPlaying !== false;
+                  const transport = nativeVideoTransportSnapshot(vSrc);
+                  vSrc._nativePlaybackDirection = transport.direction;
+                  vSrc._nativePlaybackTimeSeconds = transport.timeSeconds;
+                  vSrc._nativePlaybackUpdatedAtMs = performance.now();
                   if (playing) {
-                    vEl.pause();
+                    vSrc.videoElement?.pause();
                     vSrc.isPlaying = false;
-                  } else {
-                    vSrc.isPlaying = true;
-                    vSrc._lastFrameTime = performance.now();
-                    vEl.play().catch(() => {});
-                  }
-                  project.updateLayer(layer.id, {});
-                }}
+	                  } else {
+	                    vSrc.isPlaying = true;
+	                    vSrc._lastFrameTime = performance.now();
+	                    if (vSrc.audioPlayback && vSrc.playbackMode !== 'bounce' && (vSrc.playbackRate ?? 1) > 0) vSrc.videoElement?.play().catch(() => {});
+	                  }
+	                  project.updateLayer(layer.id, { source: { ...vSrc } });
+	                }}
                 title={(vSrc.isPlaying !== false) ? 'Pause' : 'Play'}
               >
                 {#if vSrc.isPlaying === false}
@@ -1951,21 +2252,37 @@
                 data-midi-max="1"
                 data-midi-mode="toggle"
                 onclick={() => {
-                  vEl.currentTime = (vSrc.trimStart ?? 0) * (vEl.duration || 0);
-                  vEl.play(); vSrc.isPlaying = true;
-                  project.updateLayer(layer.id, {});
-                }}
+                  cancelVideoScrub();
+                  setNativePlaybackTime(layer.id, vSrc, nativeVideoLaunchTime(vSrc, sourceDuration(vSrc)));
+	                  vSrc.isPlaying = true;
+	                  vSrc._nativePlaybackUpdatedAtMs = performance.now();
+	                  if (vSrc.audioPlayback && vSrc.playbackMode !== 'bounce' && (vSrc.playbackRate ?? 1) > 0) vSrc.videoElement?.play().catch(() => {});
+	                  project.updateLayer(layer.id, { source: { ...vSrc } });
+	                }}
                 title="Restart"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                   <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
                 </svg>
               </button>
+              <button class="vt-btn" disabled={videoStepBusy || timelineScrubbing}
+                onclick={() => stepVideoFrame(layer.id, vSrc, -1)} title="Previous frame (Left arrow)" aria-label="Previous frame">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="2" height="16"/><path d="M19 4L8 12l11 8z"/></svg>
+              </button>
+              <button class="vt-btn" disabled={videoStepBusy || timelineScrubbing}
+                onclick={() => stepVideoFrame(layer.id, vSrc, 1)} title="Next frame (Right arrow)" aria-label="Next frame">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M5 4l11 8-11 8z"/><rect x="18" y="4" width="2" height="16"/></svg>
+              </button>
               <span class="vt-time">{formatTime(videoCurrentTime)} / {formatTime(videoDuration)}</span>
-              <select
+              </div>
+                  <div class="vt-playback-options">
+                    <VideoPlaybackDirection rate={vRate} bounce={vMode === 'bounce'}
+              onselect={(direction) => setPlaybackRate(layer.id, vSrc, Math.abs(vRate) * direction)} />
+                    <select
                 class="vt-speed"
-                value={String(vRate)}
-                onchange={(e) => setPlaybackRate(layer.id, vSrc, parseFloat((e.target as HTMLSelectElement).value))}
+                aria-label="Playback speed"
+                value={String(Math.abs(vRate))}
+                onchange={(e) => setPlaybackRate(layer.id, vSrc, Math.abs(parseFloat((e.target as HTMLSelectElement).value)) * (vRate < 0 ? -1 : 1))}
               >
                 <option value="0.25">0.25x</option>
                 <option value="0.5">0.5x</option>
@@ -1976,19 +2293,26 @@
               </select>
             </div>
 
+
             <!-- Timeline bar -->
             <div
               class="vt-timeline"
               bind:this={timelineEl}
-              data-midi-path="map:media:position"
-              data-midi-label="Media Position"
+              data-native-video-timeline
+              data-midi-path="map:media:scratch"
+              data-midi-label="Media Scratch (hold frame)"
               data-midi-min="0"
               data-midi-max="1"
-              data-midi-step="0.001"
+              data-midi-step="0"
+              data-midi-mode="absolute"
               onmousedown={(e) => handleTimelineMouseDown(e, layer.id, vSrc)}
+              onkeydown={(e) => handleTimelineKeyDown(e, layer.id, vSrc)}
               role="slider"
               tabindex="0"
               aria-label="Video timeline"
+              aria-valuetext={formatTime(videoCurrentTime)}
+              aria-busy={videoStepBusy}
+              title="Drag to scrub. Left and Right arrows step one frame."
               aria-valuemin={0}
               aria-valuemax={100}
               aria-valuenow={videoDuration > 0 ? Math.round(videoCurrentTime / videoDuration * 100) : 0}
@@ -2021,22 +2345,127 @@
               ></div>
             </div>
 
-            <!-- Mode buttons row -->
-            <div class="vt-modes">
-              <button class="vt-mode-btn" class:active={vMode === 'loop'} onclick={() => setPlaybackMode(layer.id, vSrc, 'loop')} title="Loop">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
-                  <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
-                </svg>
-                Loop
-              </button>
-              <button class="vt-mode-btn" class:active={vMode === 'once'} onclick={() => setPlaybackMode(layer.id, vSrc, 'once')} title="Play Once">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
-                Once
-              </button>
+            <VideoPlaybackModes mode={vMode} direction={videoCurrentDirection}
+              onselect={(mode) => setPlaybackMode(layer.id, vSrc, mode)} />
+
+            <!-- Audio: OPT-IN, default off. Same contract as the VJ clip
+                 panel — enabling it un-mutes this layer's video element and
+                 wires it into clipAudioBus, which chases the native core's
+                 render clock. Off = silent, exactly as before. -->
+            <div class="vt-audio-block">
+              {#if vMode === 'bounce'}
+                <div class="vt-audio-note">Audio is silent during bounce playback.</div>
+              {/if}
+              <div class="vt-audio-head">
+                <span class="vt-audio-title">Audio</span>
+                <button
+                  class="vt-audio-toggle"
+                  class:active={vAudioOn}
+                  data-midi-path="map:media:audio"
+                  data-midi-label="Media Play Audio"
+                  data-midi-min="0"
+                  data-midi-max="1"
+                  data-midi-mode="toggle"
+                  onclick={() => setSourceAudioPlayback(layer.id, vSrc, !vAudioOn)}
+                  title={vHasAudioTrack === false
+                    ? 'This file has no audio track'
+                    : 'Play this layer’s audio track through the master output'}
+                >
+                  {vAudioOn ? 'On' : 'Off'}
+                </button>
+              </div>
+
+              {#if vHasAudioTrack === false}
+                <div class="vt-audio-note">No audio track detected in this file.</div>
+              {/if}
+
+              {#if vAudioOn}
+                <div class="vt-audio-row">
+                  <label for="layer-audio-vol-{layer.id}">Volume</label>
+                  <input
+                    id="layer-audio-vol-{layer.id}"
+                    type="range"
+                    min="0" max="1" step="0.01"
+                    value={vAudioVolume}
+                    disabled={vAudioMuted}
+                    data-midi-path="map:media:audioVolume"
+                    data-midi-label="Media Audio Volume"
+                    data-midi-min="0"
+                    data-midi-max="1"
+                    data-midi-step="0.01"
+                    oninput={(e) => setSourceAudioLevels(layer.id, vSrc, { audioVolume: +(e.target as HTMLInputElement).value })}
+                  />
+                  <span class="vt-audio-num">{Math.round(vAudioVolume * 100)}%</span>
+                </div>
+                <div class="vt-audio-row">
+                  <label for="layer-audio-mute-{layer.id}">Mute</label>
+                  <button
+                    id="layer-audio-mute-{layer.id}"
+                    class="vt-audio-toggle"
+                    class:active={vAudioMuted}
+                    data-midi-path="map:media:audioMute"
+                    data-midi-label="Media Audio Mute"
+                    data-midi-min="0"
+                    data-midi-max="1"
+                    data-midi-mode="toggle"
+                    onclick={() => setSourceAudioLevels(layer.id, vSrc, { audioMuted: !vAudioMuted })}
+                    title="Duck this layer without losing its volume setting"
+                  >
+                    {vAudioMuted ? 'Muted' : 'Live'}
+                  </button>
+                  <span class="vt-audio-num"></span>
+                </div>
+              {/if}
             </div>
           </div>
         {/if}
+
+        <div class="inspector-section-title">Appearance</div>
+        <!-- Orientation Arrows (all layer types) -->
+        <div class="orientation-controls">
+          <span class="orient-label">Flip</span>
+          <button
+            class="orient-btn"
+            class:active={!layer.flipV}
+            onclick={() => { if (layer.flipV) project.toggleLayerFlipV(layer.id); }}
+            title="Normal vertical"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M12 19V5M5 12l7-7 7 7"/>
+            </svg>
+          </button>
+          <button
+            class="orient-btn"
+            class:active={layer.flipV}
+            onclick={() => { if (!layer.flipV) project.toggleLayerFlipV(layer.id); }}
+            title="Flip vertically"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M12 5v14M5 12l7 7 7-7"/>
+            </svg>
+          </button>
+          <button
+            class="orient-btn"
+            class:active={layer.flipH}
+            onclick={() => { if (!layer.flipH) project.toggleLayerFlipH(layer.id); }}
+            title="Flip horizontally"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M19 12H5M12 5l-7 7 7 7"/>
+            </svg>
+          </button>
+          <button
+            class="orient-btn"
+            class:active={!layer.flipH}
+            onclick={() => { if (layer.flipH) project.toggleLayerFlipH(layer.id); }}
+            title="Normal horizontal"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M5 12h14M12 5l7 7-7 7"/>
+            </svg>
+          </button>
+        </div>
+
 
         <!-- Opacity -->
         <div class="property-row">
@@ -2072,17 +2501,15 @@
           <div class="property-row">
             <label>Render Quality</label>
             <select
-              value={String(layer.renderQuality ?? 1.0)}
+              value={layer.renderQuality == null ? '' : String(layer.renderQuality)}
               onchange={(e) => {
-                const val = parseFloat((e.target as HTMLSelectElement).value);
-                project.setRenderQuality(layer.id, val);
+                const raw = (e.target as HTMLSelectElement).value;
+                project.setRenderQuality(layer.id, raw === '' ? undefined : parseFloat(raw));
               }}
             >
-              <option value="1.0">Full (100%)</option>
-              <option value="0.75">High (75%)</option>
-              <option value="0.5">Medium (50%)</option>
-              <option value="0.35">Low (35%)</option>
-              <option value="0.25">Very Low (25%)</option>
+              {#each LAYER_RENDER_QUALITY_OPTIONS as opt}
+                <option value={opt.value}>{opt.label}</option>
+              {/each}
             </select>
           </div>
         {/if}
@@ -2139,22 +2566,22 @@
                 <div class="feather-slider">
                   <span class="feather-label">T</span>
                   <input type="range" min="0" max="1" step="0.01" value={featherEffect.params?.featherTop ?? 0}
-                    oninput={(e) => project.updateEffectParams(layer.id, featherEffect.id, { featherTop: parseFloat((e.target as HTMLInputElement).value) })} />
+                    oninput={(e) => updateEffectParamsTracked(layer.id, featherEffect.id, { featherTop: parseFloat((e.target as HTMLInputElement).value) })} />
                 </div>
                 <div class="feather-slider">
                   <span class="feather-label">B</span>
                   <input type="range" min="0" max="1" step="0.01" value={featherEffect.params?.featherBottom ?? 0}
-                    oninput={(e) => project.updateEffectParams(layer.id, featherEffect.id, { featherBottom: parseFloat((e.target as HTMLInputElement).value) })} />
+                    oninput={(e) => updateEffectParamsTracked(layer.id, featherEffect.id, { featherBottom: parseFloat((e.target as HTMLInputElement).value) })} />
                 </div>
                 <div class="feather-slider">
                   <span class="feather-label">L</span>
                   <input type="range" min="0" max="1" step="0.01" value={featherEffect.params?.featherLeft ?? 0}
-                    oninput={(e) => project.updateEffectParams(layer.id, featherEffect.id, { featherLeft: parseFloat((e.target as HTMLInputElement).value) })} />
+                    oninput={(e) => updateEffectParamsTracked(layer.id, featherEffect.id, { featherLeft: parseFloat((e.target as HTMLInputElement).value) })} />
                 </div>
                 <div class="feather-slider">
                   <span class="feather-label">R</span>
                   <input type="range" min="0" max="1" step="0.01" value={featherEffect.params?.featherRight ?? 0}
-                    oninput={(e) => project.updateEffectParams(layer.id, featherEffect.id, { featherRight: parseFloat((e.target as HTMLInputElement).value) })} />
+                    oninput={(e) => updateEffectParamsTracked(layer.id, featherEffect.id, { featherRight: parseFloat((e.target as HTMLInputElement).value) })} />
                 </div>
               </div>
             {/if}
@@ -2168,6 +2595,7 @@
           </div>
         {/if}
 
+        <div class="inspector-section-title">Warp</div>
         <!-- Warp Mode -->
         <div class="property-row">
           <label>Warp Mode</label>
@@ -2210,10 +2638,23 @@
               <option value="12x12">12x12</option>
             </select>
           </div>
+          <!-- Bezier mesh: each selected point shows tangent handles that
+               bend the cell edges, so a curved surface needs far fewer
+               points than a straight grid. -->
+          <div class="property-row">
+            <label>
+              <input
+                type="checkbox"
+                checked={layer.meshGrid.bezier ?? false}
+                onchange={(e) => project.setMeshBezier(layer.id, (e.target as HTMLInputElement).checked)}
+              />
+              Bezier curves
+            </label>
+          </div>
         {/if}
 
         <!-- Reset warp -->
-        <div class="property-row">
+        <div class="property-row inspector-actions">
           {#if layer.warpMode === 'mesh'}
             <button class="btn-reset" onclick={() => project.resetMeshGrid(layer.id)}>
               Reset Mesh
@@ -2222,11 +2663,19 @@
             <button class="btn-reset" onclick={() => project.resetCorners(layer.id)}>
               Reset Warp
             </button>
+            <!-- A warped mesh stays applied under Corner mode, so it can be
+                 cleared from here without switching back to Mesh. -->
+            {#if layerRenderMeshGrid(layer)}
+              <button class="btn-reset" onclick={() => project.resetMeshGrid(layer.id)}>
+                Reset Mesh
+              </button>
+            {/if}
           {/if}
         </div>
 
         <!-- Mask Section -->
         <div class="mask-section">
+          <div class="inspector-section-title">Mask</div>
           <div class="property-row">
             <label>
               <input
@@ -2242,7 +2691,7 @@
                   }
                 }}
               />
-              Enable Mask
+              Enable mask
             </label>
             <span class="mask-point-count">
               {#if layer.mask?.shapes}
@@ -2299,10 +2748,7 @@
                     <button
                       class="mask-shape-edit"
                       title="Edit points (drag to move, right-click anchor to delete)"
-                      onclick={() => {
-                        project.enableMask(layer.id);
-                        maskEditingLayerId.set(layer.id);
-                      }}
+                      onclick={() => maskEditingLayerId.set(layer.id)}
                       aria-label="Edit shape {sIdx + 1}"
                     >
                       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2351,17 +2797,81 @@
           </div>
           <!-- End mask-section -->
 
+        <!-- Painted mask: erase/restore brush in the layer's content space.
+             Combines (multiplies) with the vector mask above. -->
+        {#if layer}
+        {@const paint = layer.paintMask}
+        {@const armed = $paintMaskLayerId === layer.id}
+        <div class="mask-section paint-mask-section" data-help-page="masks-slices">
+          <div class="inspector-section-title">Paint Mask</div>
+          <div class="property-row">
+            <button
+              class={armed ? 'mask-done-btn paint-arm' : 'btn-reset paint-arm'}
+              data-testid="paint-mask-arm"
+              disabled={layer.locked}
+              onclick={() => {
+                if (armed) { paintMaskLayerId.set(null); return; }
+                maskEditingLayerId.set(null);
+                if (paint && paint.enabled === false) project.setPaintMaskVisible(layer.id, true);
+                paintMaskLayerId.set(layer.id);
+              }}
+            >{armed ? 'Done Painting' : 'Paint'}</button>
+            <span class="mask-point-count">{paint?.strokes.length ?? 0} {(paint?.strokes.length ?? 0) === 1 ? 'stroke' : 'strokes'}</span>
+          </div>
+          {#if armed}
+            <div class="property-row paint-mode-row" role="group" aria-label="Brush mode">
+              <button class="shape-icon-btn" class:active={$paintBrush.mode === 'erase'} onclick={() => paintBrush.update({ mode: 'erase' })} title="Erase: hide the layer where you paint">Erase</button>
+              <button class="shape-icon-btn" class:active={$paintBrush.mode === 'restore'} onclick={() => paintBrush.update({ mode: 'restore' })} title="Restore: bring erased areas back">Restore</button>
+            </div>
+            <div class="property-row">
+              <label for="paint-size-{layer.id}">Size</label>
+              <input id="paint-size-{layer.id}" type="range" min={PAINT_BRUSH_SIZE_MIN} max={PAINT_BRUSH_SIZE_MAX} step="1" value={$paintBrush.size}
+                oninput={(e) => paintBrush.update({ size: parseFloat((e.target as HTMLInputElement).value) })} />
+              <span class="value">{Math.round($paintBrush.size)} px</span>
+            </div>
+            <div class="property-row">
+              <label for="paint-soft-{layer.id}">Softness</label>
+              <input id="paint-soft-{layer.id}" type="range" min="0" max="1" step="0.01" value={$paintBrush.softness}
+                oninput={(e) => paintBrush.update({ softness: parseFloat((e.target as HTMLInputElement).value) })} />
+              <span class="value">{Math.round($paintBrush.softness * 100)}%</span>
+            </div>
+            <div class="property-row">
+              <label for="paint-opacity-{layer.id}">Opacity</label>
+              <input id="paint-opacity-{layer.id}" type="range" min="0.01" max="1" step="0.01" value={$paintBrush.opacity}
+                oninput={(e) => paintBrush.update({ opacity: parseFloat((e.target as HTMLInputElement).value) })} />
+              <span class="value">{Math.round($paintBrush.opacity * 100)}%</span>
+            </div>
+            <span class="mask-hint">Drag on the layer to paint · X or Alt swaps Erase/Restore · [ ] resize · Esc to stop</span>
+          {/if}
+          {#if paint}
+            <div class="property-row mask-actions">
+              <label>
+                <input type="checkbox" checked={paint.enabled !== false}
+                  onchange={() => project.setPaintMaskVisible(layer.id, paint.enabled === false)} />
+                Show
+              </label>
+              <label>
+                <input type="checkbox" checked={paint.inverted} onchange={() => project.togglePaintMaskInvert(layer.id)} />
+                Invert
+              </label>
+              <button class="btn-secondary" disabled={paint.strokes.length === 0} onclick={() => project.clearPaintMask(layer.id)}>Clear</button>
+            </div>
+          {/if}
+        </div>
+        {/if}
+
         <!-- Layer Shape Section -->
         <div class="shape-mask-section">
+          <div class="inspector-section-title">Shape</div>
           {#if layer.type === 'media'}
             {@const shapeType = layer.layerShape?.type ?? 'rectangle'}
             <div class="property-row">
-              <label>Layer Shape</label>
+              <label>Shape</label>
               <div class="shape-icon-row">
                 <button
                   class="shape-icon-btn"
                   class:active={shapeType === 'rectangle'}
-                  onclick={() => project.setLayerShape(layer.id, 'rectangle')}
+                  onclick={() => chooseLayerShape(layer.id, 'rectangle')}
                   title="Rectangle"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="6" width="16" height="12" rx="1.5"/></svg>
@@ -2369,7 +2879,7 @@
                 <button
                   class="shape-icon-btn"
                   class:active={shapeType === 'circle'}
-                  onclick={() => project.setLayerShape(layer.id, 'circle')}
+                  onclick={() => chooseLayerShape(layer.id, 'circle')}
                   title="Circle"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/></svg>
@@ -2377,7 +2887,7 @@
                 <button
                   class="shape-icon-btn"
                   class:active={shapeType === 'ellipse'}
-                  onclick={() => project.setLayerShape(layer.id, 'ellipse')}
+                  onclick={() => chooseLayerShape(layer.id, 'ellipse')}
                   title="Ellipse"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="12" rx="9" ry="6"/></svg>
@@ -2385,7 +2895,7 @@
                 <button
                   class="shape-icon-btn"
                   class:active={shapeType === 'triangle'}
-                  onclick={() => project.setLayerShape(layer.id, 'triangle')}
+                  onclick={() => chooseLayerShape(layer.id, 'triangle')}
                   title="Triangle"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4l8 16H4L12 4z"/></svg>
@@ -2393,25 +2903,30 @@
                 <button
                   class="shape-icon-btn"
                   class:active={shapeType === 'polygon'}
-                  onclick={() => project.setLayerShape(layer.id, 'polygon')}
-                  title="Polygon"
+                  onclick={() => chooseLayerShape(layer.id, 'polygon')}
+                  title="Hexagon"
                 >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l9.5 7-3.5 11h-12L2.5 9z"/></svg>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7z"/></svg>
                 </button>
                 <!-- Star shape hidden from UI (functionality retained) -->
               </div>
             </div>
 
-            {#if shapeType === 'circle' || shapeType === 'triangle'}
-              <div class="property-row">
+            {#if shapeType === 'circle' || shapeType === 'triangle' || shapeType === 'ellipse' || shapeType === 'polygon' || shapeType === 'star'}
+              <div class="property-row inspector-actions">
                 <button class="btn-secondary" onclick={toggleShapeWarpEditing}>
-                  {shapeWarpEditing ? 'Exit Shape Warp Edit' : 'Edit Shape Warp'}
+                  {shapeWarpEditing ? 'Done Warping' : 'Warp Shape'}
                 </button>
+                {#if layer.layerShape?.controlPoints?.length}
+                  <button class="btn-secondary" onclick={() => resetShapeWarp(layer.id)} title="Reset warp handles to their default positions">
+                    Reset Warp
+                  </button>
+                {/if}
               </div>
             {/if}
 
             {#if layer.layerShape && layer.layerShape.type !== 'custom'}
-              <div class="property-row">
+              <div class="property-row inspector-actions">
                 <button class="btn-secondary" onclick={() => project.convertToCustomShape(layer.id)} title="Convert shape to editable polygon with draggable vertices">
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1.5" fill="currentColor"/><path d="M12 5v2m0 10v2m-7-7h2m10 0h2"/></svg>
                   Edit Points
@@ -2419,20 +2934,7 @@
               </div>
             {/if}
             {#if layer.layerShape?.type === 'custom'}
-              <div class="property-row shape-help">
-                <span>Drag vertices on canvas. Click edges to add points. Right-click vertex to remove.</span>
-              </div>
-              <div class="property-row">
-                <label>Shape Fit</label>
-                <select
-                  value={layer.layerShape.params.customShapeFit || 'warp'}
-                  onchange={(e) => project.updateLayerShapeParams(layer.id, { customShapeFit: (e.target as HTMLSelectElement).value as 'warp' | 'fill' | 'mask' })}
-                >
-                  <option value="warp">Warp</option>
-                  <option value="fill">Fill</option>
-                  <option value="mask">Mask</option>
-                </select>
-              </div>
+
               <!-- Invert: turns the custom shape into a HOLE / cutout
                    instead of a fill. Stack a second layer underneath
                    and you get cool projection-mapping setups where the
@@ -2451,11 +2953,6 @@
 
           {#if layer.layerShape}
             {@const shapeT = layer.layerShape.type}
-            {#if shapeT === 'circle' || shapeT === 'triangle'}
-              <div class="property-row shape-help">
-                <span>Shape geometry is controlled directly on canvas via warp points.</span>
-              </div>
-            {/if}
 
             {#if shapeT !== 'rectangle' && shapeT !== 'custom'}
               <!-- Radius controls -->
@@ -2626,13 +3123,22 @@
               >+ Add Effect</button>
             </div>
 
+            {#key layer.id}
+              <EffectChainPresets effects={layer.effects} nativeOnly={nativeInventoryLocked}
+                onApply={(effects) => project.setEffectChain(layer.id, effects)} />
+            {/key}
             <!-- Effect List -->
+            {#if nativeInventoryLocked && nativeEffectChainWarning(layer.effects)}
+              <p class="effect-chain-warning" role="status">{nativeEffectChainWarning(layer.effects)}</p>
+            {/if}
             {#if layer.effects.length > 0}
               <div class="effect-list">
               {#each layer.effects as effect, index (effect.id)}
+                {@const pendingNativeEffect = nativeEffectPending(effect.type)}
                 <div
                   class="effect-item"
                   class:disabled={!effect.enabled}
+                  class:native-pending={pendingNativeEffect}
                   class:expanded={expandedEffectId === effect.id}
                   class:dragging={draggedEffectIndex === index}
                   class:drag-over={dragOverEffectIndex === index && draggedEffectIndex !== index}
@@ -2659,8 +3165,9 @@
                     <input
                       type="checkbox"
                       checked={effect.enabled}
-                      onchange={() => project.toggleEffect(layer.id, effect.id)}
-                      title={effect.enabled ? 'Disable effect' : 'Enable effect'}
+                      disabled={pendingNativeEffect && !effect.enabled}
+                      onchange={() => toggleLayerEffectIfNativeReady(layer.id, effect)}
+                      title={pendingNativeEffect ? 'Pending native port' : (effect.enabled ? 'Disable effect' : 'Enable effect')}
                     />
 
                     <!-- Effect name (clickable to expand) -->
@@ -2700,6 +3207,11 @@
                       class="effect-params"
                       ondragstart={(e) => e.stopPropagation()}
                       draggable="false">
+                      {#if pendingNativeEffect}
+                        <div class="native-effect-lockout">
+                          Pending native port. Disable or remove this effect to render this layer in native v2.
+                        </div>
+                      {/if}
                       <!-- Per-effect opacity & blend mode -->
                       <div class="effect-mix-row">
                         <div class="effect-opacity-ctrl">
@@ -2717,7 +3229,9 @@
                         <div class="effect-blend-ctrl">
                           <label>Blend</label>
                           <select
-                            value={effect.blendMode ?? 'normal'}
+                            value={nativeInventoryLocked ? 'normal' : effect.blendMode ?? 'normal'}
+                            disabled={nativeInventoryLocked}
+                            title={nativeInventoryLocked ? 'Per-effect blend modes are not available in the native renderer. Use effect opacity or the layer blend mode.' : 'Blend the effect result with its input'}
                             onchange={(e) => project.updateEffect(layer.id, effect.id, { blendMode: (e.target as HTMLSelectElement).value as BlendMode })}
                           >
                             {#each blendModes as mode}
@@ -2751,6 +3265,9 @@
 
                       <details open>
                         <summary>Controls</summary>
+                      {#if effect.type === 'cubeLut'}
+                        <CubeLutControls lut={effect.params.cubeLut} contextKey={`${layer.id}:${effect.id}`} onChange={(cubeLut) => updateEffectParamsTracked(layer.id, effect.id, { cubeLut })} />
+                      {/if}
                       {#if effect.type === 'gpuFluidSim'}
                         <!-- ── WebGPU Fluid Simulation ──
                              Real-time Navier-Stokes fluid running on
@@ -2763,40 +3280,40 @@
                         <EffectParamRow label="Inject Strength" min={0} max={3} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="injectStrength"
                           value={effect.params.injectStrength ?? 1.5}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { injectStrength: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { injectStrength: v })} />
                         <EffectParamRow label="Velocity Push" min={0} max={3} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="velocityFromGradient"
                           value={effect.params.velocityFromGradient ?? 1.4}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { velocityFromGradient: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { velocityFromGradient: v })} />
                         <EffectParamRow label="Vorticity" min={0} max={3} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="vorticity"
                           value={effect.params.vorticity ?? 1.0}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { vorticity: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { vorticity: v })} />
                         <EffectParamRow label="Dye Decay" min={0} max={3} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="dyeDecay"
                           value={effect.params.dyeDecay ?? 2.4}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { dyeDecay: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { dyeDecay: v })} />
                         <EffectParamRow label="Velocity Decay" min={0} max={3} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="velocityDecay"
                           value={effect.params.velocityDecay ?? 2.3}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { velocityDecay: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { velocityDecay: v })} />
                         <EffectParamRow label="Brightness Boost" min={0.5} max={4} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="outputBoost"
                           value={effect.params.outputBoost ?? 0.7}
                           displayValue={(v) => v.toFixed(2) + '×'}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { outputBoost: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { outputBoost: v })} />
                         <EffectParamRow label="Time Scale" min={0.1} max={3} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="timeScale"
                           value={effect.params.timeScale ?? 1.6}
                           displayValue={(v) => v.toFixed(2) + '×'}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { timeScale: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { timeScale: v })} />
 
                       {:else if effect.type === 'colorama'}
                         <div class="param-row">
                           <label>Palette</label>
                           <select
                             value={effect.params.coloramaPalette ?? 0}
-                            onchange={(e) => project.updateEffectParams(layer.id, effect.id, { coloramaPalette: parseInt((e.target as HTMLSelectElement).value) })}
+                            onchange={(e) => updateEffectParamsTracked(layer.id, effect.id, { coloramaPalette: parseInt((e.target as HTMLSelectElement).value) })}
                           >
                             <option value="0">Rainbow</option>
                             <option value="1">Sunset</option>
@@ -2812,21 +3329,21 @@
                           layerIndex={layerIdx} effectId={effect.id} paramName="coloramaOffset"
                           value={effect.params.coloramaOffset ?? 0}
                           displayValue={(v) => (v * 100).toFixed(0) + '%'}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { coloramaOffset: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { coloramaOffset: v })} />
                         <EffectParamRow label="Auto Speed" min={0} max={2} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="coloramaSpeed"
                           value={effect.params.coloramaSpeed ?? 0.2}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { coloramaSpeed: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { coloramaSpeed: v })} />
                         <EffectParamRow label="Contrast" min={0.5} max={2} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="coloramaContrast"
                           value={effect.params.coloramaContrast ?? 1}
                           displayValue={(v) => (v * 100).toFixed(0) + '%'}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { coloramaContrast: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { coloramaContrast: v })} />
                         <EffectParamRow label="Mix" min={0} max={1} step={0.01}
                           layerIndex={layerIdx} effectId={effect.id} paramName="coloramaMix"
                           value={effect.params.coloramaMix ?? 1}
                           displayValue={(v) => (v * 100).toFixed(0) + '%'}
-                          onChange={(v) => project.updateEffectParams(layer.id, effect.id, { coloramaMix: v })} />
+                          onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { coloramaMix: v })} />
 
                       {:else if effect.type === 'invert'}
                         <div class="param-info">No parameters</div>
@@ -2840,7 +3357,7 @@
                                 <label>{meta.label}</label>
                                 <select
                                   value={(effect.params as Record<string, number>)[paramKey] ?? meta.default}
-                                  onchange={(e) => project.updateEffectParams(layer.id, effect.id, { [paramKey]: parseFloat((e.target as HTMLSelectElement).value) })}
+                                  onchange={(e) => updateEffectParamsTracked(layer.id, effect.id, { [paramKey]: parseFloat((e.target as HTMLSelectElement).value) })}
                                 >
                                   {#each meta.options as opt}
                                     <option value={opt.value}>{opt.label}</option>
@@ -2860,7 +3377,7 @@
                                     const r = parseInt(hex.slice(1, 3), 16) / 255;
                                     const g = parseInt(hex.slice(3, 5), 16) / 255;
                                     const b = parseInt(hex.slice(5, 7), 16) / 255;
-                                    project.updateEffectParams(layer.id, effect.id, {
+                                    updateEffectParamsTracked(layer.id, effect.id, {
                                       [meta.colorParams!.r]: r, [meta.colorParams!.g]: g, [meta.colorParams!.b]: b
                                     });
                                   }}
@@ -2877,7 +3394,7 @@
                                 effectId={effect.id}
                                 paramName={paramKey}
                                 displayValue={(v) => (meta.max as number) <= 1 ? (v * 100).toFixed(0) + '%' : v.toFixed(2)}
-                                onChange={(v) => project.updateEffectParams(layer.id, effect.id, { [paramKey]: v })}
+                                onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { [paramKey]: v })}
                               />
                             {/if}
                           {/each}
@@ -2893,7 +3410,7 @@
                               effectId={effect.id}
                               paramName={paramKey}
                               displayValue={(v) => (v * 100).toFixed(0) + '%'}
-                              onChange={(v) => project.updateEffectParams(layer.id, effect.id, { [paramKey]: v })}
+                              onChange={(v) => updateEffectParamsTracked(layer.id, effect.id, { [paramKey]: v })}
                             />
                           {/each}
                         {/if}
@@ -2945,6 +3462,8 @@
 
 
 <style>
+  .stage-effect-description { font-size: 12px; line-height: 1.5; color: var(--text-secondary, #aab2c2); margin: 0 0 10px; }
+  .effect-chain-warning { color: #f4c46a; font-size: 11px; line-height: 1.5; padding: 6px 8px; }
   .layer-panel {
     width: 300px;
     background: var(--ga-panel, #0b0d11);
@@ -2984,6 +3503,7 @@
   }
 
   .properties-effects-content {
+    min-height: 0;
     flex: 1;
     overflow-y: auto;
     padding: 13px 14px;
@@ -3109,7 +3629,27 @@
     color: #63d6ff;
   }
 
+  .layers-section.composition-open {
+    flex: 1 1 70%;
+    max-height: 70%;
+    min-height: 0;
+  }
+  .layer-panel:has(.layers-section.composition-open) .properties-effects-panel {
+    flex: 1 1 30%;
+  }
+  .layers-section.composition-open .layer-list {
+    flex: 0 1 30%;
+    min-height: 64px;
+  }
+  .layers-section > .panel-header,
+  .mapping-composition-row { flex-shrink: 0; }
+
   .mapping-composition-panel {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+
     border-bottom: 1px solid var(--ga-line, rgba(255, 255, 255, 0.07));
     padding: 8px;
     background: rgba(7, 11, 16, 0.72);
@@ -3173,6 +3713,12 @@
     opacity: 0.58;
   }
 
+  .composition-effect-item.native-pending,
+  .effect-item.native-pending {
+    border-color: rgba(255, 180, 70, 0.32);
+    background: rgba(255, 160, 50, 0.045);
+  }
+
   .composition-effect-item.live {
     border-color: rgba(55, 178, 227, 0.5);
   }
@@ -3198,6 +3744,36 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .native-effect-badge {
+    flex: 0 0 auto;
+    border: 1px solid rgba(88, 231, 255, 0.38);
+    background: rgba(88, 231, 255, 0.08);
+    color: #58e7ff;
+    border-radius: 3px;
+    padding: 2px 5px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    line-height: 1;
+  }
+
+  .native-effect-badge.pending {
+    border-color: rgba(255, 170, 64, 0.42);
+    background: rgba(255, 170, 64, 0.1);
+    color: #ffb85f;
+  }
+
+  .native-effect-lockout {
+    border: 1px solid rgba(255, 170, 64, 0.28);
+    background: rgba(255, 170, 64, 0.08);
+    color: #ffcf91;
+    border-radius: 4px;
+    padding: 7px 8px;
+    margin-bottom: 8px;
+    font-size: 11px;
+    line-height: 1.35;
   }
 
   .composition-effect-params {
@@ -3461,8 +4037,29 @@
     gap: 5px;
   }
 
+  /* The "+" carries the same accent every other create-affordance uses
+     (add-layer menu glyphs, tray tabs), so the label stays ink and the
+     action mark is what reads as blue. */
+  .btn-add__plus {
+    color: var(--ga-icon, #5278ff);
+    font-weight: 700;
+  }
+
   .btn-add:hover {
     background: rgba(155, 135, 245, 0.18);
+  }
+
+  /* Looks shares the Add Layer button's look (class btn-add, so every
+     skin rule applies to both); only its mark takes the action accent. */
+  .btn-looks {
+    margin-left: auto;
+    margin-right: 6px;
+  }
+  .btn-looks :global(.looks-icon) { color: var(--ga-icon, #5278ff); }
+  .btn-looks.invite { animation: looks-invite 1.6s ease-in-out infinite; }
+  @keyframes looks-invite {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(82, 120, 255, 0); }
+    50% { box-shadow: 0 0 0 3px rgba(82, 120, 255, 0.28); }
   }
 
   .layer-list {
@@ -3511,6 +4108,10 @@
   .layer-item.multi-selected {
     background: var(--ga-blue-soft, rgba(91, 141, 239, 0.10));
     border: 1px solid var(--ga-blue-line, rgba(91, 141, 239, 0.38));
+  }
+
+  .layer-item.native-pending {
+    border-color: rgba(255, 170, 64, 0.28);
   }
 
   .layer-item.dragging {
@@ -3640,7 +4241,7 @@
   .property-value {
     font-size: 13px;
     color: var(--text-secondary, #aaa);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .grouped-child-note {
     font-size: 12px;
@@ -3760,6 +4361,22 @@
 
   .layer-item.selected .layer-name {
     color: var(--ga-ink-0, #eef0f4);
+  }
+
+  .native-layer-row-badge {
+    flex: 0 0 auto;
+    border: 1px solid rgba(255, 170, 64, 0.42);
+    background: rgba(255, 170, 64, 0.1);
+    color: #ffb85f;
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-size: 8px;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    line-height: 1;
+    max-width: 54px;
+    overflow: hidden;
+    text-overflow: clip;
   }
 
   /* Inline rename input — sits in the same flex slot as `.layer-name`
@@ -3905,8 +4522,11 @@
     border: 1px solid rgba(255, 255, 255, 0.06);
   }
 
+  .vt-playback-options { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .vt-playback-options .vt-speed { height: 28px; border-radius: 5px; }
   .vt-transport {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 4px;
     margin-bottom: 8px;
@@ -3927,6 +4547,7 @@
     flex-shrink: 0;
   }
   .vt-btn:hover { background: rgba(255, 255, 255, 0.15); color: #fff; }
+  .vt-btn:disabled { opacity: 0.4; cursor: wait; }
 
   .vt-play {
     background: #BB86FC;
@@ -3937,7 +4558,7 @@
   .vt-time {
     font-size: 12px;
     color: var(--text-muted, #888);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     margin-left: 4px;
     flex: 1;
     white-space: nowrap;
@@ -4032,40 +4653,73 @@
   }
 
   /* Mode buttons */
-  .vt-modes {
-    display: flex;
-    gap: 2px;
-  }
 
-  .vt-mode-btn {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    color: var(--text-muted, #888);
-    font-size: 11px;
-    padding: 4px 2px;
-    border-radius: 3px;
-    cursor: pointer;
-    transition: all 0.15s;
-    white-space: nowrap;
-  }
-  .vt-mode-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: #bbb;
-    border-color: rgba(255, 255, 255, 0.15);
-  }
-  .vt-mode-btn.active {
-    background: rgba(187, 134, 252, 0.2);
-    color: #BB86FC;
-    border-color: rgba(187, 134, 252, 0.4);
-  }
 
   .file-label {
     cursor: pointer;
+  }
+
+  /* Opt-in audio block inside the video controls panel. Amber accent so the
+     one control that makes noise reads as distinct from the visual params. */
+  .vt-audio-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .vt-audio-head {
+    display: grid;
+    grid-template-columns: 1fr 64px;
+    align-items: center;
+    gap: 8px;
+  }
+  .vt-audio-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: #777;
+  }
+  .vt-audio-row {
+    display: grid;
+    grid-template-columns: 56px minmax(0, 1fr) 40px;
+    align-items: center;
+    gap: 8px;
+  }
+  .vt-audio-row label {
+    font-size: 11px;
+    color: var(--text-secondary, #aaa);
+  }
+  .vt-audio-row input[type='range'] {
+    width: 100%;
+    accent-color: #fbbf24;
+  }
+  .vt-audio-num {
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
+    font-size: 11px;
+    color: #fbbf24;
+    text-align: right;
+  }
+  .vt-audio-toggle {
+    height: 22px;
+    border-radius: 3px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-secondary, #aaa);
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .vt-audio-toggle.active {
+    border-color: rgba(251, 191, 36, 0.45);
+    background: rgba(251, 191, 36, 0.16);
+    color: #fbbf24;
+  }
+  .vt-audio-note {
+    font-size: 10px;
+    color: var(--text-muted, #888);
+    font-style: italic;
   }
 
   .link {
@@ -4128,20 +4782,10 @@
     font-family: var(--ga-font-mono, ui-monospace, monospace);
   }
 
-  .vj-source-row {
-    padding: 6px 8px;
-    background: rgba(249, 153, 0, 0.08);
-    border: 1px solid rgba(249, 153, 0, 0.2);
-    border-radius: 4px;
-    margin-bottom: 8px;
-  }
-
-  .vj-source-row label {
-    color: #f90;
-  }
-
   .vj-source-select {
     flex: 1;
+    min-width: 0;
+    max-width: 100%;
     background: var(--bg-tertiary, #1a1a1e);
     color: var(--text-primary, #eee);
     border: 1px solid #555;
@@ -4378,6 +5022,17 @@
 
   .mask-done-btn:hover {
     background: #CF6EFF;
+  }
+
+  .paint-arm {
+    flex: 1;
+    width: auto;
+  }
+
+  .paint-mode-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
   }
 
   /* Shape Mask Section Styles */
@@ -4774,8 +5429,25 @@
     background: #2a2a30;
   }
 
+  .add-layer-menu button:disabled,
+  .add-layer-menu button.native-pending {
+    cursor: not-allowed;
+    color: rgba(238, 240, 244, 0.42);
+    background: rgba(255, 170, 64, 0.035);
+  }
+
+  .add-layer-menu button:disabled:hover,
+  .add-layer-menu button.native-pending:hover {
+    background: rgba(255, 170, 64, 0.045);
+  }
+
   .add-layer-menu button svg {
     color: #BB86FC;
+  }
+
+  .add-layer-menu button:disabled svg,
+  .add-layer-menu button.native-pending svg {
+    color: rgba(255, 184, 95, 0.55);
   }
 
   /* Lines layer thumbnail */
@@ -5112,4 +5784,41 @@
     width: 14px;
     height: 14px;
   }
+
+  /* Mapping inspector: consistent density, full-width actions, quiet surfaces. */
+  .media-properties { font-size: 12px; line-height: 1.4; min-width: 0; }
+  .media-properties h4 { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+  .inspector-section-title { font-size: 10px; font-weight: 650; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--ga-ink-1, #9aa0ac); margin: 14px 0 8px;
+    padding-top: 10px; border-top: 1px solid var(--ga-line-2, #303540); }
+  .video-controls-panel .inspector-section-title,
+  .mask-section .inspector-section-title,
+  .shape-mask-section .inspector-section-title { border: 0; padding: 0; margin: 0 0 8px; }
+  .media-properties .property-row { grid-template-columns: 76px minmax(0, 1fr) auto; gap: 6px; margin-bottom: 8px; min-width: 0; }
+  .media-properties .property-row > :not(label) { min-width: 0; }
+  .media-properties .property-row label { font-size: 12px; font-weight: 500; }
+  .media-properties .property-row select { width: 100%; font-size: 12px; height: 28px; padding-left: 8px; border-radius: 5px; }
+  .media-properties .property-row input[type='range'] { width: 100%; min-width: 0; }
+  .media-properties .property-row .value { font-size: 11px; font-variant-numeric: tabular-nums; }
+  .media-properties .property-row.inspector-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .media-properties .inspector-actions button { width: auto; flex: 1 1 auto; white-space: nowrap; }
+  .media-properties .btn-reset, .media-properties .btn-secondary,
+  .media-properties .btn-small, .media-properties .warp-mode-btn { font-size: 12px; font-weight: 500; min-height: 28px; height: auto; padding: 5px 8px; border-radius: 5px; line-height: 1.3; }
+  .media-properties .warp-mode-buttons { border-radius: 5px; }
+  .media-properties .warp-mode-btn { border-radius: 0; }
+  .media-properties .shape-icon-row { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
+  .media-properties .shape-icon-btn { height: 28px; padding: 0; border-radius: 5px; }
+  .media-properties .shape-icon-btn.active, .media-properties .warp-mode-btn.active,
+  .media-properties .vt-audio-toggle.active { color: var(--ga-selection-ink, #e0e8ff);
+    background: var(--ga-selection-bg, #172a5b); border-color: var(--ga-selection-line, #3d59b8); }
+  .media-properties .mask-section, .media-properties .shape-mask-section { margin-top: 12px; padding-top: 10px; }
+  .media-properties .mask-section .property-row label { white-space: nowrap; flex-shrink: 0; }
+  .media-properties .mask-point-count { font-size: 11px; text-align: right; }
+  .media-properties .mask-hint { font-size: 11px; font-style: normal; line-height: 1.5; }
+  .media-properties .media-drop-zone { border-radius: 6px; padding: 8px; }
+  .media-properties .source-name { font-size: 12px; font-weight: 500; color: var(--ga-ink-0, #eef0f4); overflow-wrap: anywhere; }
+  .media-properties .video-controls-panel { padding: 8px; }
+  .media-properties .vt-time { font-size: 11px; font-variant-numeric: tabular-nums; margin-left: auto; }
+  .media-properties .vt-audio-num { color: var(--ga-ink-1, #9aa0ac); }
+  .media-properties button:focus-visible, .media-properties select:focus-visible { outline: 2px solid var(--ga-focus, #7996ff); outline-offset: 2px; }
 </style>

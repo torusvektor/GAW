@@ -306,10 +306,10 @@
   });
 </script>
 
-<div class="veo-generator">
+<div data-help-page="ai-generation" class="veo-generator">
   <div class="header">
     <h4>AI Video Generator</h4>
-    <button class="close-btn" onclick={() => dispatch('close')}>&times;</button>
+    <button aria-label="Close video generator" class="close-btn" onclick={() => dispatch('close')}>&times;</button>
   </div>
 
   <!-- Provider tabs -->
@@ -840,7 +840,7 @@
   }
   .status.done { color: #0f0; }
   .elapsed {
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     color: var(--text-muted, #888);
   }
 

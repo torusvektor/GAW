@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { project, selectedLayer } from '../stores/layers';
+  import { project, selectedLayer, scheduleHistorySnapshot } from '../stores/layers';
   import { showLoading, hideLoading } from '../stores/loading';
+  import { keyframeTimeline } from '../stores/keyframeTimeline';
+  import { MODEL3D_AUTOMATABLE_PARAM_MAP } from '../model3d/model3dParamSchema';
   import type {
     Model3DMaterialType,
     Model3DWireframeMode,
@@ -242,18 +244,35 @@
       onUpdate(updates);
     } else if (layer) {
       project.updateModel3DContent(layer.id, updates);
+      scheduleHistorySnapshot();
     }
+  }
+
+  // Hands a changed field to the keyframe timeline. autoRecord() itself is a
+  // no-op unless the track is armed. Matches SplatPanel's doUpdate pattern —
+  // only records when driving the mapping store directly (not in VJ mode,
+  // where onUpdate takes over and there's no armed-track concept).
+  function recordAutomatable(dotPath: string, value: unknown) {
+    if (onUpdate || !layer || typeof value !== 'number') return;
+    const descriptor = MODEL3D_AUTOMATABLE_PARAM_MAP.get(dotPath);
+    if (descriptor) keyframeTimeline.autoRecord(layer.id, `model3d:${dotPath}`, value, descriptor.label, 'number');
   }
 
   // Helper to update content (alias for doUpdate for backward compatibility in template)
   function updateContent(updates: Partial<Model3DContent>) {
     doUpdate(updates);
+    for (const [key, value] of Object.entries(updates)) {
+      recordAutomatable(key, value);
+    }
   }
 
   // Helper to update nested echo config
   function updateEcho(updates: Partial<Model3DContent['echo']>) {
     if (mc) {
       doUpdate({ echo: { ...mc.echo, ...updates } });
+      for (const [key, value] of Object.entries(updates)) {
+        recordAutomatable(`echo.${key}`, value);
+      }
     }
   }
 
@@ -261,6 +280,9 @@
   function updateCamera(updates: Partial<Model3DContent['camera']>) {
     if (mc) {
       doUpdate({ camera: { ...mc.camera, ...updates } });
+      for (const [key, value] of Object.entries(updates)) {
+        recordAutomatable(`camera.${key}`, value);
+      }
     }
   }
 
@@ -292,6 +314,9 @@
   function updateAudio(updates: Partial<Model3DContent['audio']>) {
     if (mc) {
       doUpdate({ audio: { ...mc.audio, ...updates } });
+      for (const [key, value] of Object.entries(updates)) {
+        recordAutomatable(`audio.${key}`, value);
+      }
     }
   }
 
@@ -310,7 +335,7 @@
 </script>
 
 {#if (isVJMode ? mc : layer && mc)}
-  <div class="model3d-panel" class:compact>
+  <div data-help-page="layers" class="model3d-panel" class:compact>
     {#if !compact}<h3>3D Model</h3>{/if}
 
     <!-- File Loading -->
@@ -1977,7 +2002,7 @@
 
   </div>
 {:else}
-  <div class="no-layer">
+  <div data-help-page="layers" class="no-layer">
     <p>Select a 3D model layer to edit its properties</p>
   </div>
 {/if}
@@ -2153,7 +2178,7 @@
     text-align: right;
     color: var(--accent-primary, #BB86FC);
     font-size: 11px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
 
   .property-row.checkbox label {

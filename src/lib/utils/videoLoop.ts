@@ -782,6 +782,9 @@ export async function createLoopedVideo(
   }
 
   if (renderError) {
+    // Fail loudly rather than silently substituting a hard-cut
+    // concat — a wrong transition masquerading as success is worse
+    // than an actionable error.
     try { await ff.deleteFile('input.mp4'); } catch { /* ignore */ }
     const detail = renderError instanceof Error ? renderError.message : String(renderError);
     throw new Error(`The ${transitionType} loop transition could not be rendered. ${detail}`);
@@ -821,7 +824,16 @@ export async function createLoopWithResult(
   options: NativeLoopOptions = {},
 ): Promise<LoopCreateResult> {
   if (canUseNativeLoop()) {
-    return createNativeLoopedVideo(videoFile, crossfadeDuration, onProgress, transitionType, options);
+    try {
+      return await createNativeLoopedVideo(videoFile, crossfadeDuration, onProgress, transitionType, options);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[VideoLoop] Native FFmpeg loop encoder failed (${reason}); falling back to FFmpeg.wasm.`,
+        err,
+      );
+      onProgress?.({ stage: 'processing', progress: 0, message: 'Native loop failed, trying browser encoder...' });
+    }
   }
 
   const url = await createLoopedVideo(videoFile, crossfadeDuration, onProgress, transitionType);

@@ -1,7 +1,9 @@
 <script lang="ts">
+  import { prepareVideoImport } from '../video/videoImport';
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
-  import { project, selectedLayerId, selectedLayer, selectedLayerIds, layers } from '../stores/layers';
+  import { project, selectedLayerId, selectedLayer, layers } from '../stores/layers';
+  import { activeMediaTargetLayerIds } from '../media/mediaTargeting';
   import PluginIcon from './PluginIcon.svelte';
   import { keyframeTimeline } from '../stores/keyframeTimeline';
   import { mediaLibrary, type MediaItem } from '../stores/media';
@@ -10,6 +12,7 @@
   import type { MediaSource, ISFInputDef, ImageInputRef, JSAnimationSource, VideoPlaybackMode, MediaTrayFolder, IntegratedEffectSource, IntegratedEffectType } from '../types';
   import { generateUUID } from '../types';
   import { videoLibrary, type SavedVideo } from '../stores/videoLibrary';
+  import { armNativeLibraryVideo } from '../sync/nativeRendererSync';
   import { parseISF, getInputDefault } from '../isf/parser';
   import { generateCachedThumbnail as generateShaderThumbnail } from '../isf/thumbnail';
   import { estimateShaderLoadRating, type ShaderLoadRating } from '../isf/loadRating';
@@ -23,18 +26,18 @@
   } from '../api/ai-client';
   import { settings } from '../stores/settings';
   import { updateJSAnimationParams } from '../renderer/js-animation';
+  import { jsAnimationFromHtml } from '../renderer/jsAnimationPage';
   import { confirmDeleteIfSafeMode } from '../utils/safeMode';
   // Tier-related imports removed — FluidGen plugin always available.
   import AIShaderGenerator from './AIShaderGenerator.svelte';
   import AIVideoGenerator from './AIVideoGenerator.svelte';
   import ShaderLibrary from './ShaderLibrary.svelte';
   import * as THREE from 'three';
-  import { modulationStore, setParamModSource, setParamModAmount, updateParamMod, setBaseValue, registerParamRanges, modKeyShader, type ModSource, type ParamModulation } from '../audio/modulation';
+  import { modulationStore, setParamModSource, setParamModAmount, updateParamMod, setBaseValue, registerParamRanges, modKeyShader, hasModRange, rangeWithRestAt, type ModSource, type ParamModulation } from '../audio/modulation';
   import ModTray, { modSourceLabel } from './ModTray.svelte';
   import { mediaTrayShaders } from '../stores/mediaTrayShaders';
-  import { createAssetRefFromFile, createAssetRefFromGeneratedBlob } from '../storage/assetRegistry';
+  import { createDurableAssetRefFromFile, createAssetRefFromGeneratedBlob } from '../storage/assetRegistry';
   import { listScreenCaptureSources, screenCaptureSourcePickerAvailable, type ScreenCaptureSource } from '$lib/capture/screenSources';
-  import { syncTrimmedVideoPlayback } from '../utils/videoTrimPlayback';
   // Built-in Three.js / p5.js animations — auto-discovered from
   // public/threejs/ at build time by the vite plugin (see vite.config.ts).
   // Add a folder there, rebuild, it appears in the JS tab automatically.
@@ -71,9 +74,10 @@
 
   // --- Plugin System (Integrated) ---
   import { getAllPlugins, getPlugin, type PluginManifest } from '../plugins/registry';
+  import { isNativePluginId } from '$lib/renderer/nativePluginInventory';
 
-  // Get all registered plugins
-  $: availablePlugins = getAllPlugins();
+  // Ghost 2.0 intentionally exposes only plugins with an enabled native graph.
+  $: availablePlugins = getAllPlugins().filter((plugin) => isNativePluginId(plugin.id));
 
   type VJTrayLiveSourcePayload = {
     id: string;
@@ -99,10 +103,10 @@
   };
 
   type VJTrayCreatorPayload = {
-    id: 'gpu-shader' | 'text-creator';
-    type: 'gpu' | 'text';
+    id: 'gpu-shader' | 'text-creator' | 'performer';
+    type: 'gpu' | 'text' | 'synthvision';
     name: string;
-    src: 'gpu-layer' | 'text-layer';
+    src: 'gpu-layer' | 'text-layer' | 'performer';
   };
 
   type VJTrayMediaPayload = {
@@ -117,6 +121,9 @@
     shaderImageInputs?: Record<string, ImageInputRef | null>;
     jsAnimation?: JSAnimationSource;
     _assetRef?: any;
+    durationSeconds?: number;
+    videoWidth?: number;
+    videoHeight?: number;
   };
 
   type VJTrayAddPayload = VJTrayLiveSourcePayload | VJTrayPluginPayload | VJTrayCreatorPayload | VJTrayMediaPayload;
@@ -152,10 +159,14 @@
     thumbnail?: string;
     spoutSenderName?: string; // Spout sender name for direct receiver in Canvas.svelte
     ndiSourceName?: string; // NDI sender name for direct receiver in Canvas.svelte
+    nativeSessionId?: string;
   }
 
   let liveSources: LiveSource[] = [];
-  let availableWebcams: MediaDeviceInfo[] = [];
+  let availableWebcams: Array<{ id: string; name: string }> = [];
+  let nativeCaptureAvailable = !isDesktopApp;
+  let nativeCaptureChecked = !isDesktopApp;
+  let nativeCaptureHint = 'Native camera and screen capture unavailable';
   let availableSpoutSenders: string[] = []; // Populated from spout store
   let sourcesInitialized = false;
   let showSpoutPicker = false;
@@ -212,6 +223,10 @@
       const senderName = source.ndiSourceName || source.name.replace('NDI: ', '');
       (window as any).ghostNDI?.destroyReceiver?.(senderName).catch((err: any) => console.warn('Failed to stop NDI receiver:', err));
     }
+    if ((source.type === 'webcam' || source.type === 'capture') && source.nativeSessionId && isDesktop) {
+      bridgeInvoke('native_live_capture_stop', { sessionId: source.nativeSessionId })
+        .catch((err: any) => console.warn('Failed to stop native live source:', err));
+    }
   }
 
   function disposeUnusedLiveSources() {
@@ -258,10 +273,10 @@
     };
   }
 
-  function vjCreatorPayload(type: 'gpu' | 'text'): VJTrayCreatorPayload {
-    return type === 'gpu'
-      ? { id: 'gpu-shader', type: 'gpu', name: 'GPU Shader', src: 'gpu-layer' }
-      : { id: 'text-creator', type: 'text', name: 'Text Creator', src: 'text-layer' };
+  function vjCreatorPayload(type: 'gpu' | 'text' | 'synthvision'): VJTrayCreatorPayload {
+    if (type === 'gpu') return { id: 'gpu-shader', type: 'gpu', name: 'GPU Shader', src: 'gpu-layer' };
+    if (type === 'text') return { id: 'text-creator', type: 'text', name: 'Text Creator', src: 'text-layer' };
+    return { id: 'performer', type: 'synthvision', name: 'Performer', src: 'performer' };
   }
 
   function notifyVJLiveSourcesChanged() {
@@ -294,14 +309,82 @@
     ? ($textureShareInfo?.error || `${tsLabel} native addon unavailable`)
     : `Open a ${tsLabel} sender in MadMapper, Resolume, OBS, or another VJ app`;
 
+  type NativeLiveTextureInfo = {
+    available?: boolean;
+    width?: number;
+    height?: number;
+    handle?: unknown;
+  } | null | undefined;
+
+  function hasNativeLiveFrame(info: NativeLiveTextureInfo): boolean {
+    return !!info?.available
+      && Number(info.width || 0) > 0
+      && Number(info.height || 0) > 0
+      && info.handle !== undefined
+      && info.handle !== null;
+  }
+
+  async function waitForNativeLiveFrame(
+    receive: () => Promise<NativeLiveTextureInfo>,
+    timeoutMs = 12_000,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        if (hasNativeLiveFrame(await receive())) return true;
+      } catch {
+        // The receiver may still be waiting for permission or its first frame.
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
+  function setLiveSourceStatus(id: string, status: LiveSource['status']) {
+    liveSources = liveSources.map(source => source.id === id ? { ...source, status } : source);
+  }
+
   // Enumerate webcams
   async function enumerateWebcams() {
+    if (isDesktop) {
+      try {
+        const availability = await bridgeInvoke<{ available?: boolean; error?: string }>('native_live_capture_available');
+        nativeCaptureChecked = true;
+        nativeCaptureAvailable = !!availability?.available;
+        nativeCaptureHint = availability?.error || 'Native camera and screen capture unavailable';
+        if (!availability?.available) {
+          // Surfaced on the disabled Webcam/Capture buttons as a tooltip —
+          // log it too, because a disabled button with no explanation is
+          // indistinguishable from a missing feature.
+          console.warn(`[MediaTray] native capture unavailable: ${nativeCaptureHint}`);
+          availableWebcams = [];
+          return;
+        }
+        const devices = await bridgeInvoke<Array<{ id?: string; name?: string }>>('native_live_capture_list_cameras');
+        availableWebcams = (Array.isArray(devices) ? devices : [])
+          .map((device) => ({ id: String(device?.id || ''), name: String(device?.name || 'Camera') }))
+          .filter((device) => !!device.id);
+        console.log(
+          `[MediaTray] native capture available=${nativeCaptureAvailable} cameras=${availableWebcams.length}`
+          + `${availableWebcams.length ? ` (${availableWebcams.map((c) => c.name).join(', ')})` : ''}`,
+        );
+      } catch (err) {
+        console.warn('Could not enumerate native cameras:', err);
+        nativeCaptureChecked = true;
+        nativeCaptureAvailable = false;
+        nativeCaptureHint = err instanceof Error ? err.message : String(err);
+        availableWebcams = [];
+      }
+      return;
+    }
     try {
       // Request permission first
       const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
       tempStream.getTracks().forEach(t => t.stop());
       const devices = await navigator.mediaDevices.enumerateDevices();
-      availableWebcams = devices.filter(d => d.kind === 'videoinput');
+      availableWebcams = devices
+        .filter(d => d.kind === 'videoinput')
+        .map(d => ({ id: d.deviceId, name: d.label || 'Camera' }));
     } catch (err) {
       console.warn('Could not enumerate webcams:', err);
       availableWebcams = [];
@@ -310,6 +393,38 @@
 
   // Start a webcam source
   async function startWebcam(deviceId?: string) {
+    if (isDesktop) {
+      const sessionId = generateUUID();
+      const selected = availableWebcams.find(device => device.id === deviceId);
+      try {
+        const result = await bridgeInvoke<{ ok?: boolean; error?: string }>('native_live_capture_start_camera', {
+          sessionId,
+          deviceId: deviceId || '',
+        });
+        if (!result?.ok) throw new Error(result?.error || 'Native camera did not start');
+        const source: LiveSource = {
+          id: sessionId,
+          name: selected?.name || 'Webcam',
+          type: 'webcam',
+          status: 'connecting',
+          deviceId,
+          nativeSessionId: sessionId,
+        };
+        liveSources = [...liveSources, source];
+        const ready = await waitForNativeLiveFrame(() =>
+          bridgeInvoke<NativeLiveTextureInfo>('native_live_capture_texture_info', { sessionId })
+        );
+        setLiveSourceStatus(source.id, ready ? 'live' : 'disconnected');
+        if (!ready) {
+          await bridgeInvoke('native_live_capture_stop', { sessionId }).catch(() => {});
+          showToast('Camera started but did not produce a native frame.', 'error');
+        }
+      } catch (err) {
+        console.error('Failed to start native webcam:', err);
+        showToast((err as Error)?.message || 'Could not start camera.', 'error');
+      }
+      return;
+    }
     const constraints: MediaStreamConstraints = {
       video: deviceId ? { deviceId: { exact: deviceId } } : true,
       audio: false,
@@ -359,7 +474,13 @@
 
   async function startScreenCapture() {
     // Non-Electron context: keep the old behaviour so the app still runs in browsers.
-    if (!screenCaptureSourcePickerAvailable()) return startScreenCaptureBrowserFallback();
+    if (!screenCaptureSourcePickerAvailable()) {
+      if (isDesktop) {
+        showToast(nativeCaptureHint, 'error');
+        return;
+      }
+      return startScreenCaptureBrowserFallback();
+    }
 
     screenPickerOpen = true;
     screenPickerLoading = true;
@@ -383,6 +504,39 @@
 
   async function pickScreenSource(picked: ScreenSource) {
     closeScreenPicker();
+    if (isDesktop) {
+      const sessionId = generateUUID();
+      try {
+        const result = await bridgeInvoke<{ ok?: boolean; error?: string }>('native_live_capture_start_screen', {
+          sessionId,
+          sourceId: picked.id,
+          displayId: picked.display_id || '',
+          kind: picked.kind,
+        });
+        if (!result?.ok) throw new Error(result?.error || 'Native screen capture did not start');
+        const source: LiveSource = {
+          id: sessionId,
+          name: picked.name || 'Capture',
+          type: 'capture',
+          status: 'connecting',
+          thumbnail: picked.thumbnailDataUrl || undefined,
+          nativeSessionId: sessionId,
+        };
+        liveSources = [...liveSources, source];
+        const ready = await waitForNativeLiveFrame(() =>
+          bridgeInvoke<NativeLiveTextureInfo>('native_live_capture_texture_info', { sessionId })
+        );
+        setLiveSourceStatus(source.id, ready ? 'live' : 'disconnected');
+        if (!ready) {
+          await bridgeInvoke('native_live_capture_stop', { sessionId }).catch(() => {});
+          showToast('Capture started but did not produce a native frame.', 'error');
+        }
+      } catch (err) {
+        console.error('Failed to start native capture for', picked.name, err);
+        showToast((err as Error)?.message || `Could not capture "${picked.name}".`, 'error');
+      }
+      return;
+    }
     try {
       // Chrome legacy mandatory constraints — the only way to pin
       // getUserMedia to a specific desktopCapturer source id in Electron.
@@ -497,10 +651,13 @@
       const result = await bridgeInvoke('spout_start_receiver', { senderName });
       console.log('[Spout] Receiver started:', result);
 
-      // Mark as live
-      liveSources = liveSources.map(s =>
-        s.id === source.id ? { ...s, status: 'live' as const } : s
+      const ready = await waitForNativeLiveFrame(() =>
+        bridgeInvoke<NativeLiveTextureInfo>('spout_receive_texture_info', { senderName })
       );
+      setLiveSourceStatus(source.id, ready ? 'live' : 'disconnected');
+      if (!ready) {
+        await bridgeInvoke('spout_stop_receiver', { senderName }).catch(() => {});
+      }
     } catch (err) {
       console.error('Failed to start Spout receiver:', err);
       liveSources = liveSources.map(s =>
@@ -586,7 +743,7 @@
     }
   }
 
-  function addNdiSource(sourceName: string) {
+  async function addNdiSource(sourceName: string) {
     const senderName = sourceName.trim();
     if (!senderName) return;
 
@@ -594,12 +751,35 @@
       id: generateUUID(),
       name: `NDI: ${senderName}`,
       type: 'ndi',
-      status: 'live',
+      status: 'connecting',
       ndiSourceName: senderName,
     };
     liveSources = [...liveSources, source];
     showNdiPicker = false;
     stopNdiScan();
+
+    const ndi = getNdiBridge();
+    if (!ndi?.createReceiver) {
+      liveSources = liveSources.map(item =>
+        item.id === source.id ? { ...item, status: 'disconnected' as const } : item
+      );
+      return;
+    }
+    try {
+      const result = await ndi.createReceiver(senderName);
+      if (result?.ok === false) {
+        setLiveSourceStatus(source.id, 'disconnected');
+        return;
+      }
+      const ready = await waitForNativeLiveFrame(() => ndi.receiveTextureInfo(senderName));
+      setLiveSourceStatus(source.id, ready ? 'live' : 'disconnected');
+      if (!ready) await ndi.destroyReceiver?.(senderName).catch(() => {});
+    } catch (err) {
+      console.error('Failed to start NDI receiver:', err);
+      liveSources = liveSources.map(item =>
+        item.id === source.id ? { ...item, status: 'disconnected' as const } : item
+      );
+    }
   }
 
   // Stop and remove a live source
@@ -630,6 +810,8 @@
             width: 1920,
             height: 1080,
           },
+          liveSourceType: 'syphon',
+          liveSourceSessionId: source.id,
         };
         project.setLayerSource(layerId, ms);
       } else if (source.type === 'ndi') {
@@ -644,10 +826,11 @@
             width: 1920,
             height: 1080,
           },
+          liveSourceType: 'ndi',
+          liveSourceSessionId: source.id,
         };
         project.setLayerSource(layerId, ms);
       } else {
-        if (!source.videoEl) continue;
         const ms: MediaSource = {
           id: `${source.id}-${layerId}-${Date.now()}`,
           type: 'video',
@@ -656,6 +839,8 @@
           videoElement: source.videoEl,
           isPlaying: true,
           mirrorX: source.type === 'webcam',
+          liveSourceType: source.type,
+          liveSourceSessionId: source.nativeSessionId || source.id,
         };
         project.setLayerSource(layerId, ms);
       }
@@ -680,7 +865,7 @@
     onVJAddPayload?.(vjPluginPayload(plugin));
   }
 
-  function addCreatorToVJDeck(type: 'gpu' | 'text') {
+  function addCreatorToVJDeck(type: 'gpu' | 'text' | 'synthvision') {
     if (!vjMode) return;
     onVJAddPayload?.(vjCreatorPayload(type));
   }
@@ -729,7 +914,7 @@
     e.dataTransfer.setData('text/plain', plugin.id);
   }
 
-  function onCreatorCardDragStart(type: 'gpu' | 'text', e: DragEvent) {
+  function onCreatorCardDragStart(type: 'gpu' | 'text' | 'synthvision', e: DragEvent) {
     if (!vjMode || !e.dataTransfer) return;
     const payload = vjCreatorPayload(type);
     (window as any).__ghostVJMediaTrayDragPayload = payload;
@@ -890,6 +1075,17 @@
   // Media library items (local reference to store)
   $: videos = $mediaLibrary.filter(m => m.type === 'video');
   $: images = $mediaLibrary.filter(m => m.type === 'image');
+  let autoArmedVideoLibrarySignature = '';
+  $: {
+    const armCandidates = videos.slice(0, 8);
+    const signature = armCandidates
+      .map((item) => `${item.id}:${item.src}:${Number(item.videoElement?.duration) || 0}`)
+      .join('|');
+    if (signature !== autoArmedVideoLibrarySignature) {
+      autoArmedVideoLibrarySignature = signature;
+      for (const item of armCandidates) armTrayVideoItem(item);
+    }
+  }
 
   // Shader library (not shared, local to this component)
   let shaders: ShaderItem[] = [];
@@ -1076,9 +1272,22 @@
         if (mediaTrayDestroyed) return;
         preGenMap = manifest.thumbnails || {};
         console.log(`[Thumbnails] Found ${Object.keys(preGenMap).length} pre-generated thumbnails`);
+      } else {
+        console.warn(
+          `[Thumbnails] manifest.json returned ${manifestResp.status}; falling back to runtime WebGL`
+          + ' generation for every shader. Run `npm run isf:thumbnails` to rebuild it.',
+        );
       }
-    } catch {
-      // No pre-generated thumbnails available, will generate at runtime
+    } catch (err) {
+      // Losing the manifest is not fatal, but it is expensive: every shader
+      // then re-renders through WebGL on the UI thread to recreate a JPEG that
+      // is already on disk, which saturates the renderer and freezes the
+      // editor. This used to fail silently, so say so loudly.
+      console.warn(
+        '[Thumbnails] could not read thumbnails/manifest.json; falling back to runtime WebGL'
+        + ' generation for every shader. Run `npm run isf:thumbnails` to rebuild it.',
+        err,
+      );
     }
 
     // Sequential generation loop — one shader at a time
@@ -1208,21 +1417,12 @@
           continue;
         }
         const htmlCode = await resp.text();
-        const params = parseShaderParamDefs(htmlCode);
-        const values = parseShaderParamValues(htmlCode);
-        const paramValues: Record<string, number | boolean | number[]> = {};
-        for (const p of params) paramValues[p.name] = values[p.name] ?? p.default;
-        const isP5 = /p5\.(min\.)?js|new\s+p5\s*\(/.test(htmlCode);
+        const jsAnimation = jsAnimationFromHtml(htmlCode);
         const item: JSAnimationItem = {
           id: def.id,
           name: def.name,
-          type: isP5 ? 'p5js' : 'threejs',
-          jsAnimation: {
-            animationType: isP5 ? 'p5js' : 'threejs',
-            htmlCode,
-            params: params.length > 0 ? params : undefined,
-            paramValues: params.length > 0 ? paramValues : undefined,
-          },
+          type: jsAnimation.animationType,
+          jsAnimation,
           thumbnail: undefined,
         };
         jsAnimations = [...jsAnimations, item];
@@ -1244,6 +1444,12 @@
 
   onMount(async () => {
     mediaTrayDestroyed = false;
+    // Probe native capture up front rather than waiting for the SRC tab to
+    // be clicked. The Webcam and Capture buttons start disabled and only
+    // enable once this has run, so gating it on a click meant they stayed
+    // dead for anyone who never switched tabs — and left no log line
+    // explaining why. Two cheap IPC calls; safe to repeat on tab open.
+    void enumerateWebcams();
     // Seed built-in Three.js / p5 animations in the background so the JS
     // tab is never empty out of the box. Doesn't block shader loading.
     seedBuiltInThreeJSItems();
@@ -1397,7 +1603,7 @@
     // Capture both the runtime URL AND a durable AssetRef. The blob URL dies
     // at session end; the AssetRef carries the absolute disk path so reload
     // works even without the .gha sibling-copy (Electron Save As).
-    const { assetRef, runtimeUrl: url } = createAssetRefFromFile(file);
+    const { assetRef, runtimeUrl: url } = await createDurableAssetRefFromFile(file);
     const mediaType = getMediaType(file);
 
     if (mediaType === 'video') {
@@ -1410,20 +1616,19 @@
       video.preload = 'auto';
       video.src = url;
 
-      // `.src=` already initiated the load — don't call `.load()`.
-      await new Promise<void>((resolve) => {
-        const done = () => { video.removeEventListener('loadeddata', done); resolve(); };
-        video.addEventListener('loadeddata', done, { once: true });
-        if (video.readyState >= 2) done();
+      const imported = await prepareVideoImport(video, assetRef).catch(error => {
+        video.pause();
+        showToast(`${file.name}: ${error instanceof Error ? error.message : 'Could not import video.'}`, 'error');
+        return null;
       });
-
+      if (!imported) return;
       const item: MediaItem = {
         id: generateUUID(),
         name: file.name,
         src: url,
         type: 'video',
         videoElement: video,
-        thumbnail: await captureVideoThumbnail(video),
+        ...imported,
         _assetRef: assetRef,
       };
       mediaLibrary.addItem(item);
@@ -1485,30 +1690,11 @@
       try {
         const htmlCode = await file.text();
         const baseName = file.name.replace(/\.html?$/i, '');
-        // Auto-detect p5 vs three by looking for the import. Defaults to
-        // threejs so single-canvas pages without either work too.
-        const isP5 = /p5\.(min\.)?js|new p5\(/.test(htmlCode);
-        const animationType: 'threejs' | 'p5js' = isP5 ? 'p5js' : 'threejs';
-
-        // Parse window.shaderParamDefs out of the HTML so the slider UI
-        // can render the right controls. Without this users have to
-        // manually re-declare every param in the app — defeats the point
-        // of supporting param-aware files.
-        const parsedDefs = parseShaderParamDefs(htmlCode);
-        // Also parse window.shaderParams for the live values; falls back
-        // to the def's default if not present.
-        const parsedValues = parseShaderParamValues(htmlCode);
-        const paramValues: Record<string, number | boolean | number[]> = {};
-        for (const def of parsedDefs) {
-          paramValues[def.name] = parsedValues[def.name] ?? def.default;
-        }
-
-        const jsAnimation: JSAnimationSource = {
-          animationType,
-          htmlCode,
-          params: parsedDefs.length > 0 ? parsedDefs : undefined,
-          paramValues: parsedDefs.length > 0 ? paramValues : undefined,
-        };
+        // p5 or three.js, and sliders from the page's shaderParamDefs, or
+        // from its flat `window.shaderParams = {...}` when it declares none.
+        // The literals are parsed as data, never evaluated.
+        const jsAnimation: JSAnimationSource = jsAnimationFromHtml(htmlCode);
+        const animationType = jsAnimation.animationType;
 
         // Snapshot the first rendered frame as a thumbnail. Best-effort —
         // failures (cross-origin, no canvas, slow first frame) fall back
@@ -1533,91 +1719,18 @@
   }
 
   /**
-   * Extract a balanced object-or-array literal from `html` starting after
-   * the first match of `pattern`. Handles nested brackets (e.g. a defs
-   * array whose entries contain `default: [0.4, 0.7, 1.0]`) and strings
-   * with brackets inside them. Returns the literal text including its
-   * outer brackets, or null when no match / unbalanced.
-   *
-   * Why this exists: the original regex match `\[[\s\S]*?\]` is non-
-   * greedy and stops at the FIRST closing bracket, so a color default
-   * like `[0.4, 0.7, 1.0]` truncates the entire defs array and the
-   * caller falls back to "no params" — exactly the user-visible bug we
-   * just hit with the Embryo defaults.
-   */
-  function extractBracketedAfter(html: string, pattern: RegExp): string | null {
-    const m = html.match(pattern);
-    if (!m || m.index === undefined) return null;
-    let i = m.index + m[0].length;
-    while (i < html.length && /\s/.test(html[i])) i++;
-    if (i >= html.length) return null;
-    const open = html[i];
-    if (open !== '[' && open !== '{') return null;
-    const close = open === '[' ? ']' : '}';
-    let depth = 0;
-    let inStr = false;
-    let strCh = '';
-    for (let j = i; j < html.length; j++) {
-      const c = html[j];
-      if (inStr) {
-        if (c === '\\') { j++; continue; }
-        if (c === strCh) inStr = false;
-      } else {
-        if (c === '"' || c === "'" || c === '`') { inStr = true; strCh = c; }
-        else if (c === open) depth++;
-        else if (c === close) {
-          depth--;
-          if (depth === 0) return html.slice(i, j + 1);
-        }
-      }
-    }
-    return null;
-  }
-
-  function parseShaderParamDefs(html: string): Array<{
-    name: string;
-    type: 'number' | 'boolean' | 'color';
-    default: number | boolean | number[];
-    min?: number;
-    max?: number;
-    label?: string;
-  }> {
-    const lit = extractBracketedAfter(html, /window\.shaderParamDefs\s*=\s*/);
-    if (!lit) return [];
-    try {
-      const arr = new Function('return ' + lit)();
-      if (!Array.isArray(arr)) return [];
-      return arr.filter(d => d && typeof d.name === 'string' && d.type).map(d => ({
-        name: String(d.name),
-        type: d.type as 'number' | 'boolean' | 'color',
-        default: d.default,
-        min: typeof d.min === 'number' ? d.min : undefined,
-        max: typeof d.max === 'number' ? d.max : undefined,
-        label: typeof d.label === 'string' ? d.label : d.name,
-      }));
-    } catch (err) {
-      console.warn('[MediaTray] failed to parse shaderParamDefs:', err);
-      return [];
-    }
-  }
-
-  function parseShaderParamValues(html: string): Record<string, number | boolean | number[]> {
-    const lit = extractBracketedAfter(html, /window\.shaderParams\s*=\s*/);
-    if (!lit) return {};
-    try {
-      const obj = new Function('return ' + lit)();
-      return (obj && typeof obj === 'object') ? obj : {};
-    } catch {
-      return {};
-    }
-  }
-
-  /**
    * Mount the HTML in a hidden iframe long enough to capture the first
    * frame as a 160×90 JPEG thumbnail. Cleans up the iframe after. Fails
    * silently on cross-origin / no-canvas / slow-load.
    */
   async function captureJSAnimationThumbnail(html: string): Promise<string | undefined> {
+    // On desktop the page draws in an offscreen host with the bundled three
+    // and p5 it expects, instead of running inside the editor for a moment.
+    if (isDesktopApp) {
+      const result = await bridgeInvoke<{ ok: boolean; data_url?: string }>('js_source_thumbnail', { html })
+        .catch(() => null);
+      return result?.ok ? result.data_url : undefined;
+    }
     return new Promise((resolve) => {
       const blob = new Blob([html], { type: 'text/html' });
       const url = URL.createObjectURL(blob);
@@ -1686,14 +1799,7 @@
   }
 
   function getTargetMediaLayerIds(): string[] {
-    const multiSelectionValid =
-      !!$selectedLayerId &&
-      $selectedLayerIds.length > 0 &&
-      $selectedLayerIds.includes($selectedLayerId);
-    const selectedIds = multiSelectionValid
-      ? $selectedLayerIds
-      : ($selectedLayerId ? [$selectedLayerId] : []);
-    return selectedIds.filter((id) => $layers.some((l) => l.id === id && (l.type === 'media' || l.type === 'screen' || l.type === 'group')));
+    return activeMediaTargetLayerIds($selectedLayerId, $layers);
   }
 
   async function applySourceToTargetMediaLayers(
@@ -1701,7 +1807,7 @@
   ) {
     const targetIds = getTargetMediaLayerIds();
     if (targetIds.length === 0) {
-      alert('Please select one or more media layers first');
+      alert('Please select a media layer first');
       return;
     }
     for (const layerId of targetIds) {
@@ -1752,6 +1858,8 @@
           // can find the original disk file. Without this the layer ends up
           // with a dead blob: URL by save time and reload comes back empty.
           _assetRef: (item as any)._assetRef,
+          durationSeconds: (item as MediaItem).durationSeconds,
+      videoWidth: (item as MediaItem).videoWidth, videoHeight: (item as MediaItem).videoHeight,
         };
 
         if (item.type === 'video' && item.videoElement) {
@@ -1770,9 +1878,7 @@
           if (prevVideo && prevVideo !== video) {
             try { prevVideo.pause(); } catch { /* ignore */ }
           }
-          // The layer playback controller owns looping. Native browser
-          // looping always seeks to source time zero and breaks trim-in.
-          video.loop = false;
+          video.loop = true;
           video.muted = true;
           video.playsInline = true;
           video.preload = 'auto';
@@ -1781,32 +1887,15 @@
           // wherever it was last paused".
           try { video.currentTime = 0; } catch { /* ignore */ }
 
-          if (video.readyState < 2) {
-            await new Promise<void>((resolve) => {
-              const done = () => { cleanup(); resolve(); };
-              const cleanup = () => {
-                video.removeEventListener('loadeddata', done);
-                video.removeEventListener('canplaythrough', done);
-              };
-              video.addEventListener('loadeddata', done, { once: true });
-              video.addEventListener('canplaythrough', done, { once: true });
-            });
-          }
-
-          if (video.paused) {
-            try {
-              await video.play();
-              await new Promise(resolve => requestAnimationFrame(resolve));
-            } catch (e) {
-              if ((e as DOMException)?.name !== 'AbortError') {
-                console.warn('Video autoplay blocked:', e);
-              }
-            }
-          }
-
           source.videoElement = video;
-          source.isPlaying = !video.paused;
-          syncTrimmedVideoPlayback(video, source);
+          // Native playback owns the clock. Never wait for the browser video
+          // element to load or play before binding the layer; that put a
+          // 1-2 second HTML-media stall directly in the trigger path.
+          source.isPlaying = true;
+          source.durationSeconds = Number.isFinite(video.duration) ? video.duration : undefined;
+          source._nativePlaybackTimeSeconds = 0;
+          source._nativePlaybackUpdatedAtMs = performance.now();
+          source._nativePlaybackSeekSeq = 1;
         }
 
         project.setLayerSource(layerId, source);
@@ -1869,6 +1958,19 @@
     showTimelapsePopover = itemId;
   }
 
+  /** Mirror a timelapse position into the native decoder. The core decodes
+   *  video itself and never reads videoElement.currentTime, which is why
+   *  timelapse "played as a normal loop" natively: the mode UI ran, but no
+   *  seek ever reached the decoder. Explicit time + a bumped seek
+   *  generation + paused playback is exactly the scrub contract the sync
+   *  layer already implements. */
+  function writeNativeTimelapseSeek(source: MediaSource, timeSeconds: number, paused: boolean) {
+    (source as any)._nativePlaybackTimeSeconds = Math.max(0, timeSeconds);
+    (source as any)._nativePlaybackSeekSeq = Math.round(Number((source as any)._nativePlaybackSeekSeq ?? 0)) + 1;
+    (source as any)._nativePlaybackUpdatedAtMs = performance.now();
+    source.isPlaying = !paused;
+  }
+
   function startTimelapse() {
     if (!$selectedLayerId || !$selectedLayer?.source) return;
     const source = $selectedLayer.source;
@@ -1881,6 +1983,7 @@
     source.playbackMode = 'timelapse';
     source.timelapseInterval = timelapseInterval;
     source.timelapseRunning = true;
+    writeNativeTimelapseSeek(source, timelapseState !== 'paused' ? 0 : vid.currentTime, true);
 
     const dur = vid.duration || 0;
     timelapseTotalFrames = Math.max(1, Math.floor(dur * ASSUMED_FPS));
@@ -1926,6 +2029,9 @@
     if (source.texture) {
       (source.texture as THREE.VideoTexture).needsUpdate = true;
     }
+    // Native decoder: hold paused on the stepped frame.
+    writeNativeTimelapseSeek(source, newTime, true);
+    project.setLayerSource($selectedLayerId, { ...source });
   }
 
   function pauseTimelapse() {
@@ -1952,6 +2058,9 @@
       const source = $selectedLayer.source;
       source.timelapseRunning = false;
       source._timelapseFrame = 0;
+      // Resume normal native playback from the start.
+      source.playbackMode = 'loop';
+      writeNativeTimelapseSeek(source, 0, false);
       project.setLayerSource($selectedLayerId, { ...source });
     }
   }
@@ -2172,7 +2281,9 @@
       project.setShaderValueAuto($selectedLayerId, paramName, null);
     }
     if (selectedLayerIdx >= 0) {
-      setParamModSource(selectedLayerIdx, paramName, source, 'A', 'mapping');
+      const current = selectedShader?.values?.[paramName];
+      setParamModSource(selectedLayerIdx, paramName, source, 'A', 'mapping', undefined,
+        { value: typeof current === 'number' ? current : paramMin, min: paramMin, max: paramMax });
     }
   }
 
@@ -2249,6 +2360,13 @@
     // Keep modulation base value in sync with slider (mapping mode)
     if (typeof value === 'number' && selectedLayerIdx >= 0) {
       setBaseValue(selectedLayerIdx, inputName, value);
+      // Range-mode modulation: the slider sets the resting end.
+      const mod = mappingModMap.get(modKeyShader(selectedLayerIdx, inputName, 'A', 'mapping'));
+      const input = selectedShader.inputs.find(i => i.NAME === inputName);
+      if (mod && hasModRange(mod) && input) {
+        const lo = input.MIN ?? 0, hi = input.MAX ?? 1;
+        patchMappingShaderMod(inputName, rangeWithRestAt(mod, hi > lo ? (value - lo) / (hi - lo) : 0));
+      }
     }
 
     // Auto-keyframe: if this track is armed, record a keyframe at the current playhead
@@ -2670,16 +2788,7 @@
         await createCrossfadeLoopFromVideo(item, generatedName);
       }
 
-      const transitionLabel = LOOP_TRANSITIONS.find(
-        transition => transition.value === loopTransitionType
-      )?.label ?? loopTransitionType;
-      loopProgress = {
-        stage: 'complete',
-        progress: 1,
-        message: loopCreationMode === 'veo'
-          ? 'Veo loop created & saved!'
-          : `${transitionLabel} loop created & saved!`,
-      };
+      loopProgress = { stage: 'complete', progress: 1, message: 'Loop created & saved!' };
 
       setTimeout(() => {
         loopingVideoId = null;
@@ -2774,6 +2883,21 @@
 
   function getVisibleItemsForSelection() {
     return currentItems;
+  }
+
+  /** Hover/drag-start pre-arm so a subsequent click triggers the clip with
+   *  zero decoder cold-start — the native core pre-rolls a paused `library:`
+   *  session and hands it over at bind time (music-sync trigger latency). */
+  function armTrayVideoItem(item: MediaItem | ShaderItem | JSAnimationItem) {
+    if (!('type' in item) || item.type !== 'video' || !item.src) return;
+    armNativeLibraryVideo({
+      id: item.id,
+      src: item.src,
+      videoElement: (item as MediaItem).videoElement ?? null,
+      durationSeconds: (item as MediaItem).durationSeconds,
+      videoWidth: (item as MediaItem).videoWidth, videoHeight: (item as MediaItem).videoHeight,
+      assetRef: (item as MediaItem)._assetRef,
+    });
   }
 
   function handleTrayItemClick(itemId: string, e: MouseEvent, apply: () => void) {
@@ -2973,6 +3097,8 @@
       src: item.src,
       thumbnail: item.thumbnail,
       _assetRef: (item as any)._assetRef,
+      durationSeconds: (item as MediaItem).durationSeconds,
+      videoWidth: (item as MediaItem).videoWidth, videoHeight: (item as MediaItem).videoHeight,
     };
   }
 
@@ -3509,7 +3635,7 @@
 
 {#if !embedded}
 <!-- Toggle button -->
-<button class="tray-toggle" class:open={isOpen} onclick={toggleTray}>
+<button data-help-page="custom-shaders" class="tray-toggle" class:open={isOpen} onclick={toggleTray}>
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
     {#if isOpen}
       <path d="M9 18l6-6-6-6" />
@@ -3522,7 +3648,7 @@
 {/if}
 
 <!-- Slide-out tray -->
-<div class="media-tray" class:open={isOpen || embedded} class:embedded>
+<div data-help-page="custom-shaders" class="media-tray" class:open={isOpen || embedded} class:embedded>
   <div class="tray-header">
     <h3>Media Library</h3>
   </div>
@@ -3555,7 +3681,7 @@
         <span>Img</span>
         {#if images.length}<span class="tab-count">{images.length}</span>{/if}
       </button>
-      <button class="tab" class:active={activeTab === 'sources'} onclick={() => { activeTab = 'sources'; if (!sourcesInitialized) { sourcesInitialized = true; enumerateWebcams(); } }}>
+      <button class="tab" class:active={activeTab === 'sources'} onclick={() => { activeTab = 'sources'; sourcesInitialized = true; enumerateWebcams(); }}>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
         <span>Src</span>
         {#if liveSources.filter(s => s.status === 'live').length > 0}
@@ -3637,7 +3763,7 @@
   {/if}
 
   <!-- Shader Parameters Panel (when shader is selected) -->
-  {#if selectedShader && selectedShader.inputs.length > 0}
+  {#if !vjMode && selectedShader && selectedShader.inputs.length > 0}
     <div class="shader-params">
       <div class="params-header">
         <h4>{selectedShader.name}</h4>
@@ -3768,6 +3894,21 @@
                   }} />
               </div>
             </div>
+          {:else if input.TYPE === 'event'}
+            <!-- ISF `event` inputs are momentary actions, not values. The
+                 uniform is a float, so clicking writes a fresh random one:
+                 a generative shader reads it as its seed and re-rolls, and
+                 a shader that only wants "did it fire" still sees a change.
+                 Goes through updateShaderParam like every other control, so
+                 it persists, keyframes and MIDI-maps for free. -->
+            <div class="param-row">
+              <button
+                type="button"
+                class="param-event-btn"
+                title="Re-roll this shader"
+                onclick={() => updateShaderParam(input.NAME, Math.random())}
+              >{input.LABEL || input.NAME}</button>
+            </div>
           {:else if input.TYPE === 'bool'}
             <div class="param-row">
               <label>{input.LABEL || input.NAME}</label>
@@ -3826,13 +3967,16 @@
           onSetSource={(s) => setMappingShaderSource(mapModTrayParam!, s, _tInput?.MIN ?? 0, _tInput?.MAX ?? 1)}
           onPatchMod={(p) => patchMappingShaderMod(mapModTrayParam!, p)}
           onPatchAuto={(p) => patchMappingShaderAuto(mapModTrayParam!, p)}
+          paramMin={_tInput?.MIN ?? 0}
+          paramMax={_tInput?.MAX ?? 1}
+          paramValue={typeof selectedShader.values[mapModTrayParam] === 'number' ? selectedShader.values[mapModTrayParam] as number : undefined}
         />
       {/if}
     </div>
   {/if}
 
   <!-- JS Animation Parameters Panel (when JS animation is selected) -->
-  {#if selectedJSAnimation && selectedJSAnimation.jsAnimation.params && selectedJSAnimation.jsAnimation.params.length > 0}
+  {#if !vjMode && selectedJSAnimation && selectedJSAnimation.jsAnimation.params && selectedJSAnimation.jsAnimation.params.length > 0}
     <div class="shader-params js-params">
       <div class="params-header">
         <h4>{selectedJSAnimation.name}</h4>
@@ -3882,13 +4026,23 @@
       <!-- Live Sources Panel -->
       <div class="sources-panel">
         <div class="sources-add-row">
-          <button class="source-add-btn" onclick={() => startWebcam()}>
+          <button
+            class="source-add-btn"
+            disabled={isDesktop && (!nativeCaptureChecked || !nativeCaptureAvailable)}
+            title={isDesktop && !nativeCaptureAvailable ? nativeCaptureHint : 'Add webcam source'}
+            onclick={() => startWebcam()}
+          >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
             </svg>
             Webcam
           </button>
-          <button class="source-add-btn" onclick={() => startScreenCapture()}>
+          <button
+            class="source-add-btn"
+            disabled={isDesktop && (!nativeCaptureChecked || !nativeCaptureAvailable)}
+            title={isDesktop && !nativeCaptureAvailable ? nativeCaptureHint : 'Capture a screen or window'}
+            onclick={() => startScreenCapture()}
+          >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
             </svg>
@@ -3976,7 +4130,7 @@
             <select class="device-select" onchange={(e) => { const v = (e.target as HTMLSelectElement).value; if (v) startWebcam(v); }}>
               <option value="">Select camera...</option>
               {#each availableWebcams as cam}
-                <option value={cam.deviceId}>{cam.label || `Camera ${availableWebcams.indexOf(cam) + 1}`}</option>
+                <option value={cam.id}>{cam.name || `Camera ${availableWebcams.indexOf(cam) + 1}`}</option>
               {/each}
             </select>
           </div>
@@ -4051,7 +4205,7 @@
                   </span>
                 </div>
                 <div class="source-actions">
-                  {#if source.status === 'live' && (source.videoEl || source.type === 'spout' || source.type === 'ndi')}
+                  {#if source.status === 'live'}
                     <button class="source-apply-btn" onclick={(e) => { e.stopPropagation(); addLiveSourceToCurrentMode(source); }} title={vjMode ? 'Add to VJ deck' : 'Apply to selected layer'}>
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <polyline points="20 6 9 17 4 12"/>
@@ -4092,6 +4246,23 @@
               <div class="plugin-info">
                 <span class="plugin-name">GPU Shader</span>
                 <span class="plugin-desc">Native generative shaders with live controls</span>
+                <span class="plugin-tier creator-tier">VJ CONTENT</span>
+              </div>
+            </button>
+            <button
+              class="plugin-card creator-card"
+              onclick={() => addCreatorToVJDeck('synthvision')}
+              draggable="true"
+              ondragstart={(e) => onCreatorCardDragStart('synthvision', e)}
+              ondragend={clearVJMediaTrayDragPayload}
+              title="Add Performer to VJ deck"
+            >
+              <div class="plugin-preview creator-icon">
+                <PluginIcon pluginId="performer" size={34} />
+              </div>
+              <div class="plugin-info">
+                <span class="plugin-name">Performer</span>
+                <span class="plugin-desc">Keyboard-launched worlds, shaders and clips</span>
                 <span class="plugin-tier creator-tier">VJ CONTENT</span>
               </div>
             </button>
@@ -4208,7 +4379,7 @@
                 </div>
                 <div class="library-preview">
                   {#if saved.thumbnail}
-                    <img src={saved.thumbnail} alt={saved.name} class="library-thumb" />
+                    <img src={saved.thumbnail} alt={saved.name} class="library-thumb" draggable="false" />
                   {:else}
                     <div class="library-icon">
                       {#if saved.type === 'shader-isf'}
@@ -4435,8 +4606,9 @@
               class:drag-over-reorder={dragOverTrayItemId === item.id}
               onclick={(e) => handleTrayItemClick(item.id, e, () => addTrayItemToCurrentMode(item))}
               oncontextmenu={(e) => openTrayContextMenu(item.id, e)}
+              onpointerenter={() => armTrayVideoItem(item)}
               draggable="true"
-              ondragstart={(e) => onTrayItemDragStart(item, e)}
+              ondragstart={(e) => { armTrayVideoItem(item); onTrayItemDragStart(item, e); }}
               ondragover={(e) => { e.preventDefault(); dragOverTrayItemId = item.id; }}
               ondragleave={() => { if (dragOverTrayItemId === item.id) dragOverTrayItemId = null; }}
               ondrop={(e) => { e.preventDefault(); e.stopPropagation(); reorderTrayItem(item.id); }}
@@ -4447,7 +4619,7 @@
               title={trayItemActionTitle()}
             >
               {#if 'shaderCode' in item && item.thumbnail}
-                <img src={item.thumbnail} alt={item.name} class="shader-thumb" />
+                <img src={item.thumbnail} alt={item.name} class="shader-thumb" draggable="false" />
               {:else if 'shaderCode' in item && (item.loadingProgress || 0) < 1}
                 <div class="shader-icon loading">
                   <div class="loading-bar-container">
@@ -4460,7 +4632,7 @@
                   <span class="shader-placeholder-text">ISF</span>
                 </div>
               {:else if 'thumbnail' in item && item.thumbnail}
-                <img src={item.thumbnail} alt={item.name} />
+                <img src={item.thumbnail} alt={item.name} draggable="false" />
               {:else}
                 <div class="placeholder-thumb"></div>
               {/if}
@@ -4700,7 +4872,7 @@
 {#if showLoopOptions}
   {@const loopItem = videos.find(i => i.id === showLoopOptions)}
   {#if loopItem}
-    <div
+    <div data-help-page="custom-shaders"
       class="loop-options-popover"
       style="left: {loopPopoverPos.x}px; top: {loopPopoverPos.y}px; transform: translate(-50%, -100%);"
       onclick={(e) => e.stopPropagation()}
@@ -4752,7 +4924,7 @@
 
 <!-- Fixed-position timelapse popover -->
 {#if showTimelapsePopover}
-  <div
+  <div data-help-page="custom-shaders"
     class="timelapse-popover"
     style="left: {timelapsePopoverPos.x}px; top: {timelapsePopoverPos.y}px; transform: translate(-50%, -100%);"
     onclick={(e) => e.stopPropagation()}
@@ -4841,7 +5013,7 @@
   same "Zoom-style" chooser UX.
 -->
 {#if screenPickerOpen}
-  <div
+  <div data-help-page="custom-shaders"
     class="capture-picker-backdrop"
     onclick={closeScreenPicker}
     role="dialog"
@@ -5393,6 +5565,29 @@
     font-size: 11px;
     outline: none;
     cursor: pointer;
+  }
+  /* ISF `event` inputs — a momentary action, styled as an accented
+     button so it reads as "do something" rather than "set a value". */
+  .param-event-btn {
+    flex: 1;
+    background-color: #1a1a2e;
+    color: #BB86FC;
+    border: 1px solid #BB86FC;
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    outline: none;
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+  }
+  .param-event-btn:hover {
+    background-color: #BB86FC;
+    color: #12121c;
+  }
+  .param-event-btn:active {
+    transform: translateY(1px);
   }
   .param-select:focus {
     border-color: #BB86FC;
@@ -6315,7 +6510,7 @@
     background: transparent;
     border: none;
     color: var(--ga-ink-1, #9aa0ac);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', monospace);
     font-size: 11px;
     letter-spacing: 0.18em;
     text-transform: uppercase;
@@ -6764,9 +6959,9 @@
     gap: 8px;
   }
 
-  /* App-native plugin card — minimal dark surface with coral accent.
-     Palette comes from App.svelte CSS vars (--accent-primary #FF6B6B,
-     --border-primary rgba(255,107,107,0.15)). No per-plugin gradient
+  /* App-native plugin card — minimal dark surface with the accent tint. 
+     Palette follows the active accent scheme (--accent-primary), with
+     every tint derived from it via color-mix. No per-plugin gradient
      backgrounds — uniform look across every visualizer engine. */
   .plugin-card {
     display: flex;
@@ -6774,7 +6969,7 @@
     gap: 10px;
     padding: 9px 10px;
     background: #0a0a0d;
-    border: 1px solid rgba(255, 107, 107, 0.10);
+    border: 1px solid color-mix(in srgb, var(--accent-primary, #FF725F) 10%, transparent);
     border-radius: 6px;
     transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
     cursor: pointer;
@@ -6783,14 +6978,14 @@
   }
 
   .plugin-card:hover:not(:disabled) {
-    border-color: rgba(255, 107, 107, 0.55);
+    border-color: color-mix(in srgb, var(--accent-primary, #FF725F) 55%, transparent);
     background: #100a0c;
-    box-shadow: 0 0 0 1px rgba(255, 107, 107, 0.06), 0 0 10px rgba(255, 107, 107, 0.10);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-primary, #FF725F) 6%, transparent), 0 0 10px color-mix(in srgb, var(--accent-primary, #FF725F) 10%, transparent);
   }
 
   .plugin-card:hover:not(:disabled) .plugin-icon-svg {
-    color: var(--accent-primary, #FF6B6B);
-    filter: drop-shadow(0 0 4px rgba(255, 107, 107, 0.4));
+    color: var(--accent-primary, #FF725F);
+    filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent-primary, #FF725F) 40%, transparent));
   }
 
   .plugin-card:disabled {
@@ -6799,8 +6994,8 @@
   }
 
   .plugin-card.running {
-    border-color: var(--accent-primary, #FF6B6B);
-    background: rgba(255, 107, 107, 0.05);
+    border-color: var(--accent-primary, #FF725F);
+    background: color-mix(in srgb, var(--accent-primary, #FF725F) 5%, transparent);
     position: relative;
   }
 
@@ -6810,9 +7005,9 @@
     right: 8px;
     width: 6px;
     height: 6px;
-    background: var(--accent-primary, #FF6B6B);
+    background: var(--accent-primary, #FF725F);
     border-radius: 50%;
-    box-shadow: 0 0 6px rgba(255, 107, 107, 0.6);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--accent-primary, #FF725F) 60%, transparent);
     animation: pulse-dot 2s infinite;
   }
 
@@ -6829,7 +7024,7 @@
     height: 40px;
     border-radius: 5px;
     background: var(--bg-primary, #050507);
-    border: 1px solid rgba(255, 107, 107, 0.08);
+    border: 1px solid color-mix(in srgb, var(--accent-primary, #FF725F) 8%, transparent);
     flex-shrink: 0;
   }
 
@@ -6867,7 +7062,7 @@
 
   .plugin-tier {
     font-size: 9px;
-    color: var(--accent-primary, #FF6B6B);
+    color: var(--accent-primary, #FF725F);
     letter-spacing: 0.6px;
     margin-top: 1px;
     opacity: 0.55;
@@ -6924,10 +7119,15 @@
     transition: all 0.15s;
   }
 
-  .source-add-btn:hover {
+  .source-add-btn:hover:not(:disabled) {
     border-color: #BB86FC;
     color: #BB86FC;
     background: #1a2a2d;
+  }
+
+  .source-add-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.42;
   }
 
   .source-add-btn.spout {

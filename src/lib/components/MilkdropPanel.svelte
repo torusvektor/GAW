@@ -104,7 +104,7 @@
   });
 </script>
 
-<div class="mk-panel">
+<div data-help-page="gpu-instruments" class="mk-panel">
   <!-- Transport row -->
   <div class="mk-transport">
     <button class="mk-btn" title="Previous preset" onclick={() => fire('prev')}>◀</button>
@@ -226,7 +226,7 @@
     border-radius: 3px;
     padding: 1px 5px;
     font-size: 10px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     margin: 0 2px;
   }
 
@@ -250,7 +250,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .mk-fav-btn, .mk-fav-only {
     background: transparent;
@@ -310,7 +310,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .mk-row-fav {
     background: transparent;

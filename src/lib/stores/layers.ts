@@ -1,9 +1,25 @@
+import { normalizeVJGroups } from './vjGroups';
+import { normalizeCuePoints } from './vjCuePoints';
+import { normalizeAutopilot } from './vjAutopilot';
 import { writable, derived, get } from 'svelte/store';
-import type { Layer, Project, WarpCorners, Point2D, BezierPoint, MaskShape, MediaSource, BlendMode, WarpMode, Effect, EffectType, EffectParams, LayerType, SVGContent, SVGFillMode, SVGColorMode, ColorContent, LightPaintingContent, LightPaintingStroke, CropRegion, LayerShape, LayerShapeType, Composition, VJModeState, VJDeck, Timeline, TimelineClip, TextContent, TextAnimation, SplatContent, Model3DContent, MediaTrayFolder, StagePreset, SVKeyboardPreset, EdgeEffect, EdgeEffectsConfig, PixelFXContent, GPULayerContent, AutoConfig, WLEDController, WLEDEffect, WLEDEffectAutomation, WLEDGroup, StageEffect, SurfaceEffectAutomation, MappingCompositionState } from '../types';
+import type { Layer, Project, WarpCorners, Point2D, BezierPoint, MeshPointTangents, MaskShape, MediaSource, BlendMode, WarpMode, Effect, EffectType, EffectParams, LayerType, SVGContent, SVGFillMode, SVGColorMode, ColorContent, LightPaintingContent, LightPaintingStroke, CropRegion, LayerShape, LayerShapeType, Composition, VJModeState, VJDeck, Timeline, TimelineClip, TextContent, TextAnimation, SplatContent, Model3DContent, MediaTrayFolder, StagePreset, SVKeyboardPreset, EdgeEffect, EdgeEffectsConfig, PixelFXContent, GPULayerContent, AutoConfig, WLEDController, PixelMapConfig, PixelMapFixture, WLEDEffect, WLEDEffectAutomation, WLEDGroup, StageEffect, SurfaceEffectAutomation, MappingCompositionState } from '../types';
+import { createDefaultPixelMapConfig, normalizePixelMapConfig } from '../pixelmap/fixtures';
+
+/** Keep only the object entries with a string id from a saved list; anything
+ *  else in an older or hand-edited file is dropped instead of breaking the load. */
+function identifiedEntries(raw: unknown): any[] {
+  return Array.isArray(raw)
+    ? raw.filter(entry => entry && typeof entry === 'object' && typeof (entry as any).id === 'string')
+    : [];
+}
 import { createLayer, createProject, createDefaultCorners, createMeshGrid, createLinesLayer, createSVGLayer, createColorLayer, createLightPaintingLayer, createAdvLightPaintingLayer, createTextLayer, createSplatLayer, createDefaultSVGContent, createDefaultCropRegion, createDefaultLayerShape, createDefaultVJModeState, createDefaultMappingCompositionState, createDefaultTimeline, generateUUID, createDefaultModel3DContent, createDefaultEdgeEffect, convertShapeToCustom, createGroupLayer, createDefaultPixelFXContent, createDefaultGPULayerContent } from '../types';
 import type { GroupConfig } from '../types';
+import { instantiateEdgeEffects } from './edgeEffectPresets';
+import { buildLookEffects, lookPalette } from '../looks/edgeLooks';
+import { edgeLook } from '../looks/edgeLookCatalog';
 import { mediaLibrary } from './media';
 import { vjClipLauncher, type VJClip, type VJBlock, type VJLayerState, DEFAULT_VJ_LAYERS, DEFAULT_VJ_COLUMNS } from './vjClipLauncher';
+import { normalizedTransitionDuration, normalizedTransitionStyle } from './vjClipTransitions';
 import { disposeJSAnimationContext } from '../renderer/js-animation';
 import { synthVisionStore } from './synthVision';
 import { modulationStore, type ParamModulation } from '../audio/modulation';
@@ -13,41 +29,54 @@ import { macros } from './macros';
 import { snapshots } from './snapshots';
 import { layerSequencer } from './layerSequencer';
 import { surfaceStore } from './surface';
+import { migrateStageLayerCorners } from '../utils/stageTextureOrientation';
+import { createPaintMask, migratePaintMask, PAINT_MASK_MAX_STROKES } from '../utils/paintMask';
+import type { PaintMaskConfig, PaintMaskStroke } from '../types';
+import { captureMapSurfaces, mapLookSurfaceIds, migrateMapSurfaces, presetLayersForEditing, registerMapSurfaces, setSurfaceLooks, tagPresetSurfaces } from './mapSurfaces';
 import {
   captureStagePresetSurfaceState,
   cloneStagePresetSurface,
   resolveStagePresetSurfaceId,
 } from './stagePresetSurfaces';
 import { stage3dScene } from '../stage3d/store';
+import { projectionSimScene } from '../projectionSim/store';
+import { showTimeline, setShowCompositionLoader } from './showTimeline';
+import { serializeShowControl, hydrateShowControl } from '../show/showControlPersistence';
 // Catalog of per-effect default params. Used by resetEffectParams to
 // snap an effect back to its baseline values when the user hits the
 // per-effect reset button in LayerPanel.
 import { getDefaultEffectParams } from '../renderer/effects';
+import { isNativeSelectableEffect } from '../renderer/nativeEffectCoverage';
 import { oscStore } from '../osc/oscStore';
+import { dmxStore } from '../dmx/dmxStore';
 import { keyboardStore } from '../keyboard/keyboardStore';
 import { mediaPipeBus } from '../mediapipe/mediaPipeBus';
 import { geoDeckStore } from './geoDeck';
 import { createDefaultShapeMesh } from '../drawing/types';
 import type { LineElement, LineShape, LinesContent, LineDrawAnimation, LineStroke } from '../lines/types';
 import { maxLayers } from './license';
-import { settings, migrateOutputSlice } from './settings';
+import { NATIVE_ENGINE_ONLY, settings, migrateOutputSlice } from './settings';
+import { withMeshPointTangents } from '../utils/meshWarp';
 import { createLineElement, createDefaultLinesContent, createDefaultDrawAnimation } from '../lines/types';
 import { syncTrimmedVideoPlayback } from '../utils/videoTrimPlayback';
 import { recoverVJClipAssetRef } from '../storage/vjAssetPersistence';
+import { selectionForPrimary } from './layerSelection';
 import { restoreVideoSourceElement } from '../media/videoSourceRestore';
+import { clipAudioBus, type ClipAudioTransport } from '../audio/clipAudioBus';
 
-// History recording callback — set from App.svelte to avoid circular imports.
-// We record SYNCHRONOUSLY (no setTimeout) so each discrete action lands in its
-// own undo step. Previously this used setTimeout(_, 0) which coalesced rapid
-// successive actions — drawing 10 light-painting strokes in quick succession
-// scheduled 10 callbacks that all fired in the next tick reading the SAME
-// post-mutation project, so the undo stack only got 1 entry pointing at the
-// pre-first-stroke state. One undo would wipe every stroke. Now each call
-// captures the project state synchronously, post-update, so undo unwinds
-// stroke-by-stroke as expected.
-let _onDiscreteAction: (() => void) | null = null;
-export function setHistoryCallback(fn: () => void) { _onDiscreteAction = fn; }
-function recordDiscreteAction() { if (_onDiscreteAction) _onDiscreteAction(); }
+// History hooks now live in ./historyHooks so the keyframe store can use them
+// too (layers.ts imports keyframeTimeline, so it cannot import back from here).
+// Re-exported for the many components that already import them from this file.
+import {
+  recordDiscreteAction,
+  scheduleHistorySnapshot,
+} from './historyHooks';
+export {
+  setHistoryCallback,
+  recordDiscreteAction,
+  scheduleHistorySnapshot,
+  flushPendingHistorySnapshot,
+} from './historyHooks';
 const selectedLayerIdsState = writable<string[]>([]);
 
 function cleanMediaSourceName(source: MediaSource): string {
@@ -217,6 +246,29 @@ function placeNewLayer(layers: Layer[], newLayer: Layer, selectedLayerId: string
   }
 }
 
+const NATIVE_READY_LAYER_TYPES = new Set<LayerType>(['media', 'gpu', 'color', 'lines', 'svg', 'lightpainting', 'text', 'splat', 'model3d', 'group', 'screen', 'mask']);
+
+function nativeLayerTypePending(type: LayerType): boolean {
+  return NATIVE_ENGINE_ONLY && Boolean(get(settings).experimental?.outputNativeCore) && !NATIVE_READY_LAYER_TYPES.has(type);
+}
+
+function blockNativePendingLayerType(type: LayerType): boolean {
+  if (!nativeLayerTypePending(type)) return false;
+  console.warn(`[layers] blocked non-native layer type in native-only mode: ${type}`);
+  return true;
+}
+
+function blockNativePendingInitialShape(type: LayerType, initialShapeType?: LayerShapeType): boolean {
+  if (!NATIVE_ENGINE_ONLY || !get(settings).experimental?.outputNativeCore) return false;
+  if (type !== 'media' || !initialShapeType) return false;
+  // The native compositor renders every shape type except line/polyline.
+  if (initialShapeType !== 'line' && initialShapeType !== 'polyline') {
+    return false;
+  }
+  console.warn(`[layers] blocked non-native initial media shape in native-only mode: ${initialShapeType}`);
+  return true;
+}
+
 // Main project store
 function createProjectStore() {
   const { subscribe, set, update } = writable<Project>(createProject('Untitled Project'));
@@ -292,13 +344,14 @@ void main() {
   };
 
   // Auto-apply default shader to a newly created layer (fire-and-forget)
-  const autoApplyDefaultShader = (layerId: string) => {
+  const autoApplyDefaultShader = (layerId: string, requireReference = false) => {
     (async () => {
       try {
         // Get the user's preferred default shader from settings
         const { settings: settingsStore } = await import('./settings');
         const appSettings = get(settingsStore);
-        const shaderChoice = appSettings.defaultLayerShader || 'grid';
+        const preferred = appSettings.defaultLayerShader || 'grid';
+        const shaderChoice = requireReference && preferred === 'none' ? 'grid' : preferred;
 
         // 'none' = blank layer, no shader
         if (shaderChoice === 'none') return;
@@ -366,7 +419,7 @@ void main() {
 
     update(currentProject => ({
       ...currentProject,
-      layers: structuredClone(preset.layers),
+      layers: structuredClone(preset.layers).map(migrateStageLayerCorners),
     }));
     vjClipLauncher.setStagePreset(preset.id);
 
@@ -401,6 +454,8 @@ void main() {
 
     // Layer management
     addLayer(name?: string, type: LayerType = 'media', initialShapeType?: LayerShapeType): string | undefined {
+      if (blockNativePendingLayerType(type)) return undefined;
+      if (blockNativePendingInitialShape(type, initialShapeType)) return undefined;
       const currentProject = get({ subscribe });
       const limit = get(maxLayers);
       if (currentProject.layers.length >= limit) {
@@ -433,13 +488,14 @@ void main() {
       recordDiscreteAction();
 
       // Auto-apply crosshair shader to media layers so the user can see placement
-      if (type === 'media') {
+      if (type === 'media' && !(NATIVE_ENGINE_ONLY && Boolean(get(settings).experimental?.outputNativeCore))) {
         autoApplyDefaultShader(id);
       }
       return id;
     },
 
     addLinesLayer(name?: string) {
+      if (blockNativePendingLayerType('lines')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Lines ${project.layers.filter(l => l.type === 'lines').length + 1}`;
@@ -454,6 +510,7 @@ void main() {
     },
 
     addSVGLayer(name?: string) {
+      if (blockNativePendingLayerType('svg')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `SVG ${project.layers.filter(l => l.type === 'svg').length + 1}`;
@@ -468,6 +525,7 @@ void main() {
     },
 
     addColorLayer(name?: string) {
+      if (blockNativePendingLayerType('color')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Color ${project.layers.filter(l => l.type === 'color').length + 1}`;
@@ -538,19 +596,18 @@ void main() {
             cpIn:  p.cpIn  ? { x: (p.cpIn.x  - minX) / bw, y: 1 - (p.cpIn.y  - minY) / bh } : undefined,
             cpOut: p.cpOut ? { x: (p.cpOut.x - minX) / bw, y: 1 - (p.cpOut.y - minY) / bh } : undefined,
           }));
-          // 3. corners in project-normalized 0..1, SAME Y-down convention
-          //    as the canvas/engine (y=0 top). Previously these were
-          //    Y-flipped ("UV convention") — but the engine renders and
-          //    unified-crops corners as Y-down (verified empirically:
-          //    a quad with corner y .85-.95 displays at the BOTTOM of
-          //    the canvas), so flipped corners made every Apply-Stage
-          //    layout render vertically mirrored. Symmetric layouts hid
-          //    the placement mirror, but unified-group screens sampled
-          //    the mirrored band of the shared texture — the "VJ stage
-          //    bands are reversed vs 3D stage" bug.
+          // 3. corners in project-normalized 0..1, Y-UP (y=1 top) — the
+          //    convention createDefaultCorners, the warp handles and the
+          //    native compositor all use. Surface coords are SVG-style
+          //    Y-down, so the slice's top edge becomes the LARGER y.
+          //    These were written Y-down until 2026-09-11, which placed
+          //    every applied slice in the mirrored half of the canvas and
+          //    drew its content upside down; saved layers carrying
+          //    `stageTextureFlipV: true` are converted on load by
+          //    migrateStageLayerCorners.
           const cMinX = minX / sw, cMaxX = maxX / sw;
-          const cTop  = minY / sh;
-          const cBot  = maxY / sh;
+          const cTop  = 1 - minY / sh;
+          const cBot  = 1 - maxY / sh;
           const corners = {
             topLeft:     { x: cMinX, y: cTop },
             topRight:    { x: cMaxX, y: cTop },
@@ -566,13 +623,14 @@ void main() {
               ...l,
               name: slice.name,
               corners,
-              stageTextureFlipV: true,
+              stageTextureFlipV: false,
               layerShape: {
                 type: 'custom' as const,
                 enabled: true,
                 params: {
                   ...(l.layerShape?.params ?? { feather: 0, rotation: 0 }),
                   customPoints: localPoly,
+                  customBasePoints: localPoly.map((point) => ({ ...point })),
                   customClosed: true,
                 },
               },
@@ -590,7 +648,7 @@ void main() {
             const fresh: Layer = {
               ...createLayer(id, slice.name, 'screen'),
               vjLayerIndex: 0,
-              stageTextureFlipV: true,
+              stageTextureFlipV: false,
             };
             fresh.corners = corners;
             fresh.layerShape = {
@@ -600,6 +658,7 @@ void main() {
                 feather: 0,
                 rotation: 0,
                 customPoints: localPoly,
+                customBasePoints: localPoly.map((point) => ({ ...point })),
                 customClosed: true,
               },
             };
@@ -616,11 +675,12 @@ void main() {
       // (crosshair / grid / whatever the user has configured) instead
       // of being blank until content is dropped in. Matches the
       // addScreenLayer behavior — same code path.
-      for (const id of freshIds) autoApplyDefaultShader(id);
+      for (const id of freshIds) autoApplyDefaultShader(id, true);
       return links;
     },
 
     addLightPaintingLayer(name?: string) {
+      if (blockNativePendingLayerType('lightpainting')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Light Paint ${project.layers.filter(l => l.type === 'lightpainting').length + 1}`;
@@ -641,6 +701,7 @@ void main() {
      *  intentional, so the project file stays portable across the
      *  flag flip. */
     addAdvLightPaintingLayer(name?: string) {
+      if (blockNativePendingLayerType('adv-lightpaint')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Adv Light Paint ${project.layers.filter(l => l.type === 'adv-lightpaint').length + 1}`;
@@ -656,6 +717,7 @@ void main() {
 
     // Text layer methods
     addTextLayer(name?: string) {
+      if (blockNativePendingLayerType('text')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Text ${project.layers.filter(l => l.type === 'text').length + 1}`;
@@ -671,6 +733,7 @@ void main() {
 
     // Splat layer methods (Point Cloud / Gaussian Splat)
     addSplatLayer(name?: string) {
+      if (blockNativePendingLayerType('splat')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Splat ${project.layers.filter(l => l.type === 'splat').length + 1}`;
@@ -788,6 +851,7 @@ void main() {
 
     // 3D Model layer methods
     addModel3DLayer(name?: string) {
+      if (blockNativePendingLayerType('model3d')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `3D Model ${project.layers.filter(l => l.type === 'model3d').length + 1}`;
@@ -810,6 +874,7 @@ void main() {
      *  visible result is the source displaced into 3D space — most
      *  immediately demos the WebGPU magic. */
     addPixelFXLayer(name?: string) {
+      if (blockNativePendingLayerType('pixel-fx')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Pixel FX ${project.layers.filter(l => l.type === 'pixel-fx').length + 1}`;
@@ -830,13 +895,16 @@ void main() {
      *  particle, etc). The selected shader's defaults are populated
      *  by the renderer on first frame so the new layer starts with
      *  a useful look immediately. */
-    addGPULayer(name?: string) {
+    addGPULayer(name?: string, shaderId = 'planet') {
+      if (blockNativePendingLayerType('gpu')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `GPU ${project.layers.filter(l => l.type === 'gpu').length + 1}`;
+        const gpuLayerContent = createDefaultGPULayerContent();
+        gpuLayerContent.shaderId = shaderId;
         const newLayer: Layer = {
           ...createLayer(id, layerName, 'gpu'),
-          gpuLayerContent: createDefaultGPULayerContent(),
+          gpuLayerContent,
         };
         return {
           ...project,
@@ -875,6 +943,7 @@ void main() {
     },
 
     addScreenLayer(name?: string) {
+      if (blockNativePendingLayerType('screen')) return;
       const id = generateUUID();
       update((project) => {
         const layerName = name || `Screen ${project.layers.filter(l => l.type === 'screen').length + 1}`;
@@ -897,6 +966,7 @@ void main() {
     // ── Group layer methods ────────────────────────────────────────────────
 
     addGroupLayer(name?: string) {
+      if (blockNativePendingLayerType('group')) return;
       update((project) => {
         const id = generateUUID();
         const layerName = name || `Group ${project.layers.filter(l => l.type === 'group').length + 1}`;
@@ -1094,11 +1164,55 @@ void main() {
       recordDiscreteAction();
     },
 
+    setLayerVJGroup(id: string, groupId: string) {
+      update(state => ({ ...state, layers: state.layers.map(layer => layer.id === id
+        ? { ...layer, vjGroupId: groupId, vjLayerIndex: undefined } : layer) }));
+      recordDiscreteAction();
+    },
+
     setLayerVJIndex(id: string, vjLayerIndex: number | undefined) {
       update((project) => ({
         ...project,
-        layers: project.layers.map((l) => (l.id === id ? { ...l, vjLayerIndex } : l)),
+        layers: project.layers.map((l) => (l.id === id ? { ...l, vjLayerIndex, vjGroupId: undefined } : l)),
       }));
+      recordDiscreteAction();
+    },
+
+    /**
+     * Shared map geometry for one layer.
+     *   'detach' - this layer (and presets saved from it) keeps its own
+     *              geometry; the shared surface stops following it.
+     *   'use'    - drop the layer's own geometry and take the shared one.
+     *   'share'  - make the layer's geometry the shared one, so every
+     *              preset using the surface moves to it.
+     */
+    setLayerSurfaceSharing(id: string, action: 'detach' | 'use' | 'share') {
+      update((project) => {
+        const layer = project.layers.find((l) => l.id === id);
+        if (!layer) return project;
+        if (action === 'detach') {
+          // Store the geometry the presets were following before letting go.
+          const mapSurfaces = captureMapSurfaces(project.mapSurfaces, project.layers);
+          return {
+            ...project,
+            ...(mapSurfaces ? { mapSurfaces } : {}),
+            layers: project.layers.map((l) => (l.id === id ? { ...l, surfaceDetached: true } : l)),
+          };
+        }
+        const attached: Layer = { ...layer, surfaceDetached: undefined };
+        if (action === 'share') {
+          return {
+            ...project,
+            mapSurfaces: registerMapSurfaces(project.mapSurfaces, [attached]),
+            layers: project.layers.map((l) => (l.id === id ? attached : l)),
+          };
+        }
+        const [shared] = presetLayersForEditing([{ ...attached, surfaceId: id }], project.mapSurfaces);
+        return {
+          ...project,
+          layers: project.layers.map((l) => (l.id === id ? { ...shared, surfaceId: layer.surfaceId } : l)),
+        };
+      });
       recordDiscreteAction();
     },
 
@@ -1165,6 +1279,7 @@ void main() {
             : layer
         ),
       }));
+      scheduleHistorySnapshot();
     },
 
     updateTextAnimation(layerId: string, updates: Partial<TextAnimation>) {
@@ -1182,6 +1297,7 @@ void main() {
             : layer
         ),
       }));
+      scheduleHistorySnapshot();
     },
 
     // Light painting methods
@@ -1209,6 +1325,7 @@ void main() {
             : layer
         ),
       }));
+      scheduleHistorySnapshot();
     },
 
     addLightPaintingStroke(layerId: string, stroke: LightPaintingStroke) {
@@ -1267,6 +1384,7 @@ void main() {
             : layer
         ),
       }));
+      scheduleHistorySnapshot();
     },
 
     // Replace the entire points array of a stroke. Used by path-edit mode
@@ -1305,7 +1423,12 @@ void main() {
             : layer
         ),
       }));
-      recordDiscreteAction();
+      // Debounced, not immediate: this is called on every pointermove tick
+      // while reshaping an existing stroke's handles (Path Edit Mode), so an
+      // unconditional recordDiscreteAction() here would push a full-project
+      // snapshot per pixel of drag and blow through MAX_HISTORY_SIZE almost
+      // instantly.
+      scheduleHistorySnapshot();
     },
 
     clearLightPaintingStrokes(layerId: string) {
@@ -1336,6 +1459,7 @@ void main() {
             : layer
         ),
       }));
+      scheduleHistorySnapshot();
     },
 
     // ============================================================================
@@ -1364,6 +1488,7 @@ void main() {
           };
         }),
       }));
+      recordDiscreteAction();
     },
 
     disableMask(layerId: string) {
@@ -1375,6 +1500,7 @@ void main() {
             : layer
         ),
       }));
+      recordDiscreteAction();
     },
 
     clearMask(layerId: string) {
@@ -1386,6 +1512,7 @@ void main() {
             : layer
         ),
       }));
+      recordDiscreteAction();
     },
 
     /**
@@ -1473,6 +1600,7 @@ void main() {
           return { ...layer, mask: { ...layer.mask, shapes: newShapes } };
         }),
       }));
+      recordDiscreteAction();
     },
 
     /**
@@ -1579,6 +1707,7 @@ void main() {
             : layer
         ),
       }));
+      recordDiscreteAction();
     },
 
     setMaskFeather(layerId: string, feather: number) {
@@ -1590,6 +1719,55 @@ void main() {
             : layer
         ),
       }));
+      scheduleHistorySnapshot();
+    },
+
+    // ============================================================================
+    // PAINTED MASK (brushed erase/restore strokes, see utils/paintMask.ts)
+    // ============================================================================
+    // Every change builds a new paintMask and a new strokes array (never
+    // mutates), so history snapshots and the native sync's identity check
+    // see each stroke. One stroke = one recordDiscreteAction = one undo step.
+
+    _updatePaintMask(layerId: string, fn: (mask: PaintMaskConfig) => PaintMaskConfig | null): boolean {
+      let changed = false;
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((layer) => {
+          if (layer.id !== layerId || layer.locked) return layer;
+          const next = fn(layer.paintMask ?? createPaintMask());
+          if (next === layer.paintMask) return layer;
+          changed = true;
+          return { ...layer, paintMask: next };
+        }),
+      }));
+      return changed;
+    },
+
+    /** Commit one finished brush stroke (the end of a drag). */
+    addPaintMaskStroke(layerId: string, stroke: PaintMaskStroke) {
+      const changed = this._updatePaintMask(layerId, (mask) =>
+        mask.strokes.length >= PAINT_MASK_MAX_STROKES || mask.strokes.some((s) => s.id === stroke.id)
+          ? mask
+          : { ...mask, strokes: [...mask.strokes, { ...stroke }] });
+      if (changed) recordDiscreteAction();
+    },
+
+    clearPaintMask(layerId: string) {
+      const changed = this._updatePaintMask(layerId, (mask) =>
+        mask.strokes.length === 0 ? mask : { ...mask, strokes: [] });
+      if (changed) recordDiscreteAction();
+    },
+
+    setPaintMaskVisible(layerId: string, enabled: boolean) {
+      const changed = this._updatePaintMask(layerId, (mask) =>
+        mask.enabled === enabled ? mask : { ...mask, enabled });
+      if (changed) recordDiscreteAction();
+    },
+
+    togglePaintMaskInvert(layerId: string) {
+      const changed = this._updatePaintMask(layerId, (mask) => ({ ...mask, inverted: !mask.inverted }));
+      if (changed) recordDiscreteAction();
     },
 
     // ============================================================================
@@ -1611,6 +1789,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     updateCustomShapePoint(layerId: string, pointIndex: number, point: Point2D) {
@@ -1631,6 +1810,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     removeCustomShapePoint(layerId: string, pointIndex: number) {
@@ -1666,7 +1846,13 @@ void main() {
             ...layer,
             layerShape: {
               ...layer.layerShape,
-              params: { ...layer.layerShape.params, customClosed: true },
+              params: {
+                ...layer.layerShape.params,
+                customClosed: true,
+                // Snapshot the outline as drawn: later vertex drags warp the
+                // content against this base (content-follow).
+                customBasePoints: pts.map((point) => ({ ...point })),
+              },
             },
           };
         }),
@@ -1711,6 +1897,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     toggleCustomShapePointCurve(layerId: string, pointIndex: number) {
@@ -1846,6 +2033,146 @@ void main() {
       }));
     },
 
+    /** Dress every layer in `layerIds` with a one-click Look, as one undo
+     *  step. The Look replaces the whole stack, so re-picking (or picking
+     *  another palette) swaps rather than piles on. Each layer gets its own
+     *  effects with fresh ids. Returns how many layers changed. */
+    applyLook(layerIds: readonly string[], lookId: string, paletteId?: string): number {
+      const look = edgeLook(lookId);
+      const targets = new Set(layerIds);
+      if (!look || !targets.size) return 0;
+      const palette = lookPalette(paletteId ?? look.palette).id;
+      let changed = 0;
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((layer) => {
+          if (!targets.has(layer.id)) return layer;
+          changed += 1;
+          const config: EdgeEffectsConfig = { enabled: true, effects: buildLookEffects(look, palette), look: { id: look.id, paletteId: palette } };
+          if (look.cornerRadius) config.cornerRadius = look.cornerRadius;
+          return { ...layer, edgeEffects: config };
+        }),
+      }));
+      if (changed) recordDiscreteAction();
+      return changed;
+    },
+
+    /** Take a Look off: layers in `layerIds` whose stack came from a Look
+     *  lose it (hand-built stacks are left alone). One undo step. */
+    clearLook(layerIds: readonly string[]): number {
+      const targets = new Set(layerIds);
+      let changed = 0;
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((layer) => {
+          if (!targets.has(layer.id) || !layer.edgeEffects?.look) return layer;
+          changed += 1;
+          return { ...layer, edgeEffects: null };
+        }),
+      }));
+      if (changed) recordDiscreteAction();
+      return changed;
+    },
+
+    /** VJ MAP: dress the map's surfaces (all of them, or `surfaceIds`) with
+     *  a Look, as one undo step. The Look lives on the surface, so every
+     *  preset fired on it wears it (see MapSurface.lookEffects). Returns how
+     *  many surfaces changed. */
+    applySurfaceLook(lookId: string, paletteId?: string, surfaceIds?: readonly string[]): number {
+      const look = edgeLook(lookId);
+      if (!look) return 0;
+      const palette = lookPalette(paletteId ?? look.palette).id;
+      let changed = 0;
+      update((project) => {
+        const ids = surfaceIds ?? mapLookSurfaceIds(project);
+        const mapSurfaces = setSurfaceLooks(project.mapSurfaces, ids, () => {
+          changed += 1;
+          const config: EdgeEffectsConfig = { enabled: true, effects: buildLookEffects(look, palette), look: { id: look.id, paletteId: palette } };
+          if (look.cornerRadius) config.cornerRadius = look.cornerRadius;
+          return config;
+        });
+        return mapSurfaces === project.mapSurfaces ? project : { ...project, mapSurfaces };
+      });
+      if (changed) recordDiscreteAction();
+      return changed;
+    },
+
+    /** VJ MAP: take the Look off the map's surfaces (all, or `surfaceIds`),
+     *  so every preset shows its own Edge Effects again. One undo step.
+     *  Returns how many surfaces lost a Look. */
+    clearSurfaceLooks(surfaceIds?: readonly string[]): number {
+      let changed = 0;
+      update((project) => {
+        const ids = surfaceIds ?? (project.mapSurfaces ?? []).map((surface) => surface.id);
+        const mapSurfaces = setSurfaceLooks(project.mapSurfaces, ids, (surface) => {
+          if (surface.lookEffects) changed += 1;
+          return null;
+        });
+        return mapSurfaces === project.mapSurfaces ? project : { ...project, mapSurfaces };
+      });
+      if (changed) recordDiscreteAction();
+      return changed;
+    },
+
+    /** Give every layer in `layerIds` an edge effect stack in one undo
+     *  step: `replace` swaps the stack, `append` adds after it. Each layer
+     *  gets its own copy with fresh effect ids. */
+    applyEdgeEffects(
+      layerIds: readonly string[],
+      effects: readonly EdgeEffect[],
+      mode: 'replace' | 'append' = 'replace',
+      cornerRadius?: number,
+    ) {
+      const targets = new Set(layerIds);
+      if (!targets.size || !effects.length) return;
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((layer) => {
+          if (!targets.has(layer.id)) return layer;
+          const copies = instantiateEdgeEffects(effects);
+          const existing = mode === 'append' ? (layer.edgeEffects?.effects ?? []) : [];
+          const radius = cornerRadius !== undefined ? cornerRadius : mode === 'append' ? layer.edgeEffects?.cornerRadius : undefined;
+          const config: EdgeEffectsConfig = { enabled: true, effects: [...existing, ...copies] };
+          if (radius && radius > 0) config.cornerRadius = radius;
+          return { ...layer, edgeEffects: config };
+        }),
+      }));
+      recordDiscreteAction();
+    },
+
+    /** Move an edge effect up (-1) or down (+1) its layer's stack. */
+    moveEdgeEffect(layerId: string, effectId: string, delta: number) {
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((layer) => {
+          if (layer.id !== layerId || !layer.edgeEffects) return layer;
+          const effects = [...layer.edgeEffects.effects];
+          const from = effects.findIndex((e) => e.id === effectId);
+          const to = from + delta;
+          if (from < 0 || to < 0 || to >= effects.length) return layer;
+          const [moved] = effects.splice(from, 1);
+          effects.splice(to, 0, moved);
+          return { ...layer, edgeEffects: { ...layer.edgeEffects, effects } };
+        }),
+      }));
+      recordDiscreteAction();
+    },
+
+    /** Round every corner of the outline the layer's edge effects trace. */
+    setEdgeEffectsCornerRadius(layerId: string, radius: number) {
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((layer) => {
+          if (layer.id !== layerId || !layer.edgeEffects) return layer;
+          const next: EdgeEffectsConfig = { ...layer.edgeEffects };
+          if (radius > 0) next.cornerRadius = radius;
+          else delete next.cornerRadius;
+          return { ...layer, edgeEffects: next };
+        }),
+      }));
+      scheduleHistorySnapshot();
+    },
+
     toggleEdgeEffectsEnabled(layerId: string) {
       update((project) => ({
         ...project,
@@ -1857,6 +2184,7 @@ void main() {
           };
         }),
       }));
+      recordDiscreteAction();
     },
 
     // ============================================================================
@@ -1870,6 +2198,7 @@ void main() {
           layer.id === layerId ? { ...layer, cropRegion } : layer
         ),
       }));
+      scheduleHistorySnapshot();
     },
 
     updateCropRegion(layerId: string, updates: Partial<CropRegion>) {
@@ -1892,6 +2221,7 @@ void main() {
           layer.id === layerId ? { ...layer, cropRegion: null } : layer
         ),
       }));
+      recordDiscreteAction();
     },
 
     // ============================================================================
@@ -1946,6 +2276,7 @@ void main() {
             : layer
         ),
       }));
+      scheduleHistorySnapshot();
     },
 
     toggleLayerShapeEnabled(layerId: string) {
@@ -1957,6 +2288,7 @@ void main() {
             : layer
         ),
       }));
+      recordDiscreteAction();
     },
 
     clearLayerShape(layerId: string) {
@@ -1966,6 +2298,7 @@ void main() {
           layer.id === layerId ? { ...layer, layerShape: null } : layer
         ),
       }));
+      recordDiscreteAction();
     },
 
     // Add/update polyline points for line shapes
@@ -2052,8 +2385,11 @@ void main() {
               ? [nextSelectedLayerId]
               : []
         );
+        // A deleted surface keeps the last geometry it had in the editor.
+        const mapSurfaces = captureMapSurfaces(project.mapSurfaces, project.layers);
         return {
           ...project,
+          ...(mapSurfaces ? { mapSurfaces } : {}),
           layers: newLayers,
           selectedLayerId: nextSelectedLayerId,
         };
@@ -2229,6 +2565,12 @@ void main() {
         ...project,
         layers: project.layers.map((l) => (l.id === id ? { ...l, ...updates } : l)),
       }));
+      // Safe to debounce here (unlike updateEffectParams/updateEdgeEffect/
+      // updateGPULayerParams/updateSplatContent): confirmed no caller in
+      // src/lib/audio/autoEngine.ts or src/lib/audio/modulation.ts, so this
+      // won't fight the audio-reactive modulation engine. A no-op update
+      // (identical project state) is naturally deduped by history.record().
+      scheduleHistorySnapshot();
     },
 
     setLayerSource(id: string, source: MediaSource | null) {
@@ -2308,6 +2650,7 @@ void main() {
         ...project,
         layers: project.layers.map((l) => (l.id === id ? { ...l, opacity } : l)),
       }));
+      scheduleHistorySnapshot();
     },
 
     setLayerBlendMode(id: string, blendMode: BlendMode) {
@@ -2326,7 +2669,8 @@ void main() {
       recordDiscreteAction();
     },
 
-    setRenderQuality(id: string, renderQuality: number) {
+    /** undefined clears the override so the layer follows the global tier. */
+    setRenderQuality(id: string, renderQuality: number | undefined) {
       update((project) => ({
         ...project,
         layers: project.layers.map((l) => (l.id === id ? { ...l, renderQuality } : l)),
@@ -2400,6 +2744,7 @@ void main() {
         ...project,
         layers: project.layers.map((l) => (l.id === id ? { ...l, flipH: !l.flipH } : l)),
       }));
+      recordDiscreteAction();
     },
 
     toggleLayerFlipV(id: string) {
@@ -2407,6 +2752,7 @@ void main() {
         ...project,
         layers: project.layers.map((l) => (l.id === id ? { ...l, flipV: !l.flipV } : l)),
       }));
+      recordDiscreteAction();
     },
 
     // Warp mode
@@ -2442,7 +2788,9 @@ void main() {
         ...project,
         layers: project.layers.map((l) => {
           if (l.id !== id) return l;
-          return { ...l, meshGrid: createMeshGrid(rows, cols) };
+          // A new grid starts straight, but stays in Bezier mode if it was.
+          const bezier = l.meshGrid?.bezier ? { bezier: true } : {};
+          return { ...l, meshGrid: { ...createMeshGrid(rows, cols), ...bezier } };
         }),
       }));
       recordDiscreteAction();
@@ -2453,10 +2801,38 @@ void main() {
         ...project,
         layers: project.layers.map((l) => {
           if (l.id !== id || !l.meshGrid) return l;
-          return { ...l, meshGrid: createMeshGrid(l.meshGrid.rows, l.meshGrid.cols) };
+          const bezier = l.meshGrid.bezier ? { bezier: true } : {};
+          return { ...l, meshGrid: { ...createMeshGrid(l.meshGrid.rows, l.meshGrid.cols), ...bezier } };
         }),
       }));
       recordDiscreteAction();
+    },
+
+    // Bezier mesh: curved cell edges shaped by per-point tangent handles.
+    // Turning it off keeps the tangents on the grid but renders straight.
+    setMeshBezier(id: string, bezier: boolean) {
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((l) => {
+          if (l.id !== id || !l.meshGrid) return l;
+          return { ...l, meshGrid: { ...l.meshGrid, bezier } };
+        }),
+      }));
+      recordDiscreteAction();
+    },
+
+    /** Store one point's tangent handles. `null` clears them all, which
+     *  straightens every edge at that point. Sides left out of `tangents`
+     *  are removed, so the caller decides what stays linked. */
+    setMeshPointTangents(id: string, row: number, col: number, tangents: MeshPointTangents | null) {
+      update((project) => ({
+        ...project,
+        layers: project.layers.map((l) => {
+          if (l.id !== id || !l.meshGrid) return l;
+          const meshGrid = withMeshPointTangents(l.meshGrid, row, col, tangents);
+          return meshGrid === l.meshGrid ? l : { ...l, meshGrid };
+        }),
+      }));
     },
 
     // Shape control point manipulation
@@ -2513,8 +2889,22 @@ void main() {
       recordDiscreteAction();
     },
 
+    setEffectChain(layerId: string | null, effects: Effect[]) {
+      if (NATIVE_ENGINE_ONLY && effects.some(effect => !isNativeSelectableEffect(effect.type))) return;
+      const chain = JSON.parse(JSON.stringify(effects)) as Effect[];
+      update(p => layerId === null ? {
+        ...p,
+        mappingComposition: { ...normalizeMappingCompositionState(p.mappingComposition), enabled: true, effects: chain },
+      } : { ...p, layers: p.layers.map(layer => layer.id === layerId ? { ...layer, effects: chain } : layer) });
+      recordDiscreteAction();
+    },
+
     // Effect management
     addEffect(layerId: string, effectType: EffectType, params?: EffectParams) {
+      if (NATIVE_ENGINE_ONLY && !isNativeSelectableEffect(effectType)) {
+        console.warn(`[layers] blocked non-native effect in native-only mode: ${effectType}`);
+        return;
+      }
       update((project) => ({
         ...project,
         layers: project.layers.map((l) => {
@@ -2532,6 +2922,10 @@ void main() {
     },
 
     addEffectInstance(layerId: string, effect: Effect) {
+      if (NATIVE_ENGINE_ONLY && !isNativeSelectableEffect(effect.type)) {
+        console.warn(`[layers] blocked non-native effect instance in native-only mode: ${effect.type}`);
+        return;
+      }
       update((project) => ({
         ...project,
         layers: project.layers.map((l) => {
@@ -2565,6 +2959,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     updateEffectParams(layerId: string, effectId: string, params: Partial<EffectParams>) {
@@ -2773,6 +3168,10 @@ void main() {
     },
 
     addMappingCompositionEffect(effectType: EffectType, params?: EffectParams) {
+      if (NATIVE_ENGINE_ONLY && !isNativeSelectableEffect(effectType)) {
+        console.warn(`[layers] blocked non-native mapping composition effect in native-only mode: ${effectType}`);
+        return;
+      }
       update((p) => {
         const mappingComposition = normalizeMappingCompositionState(p.mappingComposition);
         const effect: Effect = {
@@ -2837,6 +3236,21 @@ void main() {
           },
         };
       });
+    },
+
+    setMappingCompositionEffectParamAuto(effectId: string, paramName: string, auto: AutoConfig | null) {
+      update(p => {
+        const composition = normalizeMappingCompositionState(p.mappingComposition);
+        return { ...p, mappingComposition: { ...composition, effects: composition.effects.map(effect => {
+          if (effect.id !== effectId) return effect;
+          const paramAuto = { ...effect.paramAuto };
+          if (auto === null) delete paramAuto[paramName];
+          else paramAuto[paramName] = { ...auto };
+          const { paramAuto: _old, ...rest } = effect;
+          return Object.keys(paramAuto).length ? { ...rest, paramAuto } : rest;
+        }) } };
+      });
+      recordDiscreteAction();
     },
 
     updateMappingCompositionEffectParams(effectId: string, params: Partial<EffectParams>) {
@@ -3024,7 +3438,7 @@ void main() {
       update((project) => ({
         ...project,
         layers: project.layers.map((l) =>
-          l.id === layerId ? { ...l, vjLayerIndex } : l
+          l.id === layerId ? { ...l, vjLayerIndex, vjGroupId: undefined } : l
         ),
       }));
     },
@@ -3156,6 +3570,53 @@ void main() {
           c.id === controllerId ? { ...c, ...fields, id: controllerId } : c
         ),
       }));
+      scheduleHistorySnapshot();
+    },
+    // ========== Art-Net / sACN pixel mapping ==========
+    updatePixelMap(fields: Partial<PixelMapConfig>) {
+      update((project) => ({
+        ...project,
+        pixelMap: {
+          ...(project.pixelMap ?? createDefaultPixelMapConfig()),
+          ...fields,
+        },
+      }));
+      scheduleHistorySnapshot();
+    },
+    addPixelMapFixture(fixture: PixelMapFixture) {
+      update((project) => {
+        const pixelMap = project.pixelMap ?? createDefaultPixelMapConfig();
+        return { ...project, pixelMap: { ...pixelMap, fixtures: [...pixelMap.fixtures, fixture] } };
+      });
+      scheduleHistorySnapshot();
+    },
+    updatePixelMapFixture(fixtureId: string, fields: Partial<PixelMapFixture>) {
+      update((project) => {
+        if (!project.pixelMap) return project;
+        return {
+          ...project,
+          pixelMap: {
+            ...project.pixelMap,
+            fixtures: project.pixelMap.fixtures.map(fixture =>
+              fixture.id === fixtureId ? { ...fixture, ...fields, id: fixtureId } : fixture
+            ),
+          },
+        };
+      });
+      scheduleHistorySnapshot();
+    },
+    removePixelMapFixture(fixtureId: string) {
+      update((project) => {
+        if (!project.pixelMap) return project;
+        return {
+          ...project,
+          pixelMap: {
+            ...project.pixelMap,
+            fixtures: project.pixelMap.fixtures.filter(fixture => fixture.id !== fixtureId),
+          },
+        };
+      });
+      scheduleHistorySnapshot();
     },
     addWLEDGroup(group: WLEDGroup) {
       update((project) => ({
@@ -3315,6 +3776,7 @@ void main() {
           };
         }),
       }));
+      recordDiscreteAction();
     },
 
     reorderEffects(layerId: string, fromIndex: number, toIndex: number) {
@@ -3328,6 +3790,7 @@ void main() {
           return { ...l, effects: newEffects };
         }),
       }));
+      recordDiscreteAction();
     },
 
     // ============================================================================
@@ -3389,6 +3852,7 @@ void main() {
           };
         }),
       }));
+      recordDiscreteAction();
     },
 
     selectElement(layerId: string, elementId: string | null) {
@@ -3423,6 +3887,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     updateElementShape(layerId: string, elementId: string, shapeUpdates: Partial<LineShape> & Record<string, any>) {
@@ -3451,6 +3916,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     updateElementStroke(layerId: string, elementId: string, stroke: LineStroke | any) {
@@ -3469,6 +3935,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     // Compatibility aliases for DrawingPanel (maps old drawing API to lines API)
@@ -3508,6 +3975,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     duplicateElement(layerId: string, elementId: string) {
@@ -3662,6 +4130,7 @@ void main() {
           };
         }),
       }));
+      recordDiscreteAction();
     },
 
     updateSVGContent(layerId: string, updates: Partial<SVGContent>) {
@@ -3675,6 +4144,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     setSVGFillMode(layerId: string, fillMode: SVGFillMode) {
@@ -3716,6 +4186,7 @@ void main() {
           };
         }),
       }));
+      recordDiscreteAction();
     },
 
     setSVGParam(layerId: string, paramKey: keyof SVGContent, value: number | boolean | string) {
@@ -3729,6 +4200,7 @@ void main() {
           };
         }),
       }));
+      scheduleHistorySnapshot();
     },
 
     resetSVGContent(layerId: string) {
@@ -3743,6 +4215,7 @@ void main() {
           };
         }),
       }));
+      recordDiscreteAction();
     },
 
     // ============================================================================
@@ -3827,12 +4300,15 @@ void main() {
         wasPlaying: !!kfState.config.isPlaying,
       };
 
+      // Each layer references its shared map surface instead of owning the
+      // geometry; the snapshot keeps a copy only as a fallback.
+      const presetLayers = tagPresetSurfaces(layersSnapshot);
       const composition: Composition = {
         id: compositionId,
         name,
         thumbnail,
         createdAt: Date.now(),
-        layers: layersSnapshot,
+        layers: presetLayers,
         synthVision: synthVisionSnapshot,
         sequencer: sequencerSnap,
         keyframes: keyframesSnap,
@@ -3846,12 +4322,18 @@ void main() {
         console.log('[Store] Updating vjMode, compositions count:', newCompositions.length);
         return {
           ...project,
+          mapSurfaces: registerMapSurfaces(captureMapSurfaces(project.mapSurfaces, project.layers), presetLayers),
           vjMode: {
             ...vjMode,
             compositions: newCompositions,
           },
         };
       });
+      // Presets are part of the undo history's project snapshots. Without
+      // their own step, undoing the next edit (a VJ MAP Look, a layer
+      // change) restored the snapshot from before the save and took the
+      // preset with it.
+      recordDiscreteAction();
 
       return compositionId;
     },
@@ -3901,13 +4383,14 @@ void main() {
         wasPlaying: !!kfState.config.isPlaying,
       };
 
+      const presetLayers = tagPresetSurfaces(layersSnapshot);
       const updated: Composition = {
         ...existing,
         name: opts?.name ?? existing.name,
         thumbnail: opts?.thumbnail ?? existing.thumbnail,
         // createdAt intentionally preserved — that's the original creation
         // timestamp, not "last updated".
-        layers: layersSnapshot,
+        layers: presetLayers,
         synthVision: synthVisionSnapshot,
         sequencer: sequencerSnap,
         keyframes: keyframesSnap,
@@ -3917,6 +4400,7 @@ void main() {
         if (!project.vjMode) return project;
         return {
           ...project,
+          mapSurfaces: registerMapSurfaces(captureMapSurfaces(project.mapSurfaces, project.layers), presetLayers),
           vjMode: {
             ...project.vjMode,
             compositions: project.vjMode.compositions.map(c =>
@@ -3926,6 +4410,7 @@ void main() {
         };
       });
       console.log('[Store] updateComposition: overwrote', compositionId, updated.name);
+      recordDiscreteAction();
       return true;
     },
 
@@ -3954,6 +4439,7 @@ void main() {
           },
         };
       });
+      recordDiscreteAction();
     },
 
     /**
@@ -3972,6 +4458,7 @@ void main() {
           },
         };
       });
+      recordDiscreteAction();
     },
 
     reorderComposition(fromIndex: number, toIndex: number) {
@@ -3992,6 +4479,7 @@ void main() {
           },
         };
       });
+      recordDiscreteAction();
     },
 
     /**
@@ -4014,8 +4502,24 @@ void main() {
 
     /**
      * Load a composition into the main layers (for editing/preview)
+     *
+     * `options.restoreTransports` (default TRUE — today's behaviour for every
+     * existing caller) controls the deferred sub-transport restart below.
+     * Set it FALSE when something else owns the clock: an offline export
+     * seeks keyframeTimeline / layerSequencer itself once per frame, and the
+     * `queueMicrotask` here lands a microtask later and would re-zero both
+     * out from under the render loop. The show timeline passes false while
+     * a render owns the clock. See stores/showTimeline.ts.
      */
-    loadComposition(compositionId: string) {
+    /**
+     * Swap the editor to a saved preset. A user firing a preset is one undo
+     * step (like saving or editing one, see saveComposition); automated
+     * recalls (show timeline, scheduler cues, VJ clip triggers) pass
+     * `recordHistory: false` so playback does not flood the undo stack.
+     */
+    loadComposition(compositionId: string, options?: { restoreTransports?: boolean; recordHistory?: boolean }) {
+      const restoreTransports = options?.restoreTransports !== false;
+      const recordHistory = options?.recordHistory !== false;
       // First get the composition to access Performer data
       const currentProject = get({ subscribe });
       if (!currentProject.vjMode) return;
@@ -4031,8 +4535,12 @@ void main() {
       update((project) => {
         if (!project.vjMode) return project;
 
-        // Deep clone the composition's layers
-        const loadedLayers = structuredClone(composition.layers);
+        // Keep the geometry the editor holds right now before its layers
+        // are replaced; it is the shared map for every surface it shows.
+        const mapSurfaces = captureMapSurfaces(project.mapSurfaces, project.layers);
+        // Deep clone the composition's layers; shared surfaces take the
+        // current shared geometry rather than the copy saved with the preset.
+        const loadedLayers = presetLayersForEditing(structuredClone(composition.layers), mapSurfaces);
         loadedLayers.forEach((layer) => {
           if (isVideoSource(layer.source)) {
             rehydrateVideoSource(layer.source);
@@ -4041,6 +4549,7 @@ void main() {
 
         return {
           ...project,
+          ...(mapSurfaces ? { mapSurfaces } : {}),
           layers: loadedLayers,
           vjMode: {
             ...project.vjMode,
@@ -4059,7 +4568,7 @@ void main() {
         queueMicrotask(() => {
           if (seqSnap?.snapshot) {
             layerSequencer.hydrate(seqSnap.snapshot);
-            if (seqSnap.wasPlaying) {
+            if (seqSnap.wasPlaying && restoreTransports) {
               // stop() resets currentStep=0 and clears overrides; play()
               // kicks the RAF loop. Reset-then-play matches the user's
               // "predictable, always starts clean" choice.
@@ -4069,7 +4578,7 @@ void main() {
           }
           if (kfSnap?.snapshot) {
             keyframeTimeline.importAll(kfSnap.snapshot);
-            if (kfSnap.wasPlaying) {
+            if (kfSnap.wasPlaying && restoreTransports) {
               // seek(0) rewinds the playhead and re-evaluates overrides
               // WITHOUT wiping the timelines we just imported. Earlier
               // this called reset(), which calls set(createInitialState())
@@ -4079,7 +4588,12 @@ void main() {
               keyframeTimeline.play();
             }
           }
+          // The history snapshot carries the keyframe timelines too, so the
+          // step is recorded once they are in.
+          if (recordHistory) recordDiscreteAction();
         });
+      } else if (recordHistory) {
+        recordDiscreteAction();
       }
     },
 
@@ -4410,11 +4924,15 @@ void main() {
         warpMode: layer.warpMode,
         meshGrid: layer.meshGrid,
         mask: layer.mask,
+        paintMask: layer.paintMask ?? null,
         cropRegion: layer.cropRegion,
         layerShape: layer.layerShape,
         effects: layer.effects,
         edgeEffects: layer.edgeEffects,
         vjLayerIndex: layer.vjLayerIndex,
+        vjGroupId: layer.vjGroupId,
+        surfaceId: layer.surfaceId,
+        surfaceDetached: layer.surfaceDetached,
         contentFit: layer.contentFit,
         renderQuality: layer.renderQuality,
         parentGroupId: layer.parentGroupId,
@@ -4442,8 +4960,16 @@ void main() {
           aiPrompt: layer.source.aiPrompt,
           playbackMode: layer.source.playbackMode,
           playbackRate: layer.source.playbackRate,
+          durationSeconds: layer.source.durationSeconds,
+          videoWidth: layer.source.videoWidth,
+          videoHeight: layer.source.videoHeight,
           trimStart: (layer.source as any).trimStart,
           trimEnd: (layer.source as any).trimEnd,
+          // Opt-in audio playback for mapping-mode media layers. Absent on
+          // every project saved before this feature; imports back as false.
+          audioPlayback: (layer.source as any).audioPlayback,
+          audioVolume: (layer.source as any).audioVolume,
+          audioMuted: (layer.source as any).audioMuted,
           timelapseInterval: layer.source.timelapseInterval,
           timelapseRunning: layer.source.timelapseRunning,
           _assetRef: (layer.source as any)._assetRef,
@@ -4518,6 +5044,22 @@ void main() {
       if ((layer as any).gpuLayerContent) {
         const gp: any = { ...(layer as any).gpuLayerContent };
         exportLayer.gpuLayerContent = gp;
+      }
+
+      // _importLayer restores this, so not exporting it meant an arcade layer
+      // came back empty from its own save file.
+      if ((layer as any).arcadeContent) {
+        exportLayer.arcadeContent = (layer as any).arcadeContent;
+      }
+
+      /*
+       * Stage Designer's texture-orientation marker. Dropping it left reload
+       * relying on stageTextureNeedsVerticalFlip's corner-geometry fallback --
+       * which was written for pre-flag saves, and infers the wrong answer once
+       * the user flips or re-corners a mapped surface.
+       */
+      if (typeof (layer as any).stageTextureFlipV === 'boolean') {
+        exportLayer.stageTextureFlipV = (layer as any).stageTextureFlipV;
       }
 
       return exportLayer;
@@ -4627,6 +5169,8 @@ void main() {
       // the library entries restore to the same disk file on reload — without
       // it the saved src is just a dead blob: URL.
       const exportMedia = currentMedia.map(item => ({
+        durationSeconds: item.durationSeconds,
+        videoWidth: item.videoWidth, videoHeight: item.videoHeight,
         id: item.id,
         name: item.name,
         src: item.src,
@@ -4660,10 +5204,22 @@ void main() {
           shaderCode: clip.shaderCode,
           shaderValues: clip.shaderValues,
           playbackMode: clip.playbackMode,
+          transitionDuration: clip.transitionDuration,
+          transitionStyle: clip.transitionStyle,
+          triggerStyle: clip.triggerStyle,
+          faderStart: clip.faderStart,
+          ignoreColumnTrigger: clip.ignoreColumnTrigger,
+          autopilot: normalizeAutopilot(clip.autopilot),
+          cuePoints: normalizeCuePoints(clip.cuePoints),
           playbackRate: clip.playbackRate,
           trimStart: clip.trimStart,
           trimEnd: clip.trimEnd,
           isPlaying: clip.isPlaying,
+          // Preserve explicit clip audio choices; absent means native audio enabled.
+          audioPlayback: clip.audioPlayback,
+          audioVolume: clip.audioVolume,
+          audioPan: clip.audioPan,
+          audioMuted: clip.audioMuted,
           zoom: clip.zoom,
           fit: clip.fit,
           anchorX: clip.anchorX,
@@ -4671,6 +5227,7 @@ void main() {
           rotation: clip.rotation,
           opacity: clip.opacity,
           spoutSource: clip.spoutSource,
+          ndiSource: (clip as any).ndiSource,
           effectSource: clip.effectSource,
           jsAnimation: clip.jsAnimation,
           effects: clip.effects || [],
@@ -4679,6 +5236,18 @@ void main() {
           // contents survives save/reload.
           splatContent: (clip as any).splatContent,
           model3dContent: (clip as any).model3dContent || (clip as any).model3DContent,
+          // GPU shader and live-text clips keep ALL of their state in these
+          // content objects — a `gpu` clip that loses gpuLayerContent reopens
+          // as an empty cell, not merely an unresolved asset.
+          gpuLayerContent: (clip as any).gpuLayerContent,
+          textContent: (clip as any).textContent,
+          // Preset clips fire a saved composition by id.
+          presetId: (clip as any).presetId,
+          shaderValueAuto: (clip as any).shaderValueAuto,
+          mirrorX: (clip as any).mirrorX,
+          playbackSyncBeats: (clip as any).playbackSyncBeats,
+          durationSeconds: (clip as any).durationSeconds,
+          videoWidth: (clip as any).videoWidth, videoHeight: (clip as any).videoHeight,
           _assetRef: recoveredAssetRef,
           // Exclude runtime objects: videoElement / iframeElement / synthVisionCanvas
         };
@@ -4686,6 +5255,15 @@ void main() {
 
       // Common per-layer-state serializer (used for both Bank A and Bank B)
       const exportLayerState = (ls: any) => ({
+        faderStart: ls.faderStart === true,
+            audioVolume: Number.isFinite(ls.audioVolume) ? Math.max(0, Math.min(1, ls.audioVolume)) : 1,
+            audioPan: Number.isFinite(ls.audioPan) ? Math.max(-1, Math.min(1, ls.audioPan)) : 0,
+            autopilot: normalizeAutopilot(ls.autopilot),
+            autopilotPaused: ls.autopilotPaused === true,
+        ignoreColumnTrigger: ls.ignoreColumnTrigger === true,
+        locked: ls.locked === true,
+        transitionDuration: normalizedTransitionDuration(ls.transitionDuration),
+        transitionStyle: normalizedTransitionStyle(ls.transitionStyle),
         opacity: ls.opacity,
         blendMode: ls.blendMode,
         solo: ls.solo,
@@ -4731,6 +5309,7 @@ void main() {
         isOpen: currentVjClipLauncher.isOpen,
         isLive: false, // Don't persist live state
         compositionEffects: currentVjClipLauncher.compositionEffects || [],
+        groups: currentVjClipLauncher.groups ?? [],
         stageMode: false, // Don't persist stage mode active state
         stagePresetId: currentVjClipLauncher.stagePresetId,
       };
@@ -4766,6 +5345,11 @@ void main() {
 
       // Deep clone and strip out non-serializable data
       const exportData = {
+        // 1.9.5 = added project.showTimeline (mapping-mode show arrangement:
+        //         audio tracks riding AssetRefs + preset clip lane). Save-only
+        //         section, added by exportProjectJSON / exportProjectForSave —
+        //         NOT by this sync export, same as stage3d / projectionSim.
+        // 1.9.4 = project.projectionSim (Map Sim scene).
         // 1.9.3 = added layerSequencer (step sequencer pattern + config)
         //         and geoDeck (geo performer scenes + mod routes) at the
         //         project root. Older saves skip these on import and the
@@ -4777,7 +5361,7 @@ void main() {
         //         outside this vjClipLauncher payload but versioned together).
         // 1.8.0 = moved bankBClipGrid INSIDE each VJBlock.
         // 1.7.0 = added Bank B deck + crossfader state at launcher root.
-        version: '1.9.3',
+        version: '1.9.5',
         exportedAt: new Date().toISOString(),
         project: {
           id: currentProject.id,
@@ -4790,12 +5374,23 @@ void main() {
           vjMode: exportVjMode,
           mediaFolders: normalizeMediaTrayFolders(currentProject.mediaFolders),
           stagePresets: currentProject.stagePresets || [],
+          // Shared map geometry for preset surfaces, refreshed from the
+          // editor so a warp edited since the last preset save is kept.
+          mapSurfaces: captureMapSurfaces(currentProject.mapSurfaces, currentProject.layers) ?? [],
           svKeyboardPresets: currentProject.svKeyboardPresets || [],
           // Stage Designer surfaces — projection geometry layouts +
           // their slice→layer bindings. Persisted as plain JSON; no
           // runtime refs to strip.
           surfaces: currentProject.surfaces || [],
           activeSurfaceId: currentProject.activeSurfaceId ?? null,
+          // Art-Net / sACN fixtures and output settings.
+          ...(currentProject.pixelMap ? { pixelMap: currentProject.pixelMap } : {}),
+          // WLED controllers, their groups and LED effects belong to the
+          // project (the WLED guide says so); plain JSON, no runtime refs.
+          wledControllers: currentProject.wledControllers || [],
+          wledGroups: currentProject.wledGroups || [],
+          wledEffects: currentProject.wledEffects || [],
+          ...(currentProject.wledEffectAutomation ? { wledEffectAutomation: currentProject.wledEffectAutomation } : {}),
           // Multi-output slices snapshot — saved with the project so
           // the operator's projector / display layout survives a
           // reload. Read live from $settings.output because that's
@@ -4821,6 +5416,9 @@ void main() {
         // Include OSC config (port + bindings). The listener is
         // restarted on project load if the saved state was enabled.
         osc: oscStore.serialize(),
+        // Include DMX input bindings, universe filter and merge rule. The
+        // on/off switch and bind address are machine settings and stay out.
+        dmxInput: dmxStore.serialize(),
         // Include keyboard control bindings (key combo → param path).
         // Same router as MIDI/OSC, so the binding paths are identical.
         keyboard: keyboardStore.serialize(),
@@ -4844,15 +5442,38 @@ void main() {
         geoDeck: geoDeckStore.serialize(),
       };
 
+      // NOTE: deliberately no `project.stage3d` here. This export feeds the
+      // live state-sync relay, and importProject treats a present stage3d as
+      // "restore this scene" — so including it made every sync tick reload a
+      // stale snapshot over the Stage Sim, wiping the venue and any preset
+      // the operator had just applied. Save and autosave add it themselves.
       return exportData;
     },
 
     /**
-     * Export the project as a JSON string for download.
-     * Used for auto-save and real-time sync (no binary embedding).
+     * Export the project as a JSON string for autosave / download.
+     * Unlike exportProject(), this DOES carry the Stage 3D scene — the live
+     * sync relay uses exportProject() directly and must not.
      */
     exportProjectJSON(): string {
-      const exportData = this.exportProject();
+      const exportData = this.exportProject() as any;
+      try {
+        exportData.project.stage3d = JSON.parse(JSON.stringify(get(stage3dScene)));
+      } catch { /* snapshot failed — autosave still carries the layers */ }
+      try {
+        exportData.project.projectionSim = projectionSimScene.exportForProject();
+      } catch { /* ditto */ }
+      try {
+        // Same save-only treatment: the show timeline carries audio
+        // AssetRefs and a whole arrangement, neither of which belongs on
+        // the per-tick sync relay.
+        exportData.project.showTimeline = showTimeline.serialize();
+      } catch { /* ditto */ }
+      try {
+        // Cue list, timecode, schedule and projectors: save-only for the
+        // same reason as the show timeline.
+        exportData.project.showControl = serializeShowControl();
+      } catch { /* ditto */ }
       return JSON.stringify(exportData, null, 2);
     },
 
@@ -4885,15 +5506,39 @@ void main() {
       }
 
       // Keep in lockstep with exportProject() above.
+      // 1.9.5 bump: project.showTimeline (mapping-mode show arrangement;
+      // audio tracks ride AssetRefs, runtime URLs are blanked at save).
+      // 1.9.4 bump: project.projectionSim (Map Sim scene; imported models
+      // ride AssetRefs, runtime URLs are blanked at save).
       // 1.9.3 bump: layerSequencer + geoDeck now serialize at project root.
       // 1.9.2 bump: AssetRef capture on every File-import site, plus
       // pixelFXContent / gpuLayerContent now actually export. Older saves
       // (1.9.x and earlier) still load via the legacy resolveSrc fallback.
-      syncExport.version = '1.9.3';
+      syncExport.version = '1.9.5';
       try {
         syncExport.project.stage3d = JSON.parse(JSON.stringify(get(stage3dScene)));
       } catch (err) {
         console.warn('[Store] exportProjectForSave: 3D scene snapshot failed', err);
+      }
+      try {
+        // Save-only, like stage3d: the live state-sync relay must not carry
+        // scene payloads or every sync tick would clobber the open editor.
+        syncExport.project.projectionSim = projectionSimScene.exportForProject();
+      } catch (err) {
+        console.warn('[Store] exportProjectForSave: projection sim snapshot failed', err);
+      }
+      try {
+        // Save-only for the same two reasons: it holds audio AssetRefs, and
+        // the save-path restore is the one that receives projectDir so those
+        // refs can resolve against the .gha's own folder.
+        syncExport.project.showTimeline = showTimeline.serialize();
+      } catch (err) {
+        console.warn('[Store] exportProjectForSave: show timeline snapshot failed', err);
+      }
+      try {
+        syncExport.project.showControl = serializeShowControl();
+      } catch (err) {
+        console.warn('[Store] exportProjectForSave: show control snapshot failed', err);
       }
       return syncExport;
     },
@@ -4953,7 +5598,7 @@ void main() {
         };
       }
 
-      return {
+      const imported: Layer = {
         id: layer.id || generateUUID(),
         name: layer.name || 'Layer',
         type: migratedType,
@@ -4988,16 +5633,23 @@ void main() {
         gpuLayerContent: layer.gpuLayerContent || null,
         arcadeContent: layer.arcadeContent || null,
         mask: migratedMask,
+        paintMask: migratePaintMask(layer.paintMask),
         cropRegion: layer.cropRegion || null,
         layerShape: layer.layerShape || null,
         edgeEffects: layer.edgeEffects || null,
         vjLayerIndex: layer.vjLayerIndex,
+        vjGroupId: layer.vjGroupId,
+        ...(typeof layer.surfaceId === 'string' && layer.surfaceId ? { surfaceId: layer.surfaceId } : {}),
+        ...(layer.surfaceDetached === true ? { surfaceDetached: true } : {}),
         contentFit: layer.contentFit,
         renderQuality: layer.renderQuality,
+        stageTextureFlipV: layer.stageTextureFlipV,
         parentGroupId: layer.parentGroupId ?? null,
         groupConfig: layer.groupConfig,
         groupCollapsed: layer.groupCollapsed,
       };
+      // Screens applied from a Stage before 2026-09-11 carry Y-down corners.
+      return migrateStageLayerCorners(imported);
     },
 
     /**
@@ -5019,6 +5671,8 @@ void main() {
             vjMode?: any;
             mediaFolders?: MediaTrayFolder[];
             stage3d?: unknown;
+            projectionSim?: unknown;
+            showTimeline?: unknown;
           };
           mediaLibrary?: any[];
           vjClipLauncher?: any;
@@ -5065,12 +5719,22 @@ void main() {
         // layer as broken until the user re-imports each file by hand.
         const resolveSrc = (src: string): string => {
           if (!src) return src;
-          // Pass through any URL with a scheme. Without this, a project
-          // that already contains `ghost-asset://...` URLs (because it was
-          // opened, the URL got resolved, then re-saved and re-opened)
-          // gets the URL doubled because the resolver mistakes it for a
-          // relative path and prepends projectDir.
-          if (/^(https?:|blob:|data:|ghost-asset:)/i.test(src)) return src;
+          /*
+           * Pass through anything carrying a URI scheme, not just the four
+           * that used to be listed. This is what stops an already-resolved
+           * `ghost-asset://...` from being doubled when a project is opened,
+           * re-saved and opened again. A Windows drive letter is checked first because
+           * `C:\\clip.mp4` looks like a scheme; real schemes are two or more
+           * characters, drives are exactly one.
+           *
+           * The old allowlist (https/blob/data/ghost-asset) silently mangled
+           * every other scheme into a path: `builtin:grid` came back as
+           * `<projectDir>/builtin:grid`, and `live://webcam/<id>` the same.
+           * Opening any project saved with a built-in shader or a live source
+           * rewrote its src to a file that does not exist, and re-saving
+           * persisted the damage.
+           */
+          if (/^[A-Za-z]:[\\/]/.test(src)) return pathToFileUrl(src);
           if (/^file:/i.test(src)) {
             // Decode the file URL back to a path, then re-encode through
             // our pathToFileUrl which emits ghost-asset:// in Electron.
@@ -5082,8 +5746,9 @@ void main() {
               return src;
             }
           }
+          if (/^[A-Za-z][A-Za-z0-9+.-]+:/.test(src)) return src;
           let absPath: string | null = null;
-          if (/^[A-Z]:\\/i.test(src) || src.startsWith('/')) {
+          if (src.startsWith('/')) {
             absPath = src;
           } else if (projectDir) {
             const sep = projectDir.includes('\\') ? '\\' : '/';
@@ -5246,6 +5911,9 @@ void main() {
             mediaLibrary.addItem({
               id: item.id || generateUUID(),
               name: item.name || 'Media',
+              durationSeconds: Number.isFinite(item.durationSeconds) && item.durationSeconds > 0 ? item.durationSeconds : undefined,
+              videoWidth: Number.isFinite(item.videoWidth) && item.videoWidth > 0 ? item.videoWidth : undefined,
+              videoHeight: Number.isFinite(item.videoHeight) && item.videoHeight > 0 ? item.videoHeight : undefined,
               src: resolvedSrc,
               type: mediaType,
               thumbnail: savedThumbnail || (mediaType === 'image' ? resolvedSrc : item.thumbnail),
@@ -5305,6 +5973,9 @@ void main() {
                 );
               }
             }
+            if (clip.gpuLayerContent) {
+              resolveGpuLayerAssetParams(clip.gpuLayerContent);
+            }
             return {
               id: clip.id || generateUUID(),
               type: clipType,
@@ -5314,10 +5985,24 @@ void main() {
               shaderCode: clip.shaderCode,
               shaderValues: clip.shaderValues || {},
               playbackMode: clip.playbackMode || 'loop',
+              transitionDuration: typeof clip.transitionDuration === 'number' && Number.isFinite(clip.transitionDuration) ? normalizedTransitionDuration(clip.transitionDuration) : undefined,
+              autopilot: normalizeAutopilot(clip.autopilot),
+              cuePoints: normalizeCuePoints(clip.cuePoints),
+              faderStart: typeof clip.faderStart === 'boolean' ? clip.faderStart : undefined,
+              ignoreColumnTrigger: typeof clip.ignoreColumnTrigger === 'boolean' ? clip.ignoreColumnTrigger : undefined,
+              triggerStyle: ['normal', 'toggle', 'piano'].includes(clip.triggerStyle) ? clip.triggerStyle : 'normal',
+              transitionStyle: clip.transitionStyle == null ? undefined : normalizedTransitionStyle(clip.transitionStyle),
               playbackRate: clip.playbackRate ?? 1,
               trimStart: clip.trimStart ?? 0,
               trimEnd: clip.trimEnd ?? 1,
               isPlaying: clip.isPlaying ?? true,
+              // Audio stays OFF unless the saved project explicitly says
+              // otherwise — `=== true` so a stray truthy value from a
+              // hand-edited file can't silently un-mute a show.
+              audioPlayback: clip.audioPlayback !== false,
+              audioVolume: clip.audioVolume ?? 1,
+              audioPan: Number.isFinite(clip.audioPan) ? Math.max(-1, Math.min(1, clip.audioPan)) : 0,
+              audioMuted: clip.audioMuted === true,
               zoom: clip.zoom ?? 1,
               fit: clip.fit || 'cover',
               anchorX: clip.anchorX ?? 0.5,
@@ -5325,11 +6010,20 @@ void main() {
               rotation: clip.rotation ?? 0,
               opacity: clip.opacity ?? 1,
               spoutSource: clip.spoutSource,
+              ndiSource: clip.ndiSource,
               effectSource: clip.effectSource,
               jsAnimation: clip.jsAnimation,
               effects: clip.effects || [],
               splatContent: clip.splatContent,
               model3dContent: clipModel3dContent,
+              gpuLayerContent: clip.gpuLayerContent,
+              textContent: clip.textContent,
+              presetId: clip.presetId,
+              shaderValueAuto: clip.shaderValueAuto,
+              mirrorX: clip.mirrorX,
+              playbackSyncBeats: clip.playbackSyncBeats ?? null,
+              durationSeconds: clip.durationSeconds,
+              videoWidth: clip.videoWidth, videoHeight: clip.videoHeight,
               _assetRef: clip._assetRef,
               // videoElement will be recreated at runtime
             } as any;
@@ -5375,6 +6069,15 @@ void main() {
             mute: ls.mute || false,
             activeColumn: ls.activeColumn ?? null,
             activeClip: importClip(ls.activeClip),
+            faderStart: ls.faderStart === true,
+            audioVolume: Number.isFinite(ls.audioVolume) ? Math.max(0, Math.min(1, ls.audioVolume)) : 1,
+            audioPan: Number.isFinite(ls.audioPan) ? Math.max(-1, Math.min(1, ls.audioPan)) : 0,
+            autopilot: normalizeAutopilot(ls.autopilot),
+            autopilotPaused: ls.autopilotPaused === true,
+            ignoreColumnTrigger: ls.ignoreColumnTrigger === true,
+            locked: ls.locked === true,
+            transitionDuration: normalizedTransitionDuration(ls.transitionDuration),
+            transitionStyle: normalizedTransitionStyle(ls.transitionStyle),
             effects: ls.effects || [],
           }));
 
@@ -5387,6 +6090,8 @@ void main() {
               mute: false,
               activeColumn: null,
               activeClip: null,
+              transitionDuration: 0,
+              transitionStyle: 'dissolve',
               effects: [],
             });
           }
@@ -5409,6 +6114,8 @@ void main() {
             mute: false,
             activeColumn: null,
             activeClip: null,
+            transitionDuration: 0,
+            transitionStyle: 'dissolve',
             effects: [],
           });
 
@@ -5440,6 +6147,15 @@ void main() {
               mute: ls.mute || false,
               activeColumn: ls.activeColumn ?? null,
               activeClip: importClip(ls.activeClip),
+              faderStart: ls.faderStart === true,
+            audioVolume: Number.isFinite(ls.audioVolume) ? Math.max(0, Math.min(1, ls.audioVolume)) : 1,
+            audioPan: Number.isFinite(ls.audioPan) ? Math.max(-1, Math.min(1, ls.audioPan)) : 0,
+            autopilot: normalizeAutopilot(ls.autopilot),
+            autopilotPaused: ls.autopilotPaused === true,
+              ignoreColumnTrigger: ls.ignoreColumnTrigger === true,
+              locked: ls.locked === true,
+              transitionDuration: normalizedTransitionDuration(ls.transitionDuration),
+              transitionStyle: normalizedTransitionStyle(ls.transitionStyle),
               effects: ls.effects || [],
             }));
             // Pad with defaults if the saved array is shorter than current dims
@@ -5500,6 +6216,7 @@ void main() {
             isOpen: false,
             isLive: false, // Never import as live
             compositionEffects: vjcl.compositionEffects || [],
+            groups: normalizeVJGroups(vjcl.groups, importNumLayers),
             stageMode: false, // Never import as stage mode active
             stagePresetId: vjcl.stagePresetId || null,
             mapMode: false, // Never import as map mode active
@@ -5527,7 +6244,7 @@ void main() {
         //   "B:N:fx:effectId:paramName" → Bank B effect
         //   "xfade:value"             → crossfader value
         if (Array.isArray(parsed.modulation)) {
-          modulationStore.bulkLoad(parsed.modulation);
+          modulationStore.bulkLoad(parsed.modulation, { resetCaches: true });
         } else {
           modulationStore.clearAll();
         }
@@ -5562,6 +6279,13 @@ void main() {
           oscStore.hydrate((parsed as any).osc);
         } else {
           oscStore.reset();
+        }
+
+        // Import DMX input bindings. Older saves don't carry them.
+        if ((parsed as any).dmxInput) {
+          dmxStore.hydrate((parsed as any).dmxInput);
+        } else {
+          dmxStore.reset();
         }
 
         // Import keyboard control bindings. Older saves don't carry them
@@ -5681,13 +6405,29 @@ void main() {
           mappingComposition: normalizeMappingCompositionState(proj.mappingComposition),
           vjMode: importedVjMode,
           mediaFolders: normalizeMediaTrayFolders(proj.mediaFolders),
-          stagePresets: (proj as any).stagePresets || [],
+          // Stage presets carry their own copies of the screen layers, and
+          // they reach the project without passing through _importLayer.
+          stagePresets: ((proj as any).stagePresets || []).map((preset: any) => (
+            Array.isArray(preset?.layers)
+              ? { ...preset, layers: preset.layers.map(migrateStageLayerCorners) }
+              : preset
+          )),
           svKeyboardPresets: (proj as any).svKeyboardPresets || [],
+          // Absent on older saves; migrateMapSurfaces below builds it.
+          ...(Array.isArray((proj as any).mapSurfaces) ? { mapSurfaces: (proj as any).mapSurfaces } : {}),
           surfaces: (proj as any).surfaces || [],
           activeSurfaceId: (proj as any).activeSurfaceId ?? null,
+          ...((proj as any).pixelMap ? { pixelMap: normalizePixelMapConfig((proj as any).pixelMap) } : {}),
+          wledControllers: identifiedEntries((proj as any).wledControllers)
+            .filter((controller: any) => typeof controller.ipAddr === 'string'),
+          wledGroups: identifiedEntries((proj as any).wledGroups),
+          wledEffects: identifiedEntries((proj as any).wledEffects),
+          ...((proj as any).wledEffectAutomation && typeof (proj as any).wledEffectAutomation === 'object'
+            ? { wledEffectAutomation: (proj as any).wledEffectAutomation }
+            : {}),
         };
 
-        set(importedProject);
+        set(migrateMapSurfaces(importedProject));
         selectedLayerIdsState.set(importedProject.selectedLayerId ? [importedProject.selectedLayerId] : []);
         const importedStage3d = (proj as any).stage3d;
         const incomingSyncedStage3d = (parsed as any).stage3dScene;
@@ -5703,6 +6443,53 @@ void main() {
             }
           } catch (err) {
             console.warn('[Store] importProject: 3D scene restore failed', err);
+          }
+          try {
+            const importedSim = (proj as any).projectionSim;
+            if (importedSim?.schemaVersion === 1
+              && Array.isArray(importedSim.objects)
+              && Array.isArray(importedSim.projectors)) {
+              projectionSimScene.loadSceneFromProject(importedSim, projectDir);
+            }
+            // No else: a project without the section keeps the store's
+            // session scene (fresh launches land on the cube-pyramid preset).
+          } catch (err) {
+            console.warn('[Store] importProject: projection sim restore failed', err);
+          }
+          try {
+            const importedShow = (proj as any).showTimeline;
+            if (importedShow && typeof importedShow === 'object') {
+              // projectDir-aware so audio AssetRefs saved as siblings of the
+              // .gha resolve on another machine. Never auto-plays.
+              showTimeline.hydrate(importedShow, projectDir);
+            } else if ('stage3d' in (proj as any) || 'projectionSim' in (proj as any)) {
+              // Save-shaped payload (only the save/autosave exports carry the
+              // save-only sections) that has no show of its own — a
+              // pre-1.9.5 file, or a project the user never programmed.
+              // Clear, so the previous project's arrangement cannot bleed
+              // through and start firing presets over the new one.
+              showTimeline.hydrate(null);
+            }
+            // No else: this is a LIVE STATE-SYNC payload. exportProject()
+            // deliberately omits every save-only section, so "absent" here
+            // means "not transmitted", not "empty". Clearing on it would
+            // wipe the receiver's timeline on every relay tick — the exact
+            // failure mode the stage3d note above documents.
+          } catch (err) {
+            console.warn('[Store] importProject: show timeline restore failed', err);
+          }
+          try {
+            // Same three-way rule as the show timeline: restore a saved
+            // section, clear on a save-shaped payload without one, and leave
+            // the running cue list alone on a live state-sync payload.
+            const importedShowControl = (proj as any).showControl;
+            if (importedShowControl && typeof importedShowControl === 'object') {
+              hydrateShowControl(importedShowControl);
+            } else if ('stage3d' in (proj as any) || 'projectionSim' in (proj as any) || 'showTimeline' in (proj as any)) {
+              hydrateShowControl(null);
+            }
+          } catch (err) {
+            console.warn('[Store] importProject: show control restore failed', err);
           }
         });
         // Hydrate $settings.output from the project's multi-output
@@ -5776,11 +6563,124 @@ void main() {
 
 export const project = createProjectStore();
 
+// ─── Show timeline → composition loader ──────────────────────────────────
+// The show timeline must be able to fire a preset without importing this
+// module (that would be a cycle, and it would drag the whole project store
+// into every unit test of the arrangement maths). Register the real loader
+// here — layers.ts is loaded by everything, so this always lands before any
+// timeline can run.
+setShowCompositionLoader((compositionId, options) => {
+  project.loadComposition(compositionId, { restoreTransports: options.restoreTransports, recordHistory: false });
+});
+
+// ─── Mapping-mode clip audio reconciliation ──────────────────────────────
+// One central place decides which mapping-mode media layers are audible,
+// instead of scattering attach/detach through every edit path (create,
+// import, rehydrate, toggle, delete). Runs on every project change, but
+// short-circuits to a single `Set.size === 0` check when nothing has opted
+// in — which is every project that never touches the feature.
+//
+// Layer media video elements are safe to wire directly: unlike the VJ clip
+// pool they are created once per MediaSource object and never re-`src`ed
+// (see media/videoSourceRestore.ts and LayerPanel.createMediaSource), so
+// each element gets exactly one createMediaElementSource() for its lifetime.
+const audibleLayerSourceIds = new Set<string>();
+
+function reconcileLayerMediaAudio($project: Project): void {
+  const seen = new Set<string>();
+  for (const layer of $project.layers) {
+    const source = layer.source;
+    if (!source || source.type !== 'video' || source.audioPlayback !== true) continue;
+    const element = source.videoElement;
+    if (!element) continue;
+    seen.add(source.id);
+    const layerId = layer.id;
+    const sourceId = source.id;
+    if (!audibleLayerSourceIds.has(sourceId)) {
+      const ok = clipAudioBus.attachClip(sourceId, element, {
+        volume: source.audioVolume ?? 1,
+        muted: source.audioMuted === true,
+        provider: () => {
+          const current = get(project).layers.find((l) => l.id === layerId)?.source;
+          if (!current || current.id !== sourceId || current.audioPlayback !== true) return null;
+          return mediaSourceAudioTransport(current);
+        },
+      });
+      if (ok) audibleLayerSourceIds.add(sourceId);
+    } else {
+      clipAudioBus.setClipVolume(sourceId, source.audioVolume ?? 1);
+      clipAudioBus.setClipMuted(sourceId, source.audioMuted === true);
+    }
+  }
+  if (audibleLayerSourceIds.size === 0) return;
+  for (const id of Array.from(audibleLayerSourceIds)) {
+    if (seen.has(id)) continue;
+    clipAudioBus.detachClip(id);
+    audibleLayerSourceIds.delete(id);
+  }
+}
+
+/** Wrapped playhead time + transport for a mapping-mode media source.
+ *  Mirrors LayerPanel's `sourcePlaybackTime` so the audio element chases
+ *  exactly the value the render authority is presenting. */
+function mediaSourceAudioTransport(source: MediaSource): ClipAudioTransport {
+  const duration = Number(source.durationSeconds ?? source.videoElement?.duration);
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+  const nativeTime = Number(source._nativePlaybackTimeSeconds);
+  const elementTime = Number(source.videoElement?.currentTime);
+  let time = Number.isFinite(nativeTime) && nativeTime >= 0
+    ? nativeTime
+    : Number.isFinite(elementTime) && elementTime >= 0
+      ? elementTime
+      : 0;
+  const anchorMs = Number(source._nativePlaybackUpdatedAtMs);
+  const rate = Number(source.playbackRate) || 1;
+  const paused = source.isPlaying === false || source.playbackMode === 'bounce';
+  if (!paused && Number.isFinite(anchorMs)) {
+    time += Math.max(0, performance.now() - anchorMs) / 1000 * rate;
+  }
+  const trimStart = hasDuration ? duration * Math.max(0, Math.min(1, source.trimStart ?? 0)) : 0;
+  const trimEnd = hasDuration ? duration * Math.max(0, Math.min(1, source.trimEnd ?? 1)) : 0;
+  const loop = (source.playbackMode ?? 'loop') !== 'once';
+  if (hasDuration) {
+    const range = Math.max(0.001, trimEnd - trimStart);
+    time = loop
+      ? trimStart + (((time - trimStart) % range) + range) % range
+      : Math.max(trimStart, Math.min(trimEnd, time));
+  }
+  return {
+    timeSeconds: Math.max(0, time),
+    playbackRate: rate,
+    paused,
+    loop,
+    trimStartSeconds: trimStart,
+    trimEndSeconds: trimEnd,
+    seekGeneration: Math.max(0, Math.round(Number(source._nativePlaybackSeekSeq ?? 0))),
+    durationSeconds: hasDuration ? duration : undefined,
+  };
+}
+
+project.subscribe(($project) => {
+  try {
+    reconcileLayerMediaAudio($project);
+  } catch (err) {
+    console.warn('[layers] Clip audio reconcile failed:', err);
+  }
+});
+
 // Derived stores for convenience
 export const layers = derived(project, ($project) => $project.layers);
 
 export const selectedLayerId = derived(project, ($project) => $project.selectedLayerId);
 export const selectedLayerIds = derived(selectedLayerIdsState, ($ids) => $ids);
+
+// Keep the multi-selection in step with the primary one (see
+// selectionForPrimary): add*Layer, undo, paste and import only move
+// `selectedLayerId`.
+project.subscribe(($project) => {
+  const next = selectionForPrimary($project.selectedLayerId, get(selectedLayerIdsState));
+  if (next) selectedLayerIdsState.set(next);
+});
 
 export const selectedLayer = derived(project, ($project) =>
   $project.layers.find((l) => l.id === $project.selectedLayerId) || null
@@ -6010,7 +6910,17 @@ export function getGroupLayers(layers: Layer[]): Layer[] {
 
 // Register mapping mode callbacks for the modulation engine
 // This lets audio modulation work on mapping mode layers (not just VJ clips)
-import { registerMappingLayerCallbacks } from '../audio/modulation';
+import { registerCompositionModulationHandlers, registerMappingLayerCallbacks } from '../audio/modulationHandlers';
+
+registerCompositionModulationHandlers(
+  (effectId, paramName) => {
+    const composition = get(project).mappingComposition;
+    if (!composition?.enabled) return undefined;
+    const value = (composition.effects.find(effect => effect.id === effectId)?.params as Record<string, unknown> | undefined)?.[paramName];
+    return typeof value === 'number' ? value : undefined;
+  },
+  (effectId, values) => project.updateMappingCompositionEffectParams(effectId, values),
+);
 
 registerMappingLayerCallbacks(
   // updater: apply modulated values to a mapping layer's shader
@@ -6126,3 +7036,37 @@ registerMappingLayerCallbacks(
     return typeof value === 'number' ? value : undefined;
   },
 );
+
+// Registered after both stores exist; macros remain independent of project initialization.
+import { registerMacroAssignmentWriter } from './macroAssignments';
+registerMacroAssignmentWriter((target, value) => {
+  const patch = { [target.param]: value };
+  if (target.scope === 'mapping-layer') {
+    const effect = get(project).layers.find(layer => layer.id === target.layerId)?.effects?.find(e => e.id === target.effectId);
+    if (effect) project.updateEffectParams(target.layerId, target.effectId, patch);
+  } else if (target.scope === 'mapping-edge') {
+    const edge = get(project).layers.find(layer => layer.id === target.layerId)?.edgeEffects?.effects.find(e => e.id === target.effectId);
+    if (!edge) return;
+    const dot = target.param.indexOf('.');
+    if (dot < 0) {
+      project.updateEdgeEffect(target.layerId, target.effectId, { [target.param]: value } as any);
+    } else {
+      const top = target.param.slice(0, dot);
+      const part = (edge as any)[top];
+      if (part && typeof part === 'object') {
+        project.updateEdgeEffect(target.layerId, target.effectId, { [top]: { ...part, [target.param.slice(dot + 1)]: value } } as any);
+      }
+    }
+  } else if (target.scope === 'mapping-composition') {
+    if (get(project).mappingComposition?.effects.some(e => e.id === target.effectId)) project.updateMappingCompositionEffectParams(target.effectId, patch);
+  } else if (target.scope === 'vj-composition') {
+    if (get(vjClipLauncher).compositionEffects.some(e => e.id === target.effectId)) vjClipLauncher.updateCompositionEffectParams(target.effectId, patch);
+  } else if (target.scope === 'vj-layer') {
+    const state = get(vjClipLauncher);
+    const rows = target.bank === 'B' ? state.bankBLayerStates : state.layerStates;
+    const index = rows.findIndex(row => row.effects?.some(e => e.id === target.effectId));
+    if (index >= 0) vjClipLauncher.updateLayerEffectParams(index, target.effectId, patch, target.bank);
+  } else if (target.scope === 'vj-clip') {
+    vjClipLauncher.updateClipEffectParamsById(target.clipId, target.effectId, patch, target.bank);
+  }
+});

@@ -47,10 +47,29 @@ export interface WarpCorners {
   bottomRight: Point2D;
 }
 
+/** Bezier tangent handles on one mesh point, as offsets from the point in
+ *  mesh-local coordinates. `right` and `down` point toward the next column
+ *  and next row. `left` and `up` are only stored once the user unlinks
+ *  them (Alt-drag); while absent they mirror `right` / `down`. A side with
+ *  no tangent at all keeps its edge straight. */
+export interface MeshPointTangents {
+  right?: Point2D;
+  down?: Point2D;
+  left?: Point2D;
+  up?: Point2D;
+}
+
 export interface MeshWarpGrid {
   rows: number;
   cols: number;
   points: Point2D[][]; // [row][col]
+  /** Bezier warp: cell edges are cubic curves shaped by the point tangents.
+   *  Off (or absent, as in every project saved before it existed) keeps the
+   *  straight-edged cells. Tangents are kept while it is off. */
+  bezier?: boolean;
+  /** Per-point tangent handles, [row][col], sparse: a missing entry is a
+   *  point with straight edges. */
+  tangents?: (MeshPointTangents | null | undefined)[][];
 }
 
 export type WarpMode = 'corners' | 'mesh' | 'edge' | 'none';
@@ -96,19 +115,7 @@ export type MediaType =
   | 'synthvision';
 
 // Integrated effect types (FluidGen, Particles3D, Point Cloud, 3D Models running natively in WebGL)
-export type IntegratedEffectType =
-  | 'fluid'
-  | 'particles'
-  | 'splat'
-  | 'model3d'
-  | 'milkdrop'
-  | 'audiomotion'
-  | 'wavejs'
-  | 'hydra'
-  | 'ghostfx'
-  | 'analyzerlab'
-  | 'handfx'
-  | 'ghostpilot';
+export type IntegratedEffectType = 'fluid' | 'particles' | 'splat' | 'model3d' | 'milkdrop' | 'audiomotion' | 'wavejs' | 'hydra' | 'ghostfx' | 'analyzerlab' | 'handfx' | 'ghostpilot' | 'vj-crossfade' | 'vj-mix' | 'performer-world';
 
 // Stem identifiers for the multi-stem routing matrix (Milkdrop plugin).
 // 'full' is the unsplit mix; the rest match standard Demucs output names plus a
@@ -135,6 +142,14 @@ export interface IntegratedEffectSource {
   effectType: IntegratedEffectType;
   // Shared params
   cameraEnabled?: boolean;     // Use webcam as input feed
+  // Native Performer world overlay
+  performerWorldIndex?: number;
+  performerWorldSpace?: number;
+  performerWorldX?: number;
+  performerWorldY?: number;
+  performerWorldPointerDown?: boolean;
+  performerWorldParams?: number[];
+  performerWorldPump?: number;
   // Fluid simulation params
   fluidMode?: number;      // 0=SMOKE, 1=FIRE, 2=INK, 3=NEON, 4=THERMAL
   fluidViscosity?: number;
@@ -264,7 +279,13 @@ export interface IntegratedEffectSource {
   analyzerLabBgAlpha?: number;           // 0..1
   analyzerLabShowLabels?: boolean;
   // HandFX params (MediaPipe-driven hand visualizer)
-  handfxMode?: 'panel' | 'trails' | 'aurora' | 'skeleton' | 'bursts';
+  handfxMode?: 'panel' | 'trails' | 'aurora' | 'skeleton' | 'bursts' | 'bridge' | 'orbit' | 'lasers' | 'portal' | 'web' | 'silk';
+  handfxInput?: 'live' | 'demo';
+  handfxPalette?: string;
+  handfxBrightness?: number;
+  handfxScale?: number;
+  handfxDetail?: number;
+  handfxAudioResponse?: number;
   handfxCameraOn?: boolean;
   handfxSmoothing?: number;
   handfxPredictMs?: number;
@@ -303,7 +324,11 @@ export interface IntegratedEffectSource {
   ghostpilotAutopilot?: boolean;        // allow idle autopilot takeover
   ghostpilotSteerAssist?: number;       // 0..1 — banking/yaw coupling to steer
   // GhostFX params (original WebGPU visualizer by Ghost Arcade)
-  ghostfxScenePreset?: string;          // 'drift' (v5); more in later sessions
+  ghostfxScenePreset?: string;
+  ghostfxVoyageMotion?: number;
+  ghostfxVoyageDetail?: number;
+  ghostfxVoyageDepth?: number;
+  ghostfxVoyagePalette?: number;
   ghostfxSensitivity?: number;          // 0.25..4 — audio drive multiplier
   ghostfxHueDriftSpeed?: number;        // 0..2 — palette rotation rate
   ghostfxBloomIntensity?: number;       // 0..3 — bloom add-back at composite
@@ -332,6 +357,18 @@ export interface IntegratedEffectSource {
   ghostfxLiquidDyeDecay?: number;       // 0.985..1.0 — dye fade per frame
   ghostfxLiquidVelDecay?: number;       // 0.95..1.0 — velocity damping
   ghostfxLiquidBassRate?: number;       // 0..2 — bass-driven splat rate multiplier
+  // VJ crossfade carrier params (vj-xfade-N synthetic layers)
+  vjxfadeLayerA?: string;               // Bank A composited layer id
+  vjxfadeLayerB?: string;               // Bank B composited layer id
+  vjxfadeOpacityA?: number;             // 0..1 — Bank A opacity
+  vjxfadeOpacityB?: number;             // 0..1 — Bank B opacity
+  vjxfadeMix?: number;                  // 0..1 — post-curve fader value
+  vjxfadeTransition?: string;           // transition id (vjCrossfadeNative.ts)
+  vjxfadeBlend?: string;                // overlap blend mode
+  // VJ Mix carrier params (__vj-mix__ synthetic layer): all VJ rows,
+  // ordered bottom→top, post-crossfade, with per-row opacity + blend.
+  vjmixRows?: Array<{ layerId?: string; frameId?: string; groupId?: string; opacity: number; blendMode: string }>;
+  vjmixSharedFeed?: boolean;
 }
 
 // Spout source configuration (for plugin integrations)
@@ -761,9 +798,11 @@ export interface ImageInputRef {
   name: string;
 }
 
-export type VideoPlaybackMode = 'loop' | 'once' | 'timelapse';
+export type VideoPlaybackMode = 'loop' | 'once' | 'bounce' | 'timelapse';
 
 export interface MediaSource {
+  /** Transient paused input prepared for a native launch. Never persist. */
+  _nativeLaunchPreparation?: boolean;
   id: string;
   type: MediaType;
   src: string; // URL or path
@@ -787,6 +826,23 @@ export interface MediaSource {
   playbackSyncBeats?: number | null; // If set, fit full clip/trim span to this many beats
   trimStart?: number; // 0-1 normalized start point (default 0)
   trimEnd?: number; // 0-1 normalized end point (default 1)
+  // ── Audio playback (opt-in, default OFF) ──
+  // Mirrors VJClip.audioPlayback / audioVolume / audioMuted. NOT the same
+  // thing as `audioEnabled` further down this file, which is splat audio
+  // *reactivity*. When true, this source gets a dedicated (never-pooled)
+  // <video> element wired into `clipAudioBus`; when false or absent the
+  // element stays muted and no WebAudio node is ever constructed.
+  audioPlayback?: boolean; // Play this source's audio track (default false)
+  audioVolume?: number; // 0-1 per-source level (default 1)
+  audioMuted?: boolean; // Per-source mute, independent of audioPlayback (default false)
+  // Native metadata retained when no browser video is attached.
+  durationSeconds?: number;
+  videoWidth?: number;
+  videoHeight?: number;
+  _nativePlaybackDirection?: number; // Direction at the native time anchor
+  _nativePlaybackTimeSeconds?: number; // Runtime anchor for the native decoder clock
+  _nativePlaybackUpdatedAtMs?: number; // performance.now() corresponding to the native time anchor
+  _nativePlaybackSeekSeq?: number; // Incremented for every explicit native seek/restart
   _lastFrameTime?: number; // Internal: timestamp for manual frame stepping
   // Timelapse mode properties
   timelapseInterval?: number; // Seconds between frames (1-30)
@@ -802,6 +858,10 @@ export interface MediaSource {
   spoutSource?: SpoutSource;
   // NDI receiver source (network video stream from another app/machine)
   ndiSource?: NdiSource;
+  /** Native 2.0 live-ingest identity. Live pixels are acquired outside the
+   * browser and imported into the render core as shared GPU surfaces. */
+  liveSourceType?: 'webcam' | 'capture' | 'syphon' | 'ndi';
+  liveSourceSessionId?: string;
   // Integrated effect source (native WebGL fluid/particles)
   effectSource?: IntegratedEffectSource;
   // SynthVision: shared offscreen canvas the texture mirrors
@@ -837,7 +897,7 @@ export type SVGColorMode = 'perShape' | 'rainbow' | 'monochrome' | 'complementar
 // SVG 3D render mode — 'flat' is the classic orthographic look; 'extrude'
 // turns each shape into a beveled 3D solid under a perspective camera with
 // real lights + materials (drop a logo and spin it in 3D).
-export type SVGRenderMode = 'flat' | 'extrude';
+export type SVGRenderMode = 'source' | 'flat' | 'extrude';
 
 // PBR material look for extruded shapes. 'holographic' is the default —
 // iridescent thin-film that shifts colour by view angle.
@@ -1062,6 +1122,37 @@ export interface MaskConfig {
   feather: number;     // Feather/softness at edges (0-1)
 }
 
+/**
+ * One brush stroke of a painted mask. Stored as the stroke, not as pixels:
+ * a centreline in the layer's content space plus the brush. The native core
+ * rasterises strokes at output resolution (native-renderer/src/paint_mask.rs),
+ * so the project and every undo snapshot carry a few hundred bytes per
+ * stroke instead of a bitmap. See src/lib/utils/paintMask.ts.
+ */
+export interface PaintMaskStroke {
+  id: string;
+  mode: 'erase' | 'restore';
+  /** Brush radius in content space: x as a fraction of the layer's content
+   *  width, y of its height (a round brush on screen is an ellipse here). */
+  rx: number;
+  ry: number;
+  /** 0 = hard (anti-aliased) edge, 1 = falls off from the centre. */
+  softness: number;
+  opacity: number;
+  /** Base64 of little-endian uint16 (x, y) pairs; 0..65535 maps to content
+   *  UV -0.25..1.25, y down (0 = the top of the layer's picture). */
+  points: string;
+}
+
+/** A layer's painted mask: brushed erase/restore strokes, combined
+ *  (multiplied) with the vector mask and the layer shape. */
+export interface PaintMaskConfig {
+  /** Show/hide. Hidden keeps the strokes but renders the layer unmasked. */
+  enabled: boolean;
+  inverted: boolean;
+  strokes: PaintMaskStroke[];
+}
+
 // Input crop/slice region (what portion of the source to use)
 export interface CropRegion {
   x: number;      // Left edge (0-1)
@@ -1103,6 +1194,7 @@ export interface LayerShapeParams {
   // For custom (pen-tool drawn polygon with optional bezier curves)
   customPoints?: BezierPoint[];  // Vertices with optional bezier handles (normalized 0-1)
   customClosed?: boolean;        // Whether the polygon has been closed/finalized
+  customBasePoints?: BezierPoint[];  // Outline snapshot content was authored against (drives content-follow warp)
   customShapeFit?: 'warp' | 'fill' | 'mask';  // How texture maps to shape: warp=stretch to bbox, fill=aspect-preserving, mask=clip only (legacy)
 
   // Common params
@@ -1159,7 +1251,12 @@ export type LightPaintingBrushType =
   | 'ink'         // Bleeding-edge ink wash
   | 'crystal'     // Faceted crystalline shards
   | 'aurora'      // Curtains of borealis-style light
-  | 'bubbles';    // Floating soap-bubble field
+  | 'bubbles'     // Floating soap-bubble field
+  // ── Native particle brushes ──
+  // Emulate the retired WebGPU compute-particle looks inside the
+  // native fragment renderer: orbiting heads with motion trails.
+  | 'orbit'       // Particle clusters orbit around the stroke with comet trails
+  | 'helix';      // Candy-cane wrap of streaking particles around the stroke
 
 export type LightPaintingLoopMode = 'forward' | 'reverse' | 'pingpong' | 'once';
 
@@ -1727,10 +1824,22 @@ export type SplatCreativeEffectType =
   | 'none'
   | 'feedback'          // Temporal feedback loops
   | 'kaleidoscope'      // Kaleidoscopic mirroring
-  | 'constellation'     // Connect nearby points with lines
+  | 'constellation'     // Per-point sparkle / twinkle pulse
   | 'datamosh'          // Digital glitch aesthetic
   | 'pixelSort'         // Pixel sorting effect
   | 'echo';             // Temporal echo/ghosting
+
+/**
+ * How a creative effect's contribution combines with the point's colour.
+ * Deliberately a small set — these are evaluated per-splat inside the
+ * fragment shader, NOT the layer-level `BlendMode` (which composites the
+ * whole rendered layer downstream in the engine).
+ */
+export type SplatEffectBlendMode =
+  | 'add'               // Additive — the original constellation behaviour
+  | 'screen'            // Softer highlight, never clips to white as hard
+  | 'multiply'          // Darkens; sparkle punches holes instead of dots
+  | 'replace';          // Sparkle colour overrides the point colour
 
 // Render mode for points
 export type SplatRenderMode =
@@ -1975,6 +2084,17 @@ export interface SplatContent {
   shadowStrength: number; // 0-1
   shadowSoftness: number; // 0-1
   specularStrength: number; // 0-2
+  // Material — splat had lighting but no material model at all. These sit
+  // between the point's own colour and the lighting rig: shininess tightens
+  // the specular lobe, the two tints colour the specular/rim highlights
+  // independently of the light colours, and fresnelPower shapes the rim
+  // falloff (low = broad wash, high = thin edge).
+  specularShininess: number; // 1-128
+  specularTint: string;
+  rimTint: string;
+  fresnelPower: number; // 0.5-8
+  metallic: number; // 0-1 — biases specular toward the point's own colour
+  emissiveStrength: number; // 0-3 — self-illumination, unlit add-back
   atmosphereEnabled: boolean;
   atmosphereDensity: number; // 0-1
   atmosphereColor: string;
@@ -1983,6 +2103,26 @@ export interface SplatContent {
   atmosphereSpeed: number; // 0-3
   backgroundOpacity: number; // 0-1
   backgroundColor: string;
+
+  // Volumetric light shafts. A light-space opacity volume is scattered
+  // from the splats themselves, prefix-summed along the light axis, and
+  // then read by both a god-ray march (Henyey-Greenstein in-scattering
+  // through a haze filling the cloud) and the splats (so a splat behind
+  // a dense region is genuinely darker). The key light rig above is
+  // reused as-is — these knobs only add the medium, the cone and the
+  // occlusion. OFF by default: a project that does not use it queues no
+  // extra passes at all.
+  volumetricEnabled: boolean;
+  volumetricDensity: number;        // 0-3   haze density
+  volumetricColor: string;          // haze colour
+  volumetricStrength: number;       // 0-3   shaft brightness
+  volumetricShadowDensity: number;  // 0-6   occlusion gain
+  volumetricShadowStrength: number; // 0-1   how much splats receive it
+  volumetricShadowRes: number;      // light-space volume edge (tier-capped)
+  volumetricSpotAngle: number;      // 5-180 (180 = no cone)
+  volumetricSpotSoftness: number;   // 0.01-1
+  volumetricLightDistance: number;  // 1-20  virtual spot apex distance
+  volumetricAnisotropy: number;     // -0.95..0.95 HG phase g
 
   // Creative effects
   creativeEffectType: SplatCreativeEffectType;
@@ -1996,6 +2136,19 @@ export interface SplatContent {
   constellationDistance: number;  // 0-1
   constellationMaxDistance: number;  // Alias 0-1
   constellationOpacity: number;   // 0-1
+  // Constellation twinkle shaping. The effect is a per-point sparkle (it
+  // does not draw connecting lines); speed sets the pulse rate, blend picks
+  // how the sparkle combines with the point colour, and the wave controls
+  // turn the uniform sparkle into a travelling front across the cloud.
+  constellationSpeed: number;     // 0-8 pulse rate multiplier
+  constellationBlend: SplatEffectBlendMode;
+  constellationWave: boolean;
+  constellationWaveAxis: 'x' | 'y' | 'z';
+  constellationWaveFrequency: number; // 0.1-8 spatial frequency
+  constellationWaveSpeed: number; // -4..4 travel speed (sign = direction)
+  // Datamosh flicker rate. Was hardcoded at 10Hz with no control; intensity
+  // only ever scaled the RGB shift, never the rate.
+  datamoshSpeed: number;          // 0-4 (1 = the original 10Hz feel)
   echoCount: number;              // 1-10
   echoDelay: number;              // 0-1
 
@@ -2006,11 +2159,18 @@ export interface SplatContent {
   mouseMode: 'attract' | 'repel' | 'swirl' | 'reveal';
   mouseInteraction: SplatMouseInteraction;  // Alias for UI
 
-  // Post-processing
-  bloom: number;                  // 0-3
-  bloomThreshold: number;         // 0-1
-  chromatic: number;              // 0-0.02
-  vignette: number;               // 0-1
+  // Post-processing.
+  // NOTE: `chromatic` and `vignette` are still inert here — full-frame post
+  // belongs to the generic layer Effect chain (Add Effect -> Bloom /
+  // Chromatic Aberration / Vignette), which splat layers already route
+  // through. `bloom`/`bloomThreshold` ARE live: they drive a per-splat glow
+  // halo in the splat shader (cheap, and unlike a full-frame pass it keeps
+  // the glow attached to bright points as they move).
+  bloom: number;                  // 0-3   glow strength
+  bloomThreshold: number;         // 0-1   luminance above which points glow
+  bloomRadius: number;            // 1-4   halo size multiplier on the sprite
+  chromatic: number;              // 0-0.02 (inert — use the Effect chain)
+  vignette: number;               // 0-1    (inert — use the Effect chain)
 
   // Per-parameter Auto playheads. Audio/LFO routing lives in the
   // modulation store; Auto persists with the splat layer itself.
@@ -2204,6 +2364,12 @@ export function createDefaultSplatContent(): SplatContent {
     shadowStrength: 0.35,
     shadowSoftness: 0.5,
     specularStrength: 0.35,
+    specularShininess: 24,
+    specularTint: '#ffffff',
+    rimTint: '#ffffff',
+    fresnelPower: 3,
+    metallic: 0,
+    emissiveStrength: 0,
     atmosphereEnabled: false,
     atmosphereDensity: 0.25,
     atmosphereColor: '#6a7da8',
@@ -2212,6 +2378,19 @@ export function createDefaultSplatContent(): SplatContent {
     atmosphereSpeed: 0.25,
     backgroundOpacity: 0,
     backgroundColor: '#000000',
+
+    // Volumetric light shafts (off by default)
+    volumetricEnabled: false,
+    volumetricDensity: 1.2,
+    volumetricColor: '#cfe0ff',
+    volumetricStrength: 1.4,
+    volumetricShadowDensity: 1.6,
+    volumetricShadowStrength: 0.5,
+    volumetricShadowRes: 0,
+    volumetricSpotAngle: 38,
+    volumetricSpotSoftness: 0.4,
+    volumetricLightDistance: 6.5,
+    volumetricAnisotropy: 0.6,
 
     // Creative effects
     creativeEffectType: 'none',
@@ -2225,18 +2404,29 @@ export function createDefaultSplatContent(): SplatContent {
     constellationDistance: 0.1,
     constellationMaxDistance: 0.1,  // Alias
     constellationOpacity: 0.5,
+    constellationSpeed: 1,
+    constellationBlend: 'add',
+    constellationWave: false,
+    constellationWaveAxis: 'y',
+    constellationWaveFrequency: 1.5,
+    constellationWaveSpeed: 1,
+    datamoshSpeed: 1,
     echoCount: 3,
     echoDelay: 0.1,
 
-    // Mouse interaction
+    // Mouse interaction. Radius/strength default higher than the original
+    // 0.2/0.5: at those values the affected zone was ~15% of the cloud and
+    // the displacement ~7% of its width, which read as "not working" unless
+    // you hovered exactly over the cloud and knew what to look for.
     mouseInfluence: 0,
-    mouseRadius: 0.2,
-    mouseStrength: 0.5,  // Alias for UI
+    mouseRadius: 0.45,
+    mouseStrength: 1.2,  // Alias for UI
     mouseMode: 'attract',
     mouseInteraction: 'none',  // Alias for UI
 
     bloom: 0,
     bloomThreshold: 0.5,
+    bloomRadius: 2,
     chromatic: 0,
     vignette: 0,
   };
@@ -2726,11 +2916,53 @@ export interface EdgeEffect {
    *  or top-level `opacity`). Same role as Effect.paramAuto — see
    *  AutoConfig above. */
   paramAuto?: Record<string, AutoConfig>;
+  /** Radial effects, rotation and origami turn about this point (layer UV,
+   *  y up) instead of the outline's centroid. */
+  customCenter?: boolean;
+  centerX?: number;
+  centerY?: number;
+  /** Group chase: delay this effect by the layer's place in its group so
+   *  it travels across the map. `chaseSpread` is the delay in seconds
+   *  between the first and the last layer. */
+  chaseMode?: 'none' | 'order' | 'leftToRight' | 'radial';
+  chaseSpread?: number;
+  /** Beat reaction, evaluated by the native core every frame (no per-frame
+   *  store writes). Looks use it to sync a stack to the beat. */
+  react?: EdgeEffectReact;
+}
+
+/** How an edge effect answers the beat. `pulse` dims between hits, `boost`
+ *  flares brighter on them, `step` lights one member of the group per beat
+ *  (in the effect's chase order), `strobe` flashes hard on the hit. The
+ *  beat source runs on the launch clock (tapped, typed, detected or Link
+ *  tempo); audio sources fall back to that clock while no audio is live. */
+export interface EdgeEffectReact {
+  mode: 'none' | 'pulse' | 'boost' | 'step' | 'strobe';
+  source: 'beat' | 'kick' | 'snare' | 'bass' | 'level' | 'treble';
+  /** 0..1 depth of the reaction. */
+  amount: number;
+  /** Flash decay speed, 1 = a quarter-beat tail. */
+  decay?: number;
+  /** Beats between neighbours in the group chase (beat source only). */
+  chaseBeats?: number;
+  /** Hue turns added each beat (colour cycling), e.g. 0.25 = four colours. */
+  hueStep?: number;
+}
+
+/** The one-click Look a stack came from, so the gallery can show it as
+ *  active and swap its palette in place. */
+export interface EdgeLookRef {
+  id: string;
+  paletteId: string;
 }
 
 export interface EdgeEffectsConfig {
   enabled: boolean;
   effects: EdgeEffect[];
+  /** Rounds every corner of the outline the stack is drawn on (output px). */
+  cornerRadius?: number;
+  /** Set when the stack was applied from the Looks gallery. */
+  look?: EdgeLookRef;
 }
 
 export const VJ_MIX_SOURCE_INDEX = -1;
@@ -2771,6 +3003,9 @@ export interface Layer {
   // Mask (click-point polygon mask)
   mask: MaskConfig | null;
 
+  // Painted mask (brushed erase/restore strokes in content space)
+  paintMask?: PaintMaskConfig | null;
+
   // Input crop/slice (what portion of the source to use)
   cropRegion: CropRegion | null;
 
@@ -2792,11 +3027,33 @@ export interface Layer {
 
   // Stage Mode: which VJ layer feeds this mapping layer (undefined = use own source, -1 = VJ Mix)
   vjLayerIndex?: number;
+  /** VJ group feed for a mapped slice; independent of physical output routing. */
+  vjGroupId?: string;
 
-  // Stage Designer surfaces use canvas Y-down coordinates while source
-  // textures use UV Y-up coordinates. Set on Stage-generated screen layers
-  // so source orientation remains stable after users rotate or warp them.
+  /** Shared map surface this layer's geometry comes from (see MapSurface).
+   *  Preset layers carry it; editor layers use their own id. */
+  surfaceId?: string;
+  /** True when this layer keeps its own geometry instead of the shared
+   *  surface's. Set by the user ("This preset only") or by migration when an
+   *  older preset's geometry disagreed with the shared map. */
+  surfaceDetached?: boolean;
+
+  // Legacy marker: true means this Stage-generated screen still carries the
+  // Y-down corners Apply Stage wrote before 2026-09-11. migrateStageLayerCorners
+  // converts those to the Y-up convention on load and clears the flag; Apply
+  // Stage writes false.
   stageTextureFlipV?: boolean;
+
+  // ── Deck confidence monitors (native crossfade mode) ───────────────────
+  /** VJ bank tag for the native deck monitors: bank layers composite at
+   *  opacity 0 in the program mix, but the core re-renders tagged layers
+   *  into the Deck A / Deck B monitor targets at their true level. */
+  _deckMonitorBank?: 'a' | 'b';
+  /** True pre-crossfader opacity for the monitor pass. */
+  _deckMonitorOpacity?: number;
+  /** Screen FX colour chase multiplier (r, g, b 0..1), set per frame on the
+   *  native scene copies; never saved. */
+  _stageTint?: [number, number, number];
 
   // ── Group nesting ──────────────────────────────────────────────────────
   /** ID of parent group layer (undefined/null = top-level layer) */
@@ -2821,6 +3078,7 @@ export interface Layer {
 
 // Effect types — 81 curated effects with unique shader implementations
 export type EffectType =
+  | 'cubeLut'
   // ── WebGPU compute / fragment effects ──
   // Names are prefixed `gpu` so the engine can dispatch them via the
   // gpuEffectRunner instead of the regular WebGL effect chain.
@@ -3032,6 +3290,8 @@ export type EffectType =
   | 'donutConstellation';
 
 export interface EffectParams {
+  cubeLut?: import('./color/cubeLut').CubeLut;
+  lutStrength?: number;
   // ── WebGPU Fluid Sim params (gpuFluidSim) ──
   // Real-time Navier-Stokes simulation. The source layer feeds dye
   // (color) + force (luminance gradient) into the fluid; the result
@@ -4635,6 +4895,11 @@ export interface EffectParams {
  * a full Svelte rerender per tick (see autoEngine).
  */
 export interface AutoConfig {
+  /** Free uses speedHz; beat follows the clock; crossfader follows the A/B position. */
+  timing?: 'free' | 'beat' | 'crossfader' | 'clip';
+  cycleBeats?: number;
+  /** Optional curve; older projects keep their linear sweep. */
+  easing?: KeyframeEasing;
   /** Internal sweep counter, 0..1. Advanced by `speedHz × dt` per frame
    *  when `playing` is true. */
   phase: number;
@@ -4709,6 +4974,10 @@ export interface StagePreset {
 // SynthVision Keyboard Clip Assignment
 export interface SVClipAssignment {
   type: 'shader' | 'media';
+  /** Performer keyboard cells belong to the deck that was selected when
+   *  they were assigned. Older presets omit this and intentionally load
+   *  on Deck A. */
+  performerDeck?: 'A' | 'B';
   // Shader fields
   shaderId?: string;
   shaderName?: string;
@@ -4727,6 +4996,10 @@ export interface SVClipAssignment {
    *  the first decoded frame to a data URL at drop time and store it
    *  here so the key shows a still preview instead of an empty tile. */
   mediaThumbnail?: string;
+  /** Durable file identity for the assigned media. `mediaSrc` is a runtime
+   *  URL (usually a blob:) that dies with the session, so without this a
+   *  performer key came back silent after a restart. */
+  _assetRef?: import('./storage/assetRegistry').AssetRef;
 }
 
 // SynthVision Keyboard Preset - Saved keyboard layout with clip assignments
@@ -4775,13 +5048,76 @@ export interface VJDeck {
   transitionDuration?: number;    // Duration of transition in seconds
 }
 
+/**
+ * Composition transition styles the NATIVE renderer actually implements.
+ *
+ * The mechanism is a two-stack per-layer opacity crossfade (see
+ * `renderer/compositionTransitionLayers.ts`): during a transition BOTH
+ * compositions' layers are resident in the scene at once and the core
+ * composites them with time-varying opacity. Only envelopes that per-layer
+ * alpha (plus a blend-mode override) can express are listed here, because
+ * every entry in this union has to look different on screen — a menu of
+ * eleven names that all resolve to the same dissolve is worse than three
+ * that do what they say.
+ *
+ * Anything spatial (wipes, iris, voxelize…) would need the two composites
+ * rendered into separate frames and mixed by a shader; the core has no
+ * "composite this subset of scene layers into a source frame" pass, so
+ * those live on in `TransitionStyle` for project-file compatibility only
+ * and resolve to 'dissolve'.
+ */
+export type CompositionTransitionStyle =
+  | 'dissolve'    // Constant-power crossfade — both stacks visible at once
+  | 'dipToBlack'  // Outgoing falls to nothing by the midpoint, incoming rises after
+  | 'additive';   // Incoming blooms in over the outgoing with an additive blend
+
+/**
+ * LEGACY preset-player transition styles — the WebGL `renderer/engine.ts`
+ * snapshot-crossfade shader registry, which `TransitionType` still aliases.
+ *
+ * This build runs `NATIVE_ENGINE_ONLY`, where `getEngine()` returns null and
+ * none of these shaders ever run. They are kept as a type so project files
+ * and localStorage settings written by older builds still parse; the show
+ * timeline and preset tray both funnel them through
+ * `resolveTransitionStyle()`, which maps every one of them onto the nearest
+ * `CompositionTransitionStyle`.
+ */
+export type TransitionStyle =
+  | 'dissolve'    // Crossfade with subtle radial drift to break the frozen-snapshot feel
+  | 'wipeUp'      // New emerges from bottom, sweeping up
+  | 'wipeDown'    // New emerges from top, sweeping down
+  | 'wipeLeft'    // New sweeps in from right edge
+  | 'wipeRight'   // New sweeps in from left edge
+  | 'wave'        // Sinusoidal vertical wipe (Disney projection-mapping style)
+  | 'iris'        // Circular reveal expanding from center
+  | 'voxelize'    // Pixel-block reveal — chunks flip from snapshot to live
+  | 'warp'        // Snapshot warps outward radially, blending into live
+  | 'explode'     // Snapshot fragments fly outward, live fades in beneath
+  | 'pixelMelt';  // Snapshot drips/melts down per-column, live revealed above
+
+/**
+ * What happens at the junction on a clip's LEFT edge.
+ *
+ * 'cut' is a hard swap. 'fade' / 'crossfade' are the ORIGINAL VJ-timeline
+ * values and the `TransitionStyle` members are the legacy WebGL shader
+ * names; all of them still parse out of old project files and all of them
+ * resolve through `resolveTransitionStyle()` onto a
+ * `CompositionTransitionStyle`, which is what the native renderer runs.
+ */
+export type ClipTransitionIn =
+  | 'cut'
+  | 'fade'
+  | 'crossfade'
+  | CompositionTransitionStyle
+  | TransitionStyle;
+
 // Timeline clip - A composition in the timeline with duration
 export interface TimelineClip {
   id: string;
   compositionId: string;
   startTime: number;     // Start time in seconds
   duration: number;      // Duration in seconds
-  transitionIn?: 'cut' | 'fade' | 'crossfade';   // Transition type
+  transitionIn?: ClipTransitionIn;   // Transition style at this clip's start
   transitionDuration?: number; // Duration of transition in seconds
 }
 
@@ -4792,6 +5128,54 @@ export interface Timeline {
   totalDuration: number;  // Calculated total duration
   isPlaying: boolean;
   currentTime: number;    // Current playback position in seconds
+}
+
+// ═══════════════════════════════════════════════════
+// Show Timeline Types (mapping mode)
+// ═══════════════════════════════════════════════════
+//
+// The show timeline is the mapping-mode arrangement surface: audio files
+// on their own lanes, mapping presets (Compositions) laid out along a
+// single preset lane, one deterministic transport driving both. See
+// src/lib/stores/showTimeline.ts for the transport + evaluation rules.
+
+/** One audio file placed on the show timeline. */
+export interface ShowAudioTrack {
+  id: string;
+  /** Display name — the source filename by default. */
+  name: string;
+  /** Runtime URL (blob: / ghost-asset: / data:). Session-scoped: blanked
+   *  at save whenever `assetRef` can reproduce it on load. */
+  url: string;
+  /** Durable identity of the source file. */
+  assetRef?: import('./storage/assetRegistry').AssetRef;
+  /** Where the track starts on the show timeline, seconds. */
+  startTime: number;
+  /** How much of the show timeline the track occupies, seconds. */
+  duration: number;
+  /** In-point inside the source file, seconds. */
+  offset: number;
+  /** Full decoded length of the source, seconds. 0 = not measured yet. */
+  sourceDuration: number;
+  /** 0..1 per-track level, applied on the clip audio bus. */
+  volume: number;
+  muted: boolean;
+  /** Audio lane row index. Tracks on different lanes may overlap in time
+   *  (that is the point — layering); tracks on the same lane may not. */
+  lane: number;
+  /** Coarse peak envelope for the waveform, 0..255, ~512 buckets over the
+   *  whole source. Persisted so reopening a project doesn't have to decode
+   *  every track again. */
+  peaks?: number[];
+}
+
+/** A mapping preset (Composition) block on the show timeline's preset lane.
+ *  Extends the original VJ-mode TimelineClip shape so the two data models
+ *  stay interchangeable. */
+export interface ShowPresetClip extends TimelineClip {
+  /** Composition name captured when the clip was created, so a clip whose
+   *  composition was later deleted still reads as something in the UI. */
+  label?: string;
 }
 
 // ═══════════════════════════════════════════════════
@@ -4836,7 +5220,7 @@ export interface SequencerConfig {
 // Keyframe Timeline Types
 // ═══════════════════════════════════════════════════
 
-export type KeyframeEasing = 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out' | 'step';
+export type KeyframeEasing = 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out' | 'step' | 'sine' | 'exponential' | 'bounce' | 'elastic';
 
 export interface Keyframe {
   time: number;            // seconds from timeline start
@@ -4872,6 +5256,38 @@ export interface KeyframeTimelineConfig {
 }
 
 // VJ Mode state
+/** The geometry part of a mapped surface: everything that decides WHERE a
+ *  layer lands on the output, and nothing about what it shows. */
+export interface MapSurfaceGeometry {
+  position: Point2D;
+  scale: Point2D;
+  rotation: number;
+  flipH: boolean;
+  flipV: boolean;
+  warpMode: WarpMode;
+  corners: WarpCorners;
+  meshGrid: MeshWarpGrid | null;
+  mask: MaskConfig | null;
+  /** Absent in surfaces saved before painted masks. */
+  paintMask?: PaintMaskConfig | null;
+  cropRegion: CropRegion | null;
+  layerShape: LayerShape | null;
+}
+
+/** One mapped surface of the project's shared map. Presets reference it by
+ *  id (a layer's `surfaceId`, which is the id of the layer it was made
+ *  from), so editing the warp once moves it in every preset. */
+export interface MapSurface {
+  id: string;
+  name: string;
+  geometry: MapSurfaceGeometry;
+  /** VJ MAP Look worn by this surface (its `look` ref names the Look and
+   *  palette). While set, it replaces the Edge Effects of every preset layer
+   *  on this surface, detached ones included, so the Look survives firing
+   *  another preset. Absent when the surface wears no Look. */
+  lookEffects?: EdgeEffectsConfig;
+}
+
 export interface VJModeState {
   enabled: boolean;
   compositions: Composition[];
@@ -4900,10 +5316,17 @@ export interface Project {
   compositions?: Composition[];
   // Stage Mode presets (mapping layouts with VJ layer assignments)
   stagePresets?: StagePreset[];
+  /** Shared map: geometry for every surface a mapping preset uses. Absent on
+   *  projects saved before shared surfaces; importProject migrates those. */
+  mapSurfaces?: MapSurface[];
   /** Active Ghost Stage 3D scene saved with the project file. This is
    *  explicit file persistence only; scratch scene edits are no longer
    *  auto-restored from localStorage on app launch. */
   stage3d?: unknown;
+  /** Mapping-mode show timeline (audio tracks + preset arrangement).
+   *  Save-only, like stage3d / projectionSim: it holds audio AssetRefs and
+   *  must not ride the live state-sync relay. See showTimeline.serialize(). */
+  showTimeline?: unknown;
   // SynthVision keyboard presets (performer mode keyboard assignments)
   svKeyboardPresets?: SVKeyboardPreset[];
   // Stage Designer surfaces: SVG-imported polygon slice layouts.
@@ -4926,6 +5349,10 @@ export interface Project {
   /** Project-scoped LED performance effects shown in VJ mode. */
   wledEffects?: WLEDEffect[];
   wledEffectAutomation?: WLEDEffectAutomation;
+  /** Art-Net / sACN pixel mapping: LED fixtures sampled from the final
+   *  composite and sent as DMX universes. Optional so older projects load
+   *  unchanged. */
+  pixelMap?: PixelMapConfig;
   /** Multi-output slices — saved with the project so a recalled
    *  show restores the operator's full projector / display layout
    *  (master canvas resolution, every slice's crop, blend, color
@@ -4952,6 +5379,8 @@ export interface Project {
  *  graph (settings depends on lots of UI stuff). The migrate function
  *  in settings.ts is the single source of truth for defaults. */
 export interface OutputSliceShape {
+  projectorCalibration?: import('./output/projectorCalibration').ProjectorCalibration;
+  overlapBand?: import('./output/projectorCalibration').OverlapBand;
   id: string;
   name: string;
   enabled: boolean;
@@ -5054,6 +5483,7 @@ export interface WLEDRange {
 }
 
 export interface WLEDGroupMember {
+  /** A WLED controller id, or an Art-Net / sACN pixel-map fixture id. */
   controllerId: string;
   /** Omit to target the controller's entire LED span. */
   rangeId?: string;
@@ -5066,7 +5496,9 @@ export interface WLEDGroup {
 }
 
 export interface WLEDEffectTarget {
+  /** 'all' covers every WLED controller and every pixel-map fixture. */
   mode: 'all' | 'controller' | 'range' | 'group';
+  /** A WLED controller id, or a pixel-map fixture id for mode 'controller'. */
   controllerId?: string;
   rangeId?: string;
   groupId?: string;
@@ -5194,6 +5626,60 @@ export interface WLEDController {
 }
 
 // ═══════════════════════════════════════════════════
+// Art-Net / sACN pixel mapping
+// ═══════════════════════════════════════════════════
+
+export type PixelMapProtocol = 'artnet' | 'sacn';
+export type PixelMapFixtureType = 'strip' | 'matrix' | 'custom';
+/** Channel order on the wire. W is derived as min(R, G, B). */
+export type PixelMapColorOrder =
+  | 'RGB' | 'RBG' | 'GRB' | 'GBR' | 'BRG' | 'BGR'
+  | 'RGBW' | 'GRBW' | 'BRGW' | 'RBGW' | 'WRGB';
+/** Art-Net: unicast to a node or broadcast. sACN: multicast group or unicast. */
+export type PixelMapDelivery = 'unicast' | 'broadcast' | 'multicast';
+
+export interface PixelMapFixture {
+  id: string;
+  name: string;
+  enabled: boolean;
+  type: PixelMapFixtureType;
+  pixelCount: number;
+  colorOrder: PixelMapColorOrder;
+  protocol: PixelMapProtocol;
+  delivery: PixelMapDelivery;
+  /** Node IPv4 address, or the broadcast address for Art-Net broadcast.
+   *  Unused for sACN multicast. */
+  address: string;
+  /** First universe. Art-Net 0-32767, sACN 1-63999. */
+  universe: number;
+  /** First DMX channel, 1-512. Pixels never straddle a universe. */
+  channel: number;
+  /** Region and layout of the composition this fixture samples. The layout
+   *  mode follows `type`. */
+  mapping: WLEDMappingConfig;
+  brightness?: number;
+  gamma?: number;
+  calibration?: WLEDColorCalibration;
+  samplingMode?: WLEDColorSamplingMode;
+  testPattern?: WLEDTestPattern;
+  testColor?: string;
+}
+
+export interface PixelMapConfig {
+  /** Master output switch for every fixture. */
+  enabled: boolean;
+  /** Frames per second, 1-60. */
+  fps: number;
+  /** Send ArtSync after each Art-Net frame so nodes latch together. */
+  artSync: boolean;
+  sacnPriority: number;
+  sacnSourceName: string;
+  /** Stable sACN component identifier (UUID) for this project. */
+  sacnCid: string;
+  fixtures: PixelMapFixture[];
+}
+
+// ═══════════════════════════════════════════════════
 // Stage Designer types
 // ═══════════════════════════════════════════════════
 // A Surface is the projection geometry the user designs in the Stage
@@ -5302,6 +5788,17 @@ export interface StageEffect {
    *  tinting slice content with this color is a follow-up. UI exposes
    *  the picker so the data round-trips with project save. */
   color?: string;
+  /** What the effect drives on each screen. Absent means brightness, the
+   *  only behaviour before colour chases, so saved projects are unchanged. */
+  output?: 'brightness' | 'color' | 'both';
+  /** Colour chases: screens blend from `color2` (rest) to `color` (lit).
+   *  `rainbow` instead walks the hue wheel along the chase order. */
+  colorStyle?: 'two-tone' | 'rainbow';
+  color2?: string;
+  /** Custom chase order: layer ids (Mapping) or slice/layer ids (Stage), in
+   *  the order the user clicked them. Screens not listed follow, in their
+   *  usual order. Absent = the usual order. */
+  order?: string[];
 }
 
 export interface SurfaceSlice {
@@ -5794,12 +6291,14 @@ export function createDefaultLayerShape(type: LayerShapeType = 'rectangle'): Lay
         type,
         enabled: true,
         params: { ...baseParams, radiusX: 1.0, radiusY: 1.0 },
-        // X-style warp controls + center focus handle
+        // Warp quad + center focus handle. Corners start AT the layer bounds
+        // so the initial warp is an identity — content is untouched until a
+        // handle is actually dragged.
         controlPoints: [
-          { x: 0.2, y: 0.8 }, // top-left
-          { x: 0.8, y: 0.8 }, // top-right
-          { x: 0.2, y: 0.2 }, // bottom-left
-          { x: 0.8, y: 0.2 }, // bottom-right
+          { x: 0, y: 1 }, // top-left
+          { x: 1, y: 1 }, // top-right
+          { x: 0, y: 0 }, // bottom-left
+          { x: 1, y: 0 }, // bottom-right
           { x: 0.5, y: 0.5 }, // center focus
         ],
       };
@@ -6001,6 +6500,9 @@ export function convertShapeToCustom(shape: LayerShape): LayerShape {
       feather: shape.params.feather,
       rotation: 0,
       customPoints: points,
+      // Snapshot the outline as authored: dragging vertices later warps the
+      // content smoothly against this base (MadMapper-style content follow).
+      customBasePoints: points.map((point) => ({ ...point })),
       customClosed: true,
     },
   };

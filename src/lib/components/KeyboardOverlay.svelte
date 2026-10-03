@@ -74,7 +74,6 @@
     const explicit = el.dataset.keyboardMode;
     if (isKeyActionMode(explicit)) return explicit;
     if (path.startsWith('vj:stage-effect:') && path.endsWith(':hold')) return 'momentary';
-    if (path.startsWith('vj:led-effect:') && path.endsWith(':hold')) return 'momentary';
     return undefined;
   }
 
@@ -211,7 +210,7 @@
 </script>
 
 {#if $keyboardStore.editMode}
-  <div class="keyboard-overlay-root">
+  <div data-help-page="keyboard-mapping" class="keyboard-overlay-root">
     {#key overlayRevision}
       {#each overlayItems as item (item.path)}
         {#if item.visible}

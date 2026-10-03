@@ -1,6 +1,9 @@
 <script lang="ts">
+  import NdiOutputSettings from './NdiOutputSettings.svelte';
+  import { interfaceScale } from '../stores/interfaceScale';
   import { onMount, onDestroy } from 'svelte';
-  import { settings, getSupportedFormats, COLOR_SCHEMES, CLAUDE_MODELS, GEMINI_MODELS, VEO_MODELS, LUMA_MODELS, DEFAULT_LAYER_SHADERS, type RecordingSettings, type OutputSettings, type ColorSchemeId, type FluidQualityMode, type ShaderQualityMode, type ShaderAIProvider, type VideoAIProvider } from '../stores/settings';
+  import { tooltipsEnabled } from '../help/preferences';
+  import { NATIVE_ENGINE_ONLY, settings, getSupportedFormats, COLOR_SCHEMES, CLAUDE_MODELS, GEMINI_MODELS, VEO_MODELS, LUMA_MODELS, DEFAULT_LAYER_SHADERS, type RecordingSettings, type OutputSettings, type ColorSchemeId, type FluidQualityMode, type ShaderQualityMode, type GpuInstrumentQualityMode, type ShaderAIProvider, type VideoAIProvider } from '../stores/settings';
   // Theme template registry — full visual style swap (fonts + surfaces
   // + corners + accents). See src/lib/theming/themes/.
   import { activeThemeId, themes } from '../theming/store';
@@ -27,8 +30,14 @@
   import { updateInfo } from '../stores/updateChecker';
   import { updateModalOpen } from '../stores/uiState';
   import { project } from '../stores/layers';
+  import {
+    nativeRendererMainDriverGateChecks,
+    nativeRendererModeLabel,
+    nativeRendererRuntime,
+  } from '../stores/nativeRenderer';
   import { checkForUpdate, getCachedVersionResult, type VersionCheckResult } from '../utils/versionCheck';
-  import { openExternalUrl } from '../bridge';
+  import { openExternalUrl, invoke as bridgeInvoke, isElectron as bridgeIsElectron } from '../bridge';
+  import { mergeRecordingCodecAvailability, recordingCodecOption, type RecordingCodecId, type RecordingCodecOption } from '../recording/recordingSources';
 
   // Version-check state for the Settings → Updates section.
   // Reads cached result on mount so the row shows last-known state
@@ -49,22 +58,41 @@
   }
   let isCheckingUpdate = false;
   import { midiStore } from '../midi/midiStore';
+  import ControllerLightsSettings from './ControllerLightsSettings.svelte';
   import { midiManager } from '../midi/midiManager';
+  import {
+    groupMappingsByControl,
+    groupMatchesMessage,
+    describeTarget,
+    type MidiControlGroup,
+  } from '../midi/midiMappingView';
   import { abletonLink } from '../sync/abletonLink';
+  import AbletonLinkMonitor from './AbletonLinkMonitor.svelte';
   import { oscStore } from '../osc/oscStore';
+  import { mcpStore } from '../mcp/mcpStore';
   import { CONTROL_PATH_EXAMPLES, normalizeControlPath, validateControlPath } from '../control/controlPaths';
   import { keyboardStore, formatKeyCombo, type KeyActionMode } from '../keyboard/keyboardStore';
   import WLEDMappingPanel from './WLEDMappingPanel.svelte';
   import WLEDGroupsPanel from './WLEDGroupsPanel.svelte';
-  let keyboardAddOpen = false;
-  let keyboardAddPath = '';
-  let keyboardAddMode: KeyActionMode = 'momentary';
-  let keyboardAddMin = 0;
-  let keyboardAddMax = 1;
-  let keyboardAddStep = 0.05;
+  import PixelMapPanel from './PixelMapPanel.svelte';
+  import DmxInputPanel from './DmxInputPanel.svelte';
+  import ShowControlSettings from './show/ShowControlSettings.svelte';
+
+  // ── MIDI mappings table ──
+  // Grouped by the control rather than by the parameter, because a parameter
+  // holds at most one mapping but a pad can be bound to any number of them,
+  // and "unlearn this pad" is the thing that was impossible before this.
+  $: midiMappingGroups = groupMappingsByControl($midiStore.mappings);
+  let confirmClearMidiMappings = false;
+
+  function clearMidiControl(group: MidiControlGroup) {
+    for (const m of group.mappings) midiStore.removeMappingById(m.id);
+  }
+
+
+  // ── OSC Learn (in-app editor — never browser prompt()) ──
   let oscLearnOpen = false;
   let oscLearnPath = 'vj:0:trigger:0';
-
   function beginOscLearn() {
     oscLearnOpen = true;
     oscLearnPath = 'vj:0:trigger:0';
@@ -77,6 +105,13 @@
       oscLearnOpen = false;
     }
   }
+  let keyboardAddOpen = false;
+  let keyboardAddPath = '';
+  let keyboardAddMode: KeyActionMode = 'momentary';
+  let keyboardAddMin = 0;
+  let keyboardAddMax = 1;
+  let keyboardAddStep = 0.05;
+  $: nativeMainDriverGates = nativeRendererMainDriverGateChecks($nativeRendererRuntime);
 
   function beginKeyboardAdd() {
     keyboardAddOpen = true;
@@ -99,17 +134,23 @@
     keyboardAddOpen = false;
   }
   import MediaPipePanel from './MediaPipePanel.svelte';
+
+  // Desktop recording codecs the bundled FFmpeg can encode (H.264 always).
+  let nativeRecordingCodecs: RecordingCodecOption[] = mergeRecordingCodecAvailability(null);
+  if (NATIVE_ENGINE_ONLY && bridgeIsElectron) {
+    void bridgeInvoke<{ codecs?: Array<{ id: string; available?: boolean; reason?: string }> }>('native_recording_codecs')
+      .then((result) => { nativeRecordingCodecs = mergeRecordingCodecAvailability(result?.codecs ?? null); })
+      .catch(() => {});
+  }
   // LicensePanel + tier-related imports removed — OSS build has no license UI.
   // Multi-Output / per-slice config (createDefaultSlice, maxOutputSlices,
   // OutputCanvasPreview) moved to the Screens tab — see ScreenPanel.svelte.
   import { isDesktopApp, getTextureShareLabel, invoke } from '$lib/bridge';
-  import { getErrorLog, clearErrorLog, type ErrorEntry } from '../utils/errorReporter';
+  import { getErrorLog, clearErrorLog, recordError, type ErrorEntry } from '../utils/errorReporter';
   import { isWebGPUSupported, probeWebGPU, getWebGPUInfo, type WebGPUInfo } from '../renderer/webgpuCapability';
 
-  // GPU Acceleration panel state — populated by the WebGPU capability probe.
-  // We display the adapter info read-only and expose the two production
-  // toggles (editor-side bridge + zero-copy output transport). The probe
-  // is idempotent, so calling it from onMount is cheap on repeat opens.
+  // Renderer panel state. Desktop native builds keep the legacy bridge flags
+  // persisted for migration, but the controls are locked out by policy.
   let webgpuSupported = isWebGPUSupported();
   let webgpuInfo: WebGPUInfo = getWebGPUInfo();
   let webgpuProbing = false;
@@ -124,24 +165,25 @@
     }
   }
 
-  // Snapshot of the experimental GPU flags at the time this settings
+  // Snapshot of the renderer bridge flags at the time this settings
   // panel script first ran. The Electron renderer wires up which
-  // canvas/bridge to mount at boot, so toggling editorWebGPU or
-  // allowMidChainGpuEffects mid-session leaves the engine in a
+  // canvas/bridge to mount at boot, so toggling editorWebGPU or the
+  // legacy GPU effect bridge mid-session leaves the engine in a
   // half-broken state (grid disappears, layers stop receiving frames,
   // etc.). We compare current values against this snapshot to know
   // when a restart is required. Using $settings.experimental directly
   // (not the store wrapper) so the snapshot is a plain object frozen
   // at module-script-eval time.
-  const bootExperimentalGPU = {
+  const bootRendererFlags = {
     editorWebGPU: $settings.experimental?.editorWebGPU ?? true,
     outputZeroCopy: $settings.experimental?.outputZeroCopy ?? true,
-    allowMidChainGpuEffects: $settings.experimental?.allowMidChainGpuEffects ?? true,
+    allowMidChainGpuEffects: $settings.experimental?.allowMidChainGpuEffects ?? false,
   };
-  $: gpuRestartRequired =
-    $settings.experimental?.editorWebGPU !== bootExperimentalGPU.editorWebGPU ||
-    $settings.experimental?.outputZeroCopy !== bootExperimentalGPU.outputZeroCopy ||
-    $settings.experimental?.allowMidChainGpuEffects !== bootExperimentalGPU.allowMidChainGpuEffects;
+  $: gpuRestartRequired = !(NATIVE_ENGINE_ONLY && isDesktopApp) && (
+    $settings.experimental?.editorWebGPU !== bootRendererFlags.editorWebGPU ||
+    $settings.experimental?.outputZeroCopy !== bootRendererFlags.outputZeroCopy ||
+    $settings.experimental?.allowMidChainGpuEffects !== bootRendererFlags.allowMidChainGpuEffects
+  );
 
   let restarting = false;
   async function restartApp() {
@@ -302,10 +344,11 @@
   //     was demoted to a power-user no-op.
   type SectionId =
     | 'app:appearance' | 'app:updates'
-    | 'output:display'
+    | 'output:display' | 'output:ndi'
     | 'performance:gpu' | 'performance:render-quality' | 'performance:video-decoding'
     | 'recording'
-    | 'integrations:midi' | 'integrations:osc' | 'integrations:keyboard' | 'integrations:wled' | 'integrations:mediapipe'
+    | 'integrations:midi' | 'integrations:osc' | 'integrations:keyboard' | 'integrations:wled' | 'integrations:pixelmap' | 'integrations:dmxinput' | 'integrations:mediapipe'
+    | 'show:timecode' | 'show:schedule' | 'show:startup' | 'show:projectors'
     | 'ai';
   interface SidebarSection { id: SectionId; label: string; advanced?: boolean }
   interface SidebarCategory { id: string; label: string; sections: SidebarSection[] }
@@ -319,9 +362,10 @@
       // rotation, blackout, plus Canvas (size/aspect) and Layers
       // (default layer behavior) which used to live under "Project".
       { id: 'output:display', label: 'Display' },
+      { id: 'output:ndi', label: 'NDI Output' },
     ]},
     { id: 'performance', label: 'Performance', sections: [
-      { id: 'performance:gpu', label: 'GPU Acceleration' },
+      { id: 'performance:gpu', label: 'Renderer' },
       { id: 'performance:render-quality', label: 'Render Quality' },
       { id: 'performance:video-decoding', label: 'Video Decoding' },
     ]},
@@ -333,7 +377,17 @@
       { id: 'integrations:osc', label: 'OSC' },
       { id: 'integrations:keyboard', label: 'Keyboard' },
       { id: 'integrations:wled', label: 'WLED' },
+      { id: 'integrations:pixelmap', label: 'Pixel Mapping' },
+      { id: 'integrations:dmxinput', label: 'DMX Input' },
       { id: 'integrations:mediapipe', label: 'MediaPipe' },
+    ]},
+    // Unattended shows: timecode chase, the schedule, start at boot and
+    // PJLink projectors. The cue list itself lives beside the Show timeline.
+    { id: 'show', label: 'Show Control', sections: [
+      { id: 'show:timecode', label: 'Timecode' },
+      { id: 'show:schedule', label: 'Schedule' },
+      { id: 'show:startup', label: 'Start at Boot' },
+      { id: 'show:projectors', label: 'Projectors' },
     ]},
     { id: 'ai', label: 'AI', sections: [
       { id: 'ai', label: 'AI' },
@@ -352,13 +406,19 @@
     osc: 'integrations:osc',
     keyboard: 'integrations:keyboard',
     wled: 'integrations:wled',
+    pixelmap: 'integrations:pixelmap',
+    dmxinput: 'integrations:dmxinput',
     mediapipe: 'integrations:mediapipe',
+    timecode: 'show:timecode',
+    schedule: 'show:schedule',
+    startup: 'show:startup',
+    projectors: 'show:projectors',
     ai: 'ai',
   };
 
   let selectedSection: SectionId = 'app:appearance';
   // Advanced sections are always visible now — the checkbox was hiding
-  // mildly intimidating but useful sections (MediaPipe, GPU Acceleration)
+  // mildly intimidating but useful sections (MediaPipe, Renderer)
   // from users who would have benefited from finding them. Variable kept
   // as a constant so the existing visibility filter below still compiles.
   const showAdvanced = true;
@@ -369,6 +429,57 @@
     }
   } catch { /* ignore */ }
   $: try { localStorage.setItem('ghostarcade-settings-section', selectedSection); } catch { /* */ }
+
+  // Identify mode suppresses MIDI routing, so it must never outlive the view
+  // that explains it is on. Leaving it running would hand someone a dead
+  // controller with nothing on screen saying why.
+  $: if (selectedSection !== 'integrations:midi' && $midiStore.identifyMode) {
+    midiStore.setIdentifyMode(false);
+  }
+  $: if (!isOpen && $midiStore.identifyMode) midiStore.setIdentifyMode(false);
+
+  // A section that throws while rendering used to take the whole panel down:
+  // no boundary, so the error unwound the component and left a black panel
+  // with no sidebar. Worse, the section is persisted above and restored on
+  // open, so the panel reopened straight into the broken section every time,
+  // and a reinstall kept it because user data survives reinstalls.
+  //
+  // Each section now renders inside a boundary. On failure the error goes to
+  // Diagnostics, which is the only place a user can copy it from, and the
+  // saved section is cleared so the next open lands on the default instead
+  // of the thing that just failed.
+  //
+  // The fallback is rendered from this state, as one {#if} beside the
+  // boundary, rather than through the boundary's `failed` snippet. Svelte
+  // builds that snippet in a microtask per error, and a bad value used in
+  // several expressions throws several times in one flush: every call found
+  // no fallback yet to tear down, so they stacked, and reset only cleared the
+  // last one, leaving stale fallbacks on screen beside the recovered section.
+  // Keeping the section alongside the error also stops a fallback following
+  // the user into a different section.
+  let sectionFailure: { section: SectionId; error: unknown; reset: () => void } | null = null;
+
+  function handleSectionError(error: unknown, reset: () => void) {
+    // One failure can arrive as several calls in the same flush; record it once.
+    if (sectionFailure?.section !== selectedSection) {
+      recordError(error, `settings-section:${selectedSection}`);
+      console.error('[Settings] section failed to render:', selectedSection, error);
+    }
+    // Keep the latest reset: each call replaced the boundary's previous state.
+    sectionFailure = { section: selectedSection, error, reset };
+    try { localStorage.removeItem('ghostarcade-settings-section'); } catch { /* */ }
+  }
+
+  function retrySection() {
+    const failure = sectionFailure;
+    sectionFailure = null;
+    failure?.reset();
+  }
+
+  function leaveFailedSection() {
+    sectionFailure = null;
+    selectedSection = 'app:appearance';
+  }
 
   // Is the NDI native addon built + the NDI runtime initialized? Drives
   // the "NDI" option's disabled state in the per-slice transport
@@ -405,6 +516,7 @@
     window.addEventListener('close-settings', handleCloseRequest);
   });
   onDestroy(() => {
+    midiStore.setIdentifyMode(false);
     if (typeof window === 'undefined') return;
     window.removeEventListener('close-settings', handleCloseRequest);
   });
@@ -531,11 +643,26 @@
     { value: 'quality', label: 'Quality (best visuals)' },
   ];
 
+  /*
+   * Labels state the scale the NATIVE core actually renders at, which is what
+   * these now drive. The old 100/75/50/25 described the browser renderer's
+   * scaling, and that path does not run in a native-only build -- the control
+   * had no effect on anything at all. The core's tiers are 1.0 / 0.90 / 0.72 /
+   * 0.56, so the percentages are those and not round numbers.
+   */
   const shaderQualityModes: { value: ShaderQualityMode; label: string }[] = [
-    { value: 'full', label: 'Full (100%)' },
-    { value: 'high', label: 'High (75%)' },
-    { value: 'medium', label: 'Medium (50%)' },
-    { value: 'low', label: 'Low (25%)' },
+    { value: 'full', label: 'Native (100%)' },
+    { value: 'high', label: 'Ultra (90%)' },
+    { value: 'medium', label: 'Balanced (72%)' },
+    { value: 'low', label: 'Performance (56%)' },
+  ];
+
+  const gpuInstrumentQualityModes: { value: GpuInstrumentQualityMode; label: string }[] = [
+    { value: 'auto', label: 'Auto' },
+    { value: 'low', label: 'Performance' },
+    { value: 'balanced', label: 'Balanced' },
+    { value: 'high', label: 'High' },
+    { value: 'ultra', label: 'Ultra' },
   ];
 
   function handleFormatChange(e: Event) {
@@ -551,6 +678,11 @@
   function handleAutoDownloadChange(e: Event) {
     const checked = (e.target as HTMLInputElement).checked;
     settings.setAutoDownload(checked);
+  }
+
+  function handleIncludeAudioChange(e: Event) {
+    const checked = (e.target as HTMLInputElement).checked;
+    settings.setIncludeAudio(checked);
   }
 
   async function handlePickDirectory() {
@@ -584,14 +716,21 @@
 
   function handleShaderQualityChange(e: Event) {
     const value = (e.target as HTMLSelectElement).value as ShaderQualityMode;
+    /* Storing it is the whole job: App.svelte watches this and pushes the
+       matching tier to the native core, on change and at startup. */
     settings.setShaderQuality(value);
+  }
+
+  function handleGpuInstrumentQualityChange(e: Event) {
+    const value = (e.target as HTMLSelectElement).value as GpuInstrumentQualityMode;
+    settings.setGpuInstrumentQuality(value);
   }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
 
 {#if isOpen}
-  <div class="settings-overlay" onclick={handleOverlayClick} role="dialog" aria-modal="true">
+  <div data-help-page="settings" class="settings-overlay" onclick={handleOverlayClick} role="dialog" aria-modal="true">
     <div class="settings-panel">
       <div class="settings-header">
         <h2>Settings</h2>
@@ -650,10 +789,36 @@
           </div>
         {/if}
 
+        {#key selectedSection}
+        <svelte:boundary onerror={handleSectionError}>
         <!-- Appearance Section -->
+        {#if selectedSection === 'output:ndi'}
+          <section class="settings-section"><h3>NDI Output</h3><NdiOutputSettings /></section>
+        {/if}
+
         {#if selectedSection === 'app:appearance'}
         <section class="settings-section">
           <h3>Appearance</h3>
+          {#if isDesktopApp}
+          <div class="setting-row">
+            <div class="setting-label">
+              <label class="label-text" for="interface-scale">Interface size</label>
+              <span class="label-hint">Resize controls and text for your display. Projector output resolution stays unchanged.</span>
+            </div>
+            <select id="interface-scale" value={$interfaceScale} onchange={e => interfaceScale.set(Number(e.currentTarget.value))}>
+              {#each [0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2] as scale}
+                <option value={scale}>{Math.round(scale * 100)}%{scale === 1 ? ' · Default' : ''}</option>
+              {/each}
+            </select>
+          </div>
+          {/if}
+          <div class="setting-row">
+            <div class="setting-label">
+              <label class="label-text" for="tooltips-enabled">Tooltips</label>
+              <span class="label-hint">Show feature explanations and documentation links when hovering or focusing controls.</span>
+            </div>
+            <input id="tooltips-enabled" type="checkbox" checked={$tooltipsEnabled} onchange={e => tooltipsEnabled.set(e.currentTarget.checked)} />
+          </div>
 
           <!-- Theme Templates — a complete style overhaul (fonts,
                surfaces, accents, corner system) vs just an accent
@@ -670,6 +835,7 @@
               <button
                 class="theme-template-card"
                 class:active={$activeThemeId === theme.id}
+                aria-pressed={$activeThemeId === theme.id}
                 onclick={() => activeThemeId.set(theme.id)}
               >
                 <div class="theme-preview" style="
@@ -780,8 +946,8 @@
                drop the snap entirely (free). -->
           <div class="setting-row">
             <div class="setting-label">
-              <span class="label-text">Warp movement granularity</span>
-              <span class="label-hint">Controls mapping-mode mouse snapping and every arrow-key nudge, including corner, whole-layer, and mesh-point movement. Measured in project pixels and independent of editor zoom.</span>
+              <span class="label-text">Warp drag granularity</span>
+              <span class="label-hint">How precise mouse drags are in mapping mode. Snaps to the project's pixel grid (1920×1080 at default), independent of editor zoom. Lower = more precise; "free" disables snap entirely.</span>
             </div>
             <select
               class="port-input"
@@ -941,6 +1107,20 @@
         <section class="settings-section">
           <h3>Recording</h3>
 
+          {#if NATIVE_ENGINE_ONLY && bridgeIsElectron}
+          <div class="setting-row">
+            <div class="setting-label">
+              <span class="label-text">Recording Format</span>
+              <span class="label-hint">File the REC button writes. ProRes 4444 and HAP Alpha keep transparency when recording a layer or the composition. Pick the source from the arrow beside REC.</span>
+            </div>
+            <select value={recordingCodecOption($settings.recording.nativeCodec).id} onchange={(e) => settings.setNativeRecordingCodec((e.currentTarget as HTMLSelectElement).value as RecordingCodecId)}>
+              {#each nativeRecordingCodecs as codec}
+                <option value={codec.id} disabled={!codec.available}>{codec.label}{codec.available ? '' : ' (unavailable)'}</option>
+              {/each}
+            </select>
+          </div>
+          {/if}
+
           <div class="setting-row">
             <div class="setting-label">
               <span class="label-text">Video Format</span>
@@ -965,6 +1145,22 @@
                 <option value={option.value}>{option.label}</option>
               {/each}
             </select>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label">
+              <span class="label-text">Include Audio</span>
+              <span class="label-hint">Record sound with the video: playing clips, mic and system audio. Turn off for a silent video file.</span>
+            </div>
+            <label class="toggle">
+              <input
+                type="checkbox"
+                aria-label="Include audio in recordings"
+                checked={$settings.recording.includeAudio !== false}
+                onchange={handleIncludeAudioChange}
+              />
+              <span class="toggle-slider"></span>
+            </label>
           </div>
 
           <div class="setting-row">
@@ -1036,7 +1232,7 @@
           <div class="setting-row">
             <div class="setting-label">
               <span class="label-text">Shader Quality</span>
-              <span class="label-hint">Default render resolution for shader layers (override per-layer in Layer Panel)</span>
+              <span class="label-hint">Render resolution for shader layers. Native renders at output size; lower tiers render smaller and upscale.</span>
             </div>
             <select value={$settings.ui.shaderQuality} onchange={handleShaderQualityChange}>
               {#each shaderQualityModes as mode}
@@ -1296,13 +1492,9 @@
              next to the rest of the projector calibration tools. Their
              underlying $settings.output.* fields stay in the store so
              any leftover bindings continue to compile cleanly. -->
-        <!-- The standalone "Experimental: WebRTC output transport" toggle
-             that used to live here was removed — WebRTC is the default
-             output transport now (and WebGPU zero-copy supersedes it
-             when GPU acceleration is enabled in Performance → GPU
-             Acceleration). The underlying $settings.experimental.outputWebRTC
-             field is still in the store for the runtime selector but
-             is no longer user-toggleable from the UI. -->
+        <!-- The standalone WebRTC/WebGPU output transport toggles that used
+             to live here are removed in the native branch. Desktop output is
+             the render core's managed output window or unavailable. -->
 
         <!-- Performance Tab — opt-in knobs for users on weaker hardware.
              Defaults match the historical full-quality behaviour. Intro
@@ -1325,15 +1517,16 @@
         </section>
 
         <!-- ─────────────────────────────────────────────────────────────
-             GPU Acceleration — capability + 2 production toggles.
-             Status is read from the cached WebGPU probe; the toggles
-             write directly to $settings.experimental. When WebGPU is
-             unavailable the toggles are disabled and the section
-             explains why so users don't waste time hunting for the
-             effect / layer that disappeared from their picker.
+             Renderer & Output — native renderer is the v2 path. The old
+             transport fields still live in $settings.experimental for
+             migration stability, but native-only desktop builds force them
+             off.
+             When WebGPU is unavailable, WebGPU-specific controls are
+             disabled and the section explains why so users do not waste
+             time hunting for an unavailable effect or output path.
              ───────────────────────────────────────────────────────── -->
         <section class="settings-section">
-          <h3>GPU Acceleration <span style="font-size: 11px; padding: 2px 6px; margin-left: 6px; background: linear-gradient(135deg, #1e3a8a, #7c2d12); color: #fff; border-radius: 3px; vertical-align: middle;">EXPERIMENTAL</span></h3>
+          <h3>Renderer &amp; Output</h3>
           <!-- Restart-required banner. The renderer chooses which canvas
                and effect-chain path to mount at boot, so toggling these
                flags mid-session leaves a broken state (grid disappears,
@@ -1345,7 +1538,7 @@
             <div class="gpu-restart-banner" role="alert">
               <div class="gpu-restart-text">
                 <strong>Restart required.</strong>
-                These GPU settings only take effect on a fresh process —
+                These renderer bridge settings only take effect on a fresh process —
                 the editor will appear broken (no grid, missing frames)
                 until you restart the app.
               </div>
@@ -1376,11 +1569,19 @@
                     <br/><span style="color: #fbbf24;">⚠ Software fallback adapter — performance will be limited.</span>
                   {/if}
                   <br/>
-                  Hardware-accelerated rendering paths are available. The toggles below let you turn the GPU bridge and the zero-copy output transport on or off independently.
+                  {#if NATIVE_ENGINE_ONLY && isDesktopApp}
+                    Native-only mode is locked on. Preview, output, and recording are driven by the Rust/wgpu core; unavailable capabilities stay listed as blockers.
+                  {:else}
+                    Native core output is the v2 target path.
+                  {/if}
                 {:else}
                   {webgpuInfo.failReason ? `Reason: ${webgpuInfo.failReason}.` : 'Your browser/device did not return a WebGPU adapter.'}
                   <br/>
-                  Effects and layers that require WebGPU (e.g. <em>Fluid Sim</em>, the GPU Shader layer) are hidden in the picker so you don't try to add something that won't run. The legacy WebGL pipeline keeps the rest of the app working normally.
+                  {#if NATIVE_ENGINE_ONLY && isDesktopApp}
+                    Browser WebGPU is not used as a fallback in this build. Missing native capabilities are shown as blockers instead.
+                  {:else}
+                    Effects and layers that require WebGPU (e.g. <em>Fluid Sim</em>, the GPU Shader layer) are hidden in the picker so you don't try to add something that won't run.
+                  {/if}
                 {/if}
               </span>
             </div>
@@ -1389,68 +1590,131 @@
             </button>
           </div>
 
-          <div class="setting-row">
+          <div class="setting-row native-runtime-row">
             <div class="setting-label">
-              <span class="label-text">Editor GPU bridge</span>
-              <span class="label-hint">
-                Use the WebGPU + VideoFrame bridge for the editor → output handoff. When off, falls back to the legacy WebGL transport (works everywhere, slightly higher latency, no zero-copy).
-                {#if !webgpuSupported}
-                  <br/><em style="color: #999;">Disabled — requires WebGPU.</em>
+              <span class="label-text">Native runtime</span>
+              <span class="label-hint native-runtime-detail">
+                {nativeRendererModeLabel($nativeRendererRuntime.driverMode)}
+                · {$nativeRendererRuntime.backend ?? 'offline'}
+                {#if $nativeRendererRuntime.adapterName}
+                  · {$nativeRendererRuntime.adapterName}
+                {/if}
+                · graphs {$nativeRendererRuntime.nativeGraphSourceFrameLayers} layer{$nativeRendererRuntime.nativeGraphSourceFrameLayers === 1 ? '' : 's'}
+                / {$nativeRendererRuntime.computeGraphRuns} run{$nativeRendererRuntime.computeGraphRuns === 1 ? '' : 's'}
+                {#if $nativeRendererRuntime.nativeGraphRouteFailures > 0}
+                  <br/>
+                  <span class="native-runtime-warning">
+                    Native graph misses:
+                    {$nativeRendererRuntime.nativeGraphRouteFailures}
+                    {#if $nativeRendererRuntime.nativeGraphRouteSuppressedFailures > 0}
+                      ({$nativeRendererRuntime.nativeGraphRouteSuppressedFailures} suppressed)
+                    {/if}
+                    {#if $nativeRendererRuntime.nativeGraphRouteLastFailure}
+                      · {$nativeRendererRuntime.nativeGraphRouteLastFailure}
+                    {/if}
+                  </span>
+                {:else if $nativeRendererRuntime.nativeGraphSourceFrames}
+                  <br/>Native graph routing clean.
+                {/if}
+                <br/>
+                Native effect passes {$nativeRendererRuntime.nativeEffectCoverageNative}/{$nativeRendererRuntime.nativeEffectCoverageTotal}
+                {#if $nativeRendererRuntime.nativeEffectCoverageMissing > 0}
+                  · {$nativeRendererRuntime.nativeEffectCoverageMissing} pass-eligible not native yet
+                {/if}
+                {#if $nativeRendererRuntime.nativeBlockedLayerCount > 0}
+                  <br/>
+                  <span class="native-runtime-warning">
+                    Native inventory blocked:
+                    {$nativeRendererRuntime.nativeBlockedLayerCount}
+                    layer{$nativeRendererRuntime.nativeBlockedLayerCount === 1 ? '' : 's'}
+                    ({$nativeRendererRuntime.nativeBlockedEffectLayerCount} effect,
+                    {$nativeRendererRuntime.nativeBlockedSourceLayerCount} source)
+                    {#if $nativeRendererRuntime.nativeBlockedLayerLastReason}
+                      · {$nativeRendererRuntime.nativeBlockedLayerLastReason}
+                    {/if}
+                  </span>
                 {/if}
               </span>
             </div>
-            <label class="toggle">
-              <input
-                type="checkbox"
-                checked={$settings.experimental.editorWebGPU}
-                disabled={!webgpuSupported}
-                onchange={(e) => settings.update(s => ({ ...s, experimental: { ...s.experimental, editorWebGPU: (e.target as HTMLInputElement).checked } }))}
-              />
-              <span class="toggle-slider"></span>
-            </label>
+            <span
+              class:ok={$nativeRendererRuntime.fullV2Ready}
+              class:warn={$nativeRendererRuntime.nativeGraphRouteFailures > 0 || !$nativeRendererRuntime.fullV2Ready}
+              class="native-runtime-pill"
+            >
+              {$nativeRendererRuntime.fullV2Ready ? 'Ready' : nativeRendererModeLabel($nativeRendererRuntime.driverMode)}
+            </span>
           </div>
+          <div class="native-runtime-gates" aria-label="Native renderer main-driver readiness gates">
+            {#each nativeMainDriverGates as gate (gate.id)}
+              <div
+                class:ok={gate.ok}
+                class:warn={!gate.ok}
+                class="native-runtime-gate"
+                title={gate.detail}
+              >
+                <span class="native-runtime-gate-state">{gate.ok ? 'OK' : 'WAIT'}</span>
+                <span class="native-runtime-gate-label">{gate.label}</span>
+              </div>
+            {/each}
+          </div>
+          {#if !$nativeRendererRuntime.fullV2Ready && $nativeRendererRuntime.blockers.length > 0}
+            <div class="native-runtime-blockers">
+              Waiting on {$nativeRendererRuntime.blockers.slice(0, 3).join(' · ')}
+              {#if $nativeRendererRuntime.blockers.length > 3}
+                · +{$nativeRendererRuntime.blockers.length - 3} more
+              {/if}
+            </div>
+          {/if}
 
-          <div class="setting-row">
-            <div class="setting-label">
-              <span class="label-text">Zero-copy GPU output</span>
-              <span class="label-hint">
-                Send frames to the output window via WebGPU's <code>importExternalTexture</code> — no encode/decode round trip, true 4K60. Falls back to the legacy WebRTC/Spout transport when off or when WebGPU is unavailable. Apply on next output-window open.
-                {#if !webgpuSupported}
-                  <br/><em style="color: #999;">Disabled — requires WebGPU.</em>
-                {/if}
-              </span>
+          {#if NATIVE_ENGINE_ONLY && isDesktopApp}
+            <div class="setting-row">
+              <div class="setting-label">
+                <span class="label-text">Native engine mode</span>
+                <span class="label-hint">
+                  Locked on for this build. Browser/WebGPU comparison renderers and CPU-readback bridges are disabled; missing renderer capabilities stay visible as native blockers until they are implemented.
+                </span>
+              </div>
+              <span class="native-runtime-pill warn">Native only</span>
             </div>
-            <label class="toggle">
-              <input
-                type="checkbox"
-                checked={$settings.experimental.outputZeroCopy}
-                disabled={!webgpuSupported}
-                onchange={(e) => settings.update(s => ({ ...s, experimental: { ...s.experimental, outputZeroCopy: (e.target as HTMLInputElement).checked } }))}
-              />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
+          {:else}
+            <div class="setting-row">
+              <div class="setting-label">
+                <span class="label-text">Editor frame bridge</span>
+                <span class="label-hint">
+                  Use the WebGPU + VideoFrame bridge for the editor -> renderer handoff.
+                  {#if !webgpuSupported}
+                    <br/><em style="color: #999;">Disabled - requires WebGPU.</em>
+                  {/if}
+                </span>
+              </div>
+              <label class="toggle">
+                <input
+                  type="checkbox"
+                  checked={$settings.experimental.editorWebGPU}
+                  disabled={!webgpuSupported}
+                  onchange={(e) => settings.update(s => ({ ...s, experimental: { ...s.experimental, editorWebGPU: (e.target as HTMLInputElement).checked } }))}
+                />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
 
-          <div class="setting-row">
-            <div class="setting-label">
-              <span class="label-text">Mid-chain GPU effects</span>
-              <span class="label-hint">
-                Allow WebGPU effects (e.g. <em>Fluid Sim</em>) in the middle of a layer's effect chain. Adds a ~3 ms GPU↔CPU round-trip per affected effect; turn off if you're not using GPU effects and want the steady-state path purely WebGL.
-                {#if !webgpuSupported}
-                  <br/><em style="color: #999;">Disabled — requires WebGPU.</em>
-                {/if}
-              </span>
+            <div class="setting-row">
+              <div class="setting-label">
+                <span class="label-text">Native output driver</span>
+                <span class="label-hint">
+                  Use the Rust/wgpu managed output window. Applies on next output-window open.
+                </span>
+              </div>
+              <label class="toggle">
+                <input
+                  type="checkbox"
+                  checked={$settings.experimental.outputNativeCore}
+                  onchange={(e) => settings.update(s => ({ ...s, experimental: { ...s.experimental, outputNativeCore: (e.target as HTMLInputElement).checked } }))}
+                />
+                <span class="toggle-slider"></span>
+              </label>
             </div>
-            <label class="toggle">
-              <input
-                type="checkbox"
-                checked={$settings.experimental.allowMidChainGpuEffects}
-                disabled={!webgpuSupported}
-                onchange={(e) => settings.update(s => ({ ...s, experimental: { ...s.experimental, allowMidChainGpuEffects: (e.target as HTMLInputElement).checked } }))}
-              />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
+          {/if}
         </section>
 
         {/if}
@@ -1460,13 +1724,23 @@
           <div class="setting-row">
             <div class="setting-label">
               <span class="label-text">Shader Quality</span>
-              <span class="label-hint">Internal render resolution for shader layers. Full = native; lower scales then upscales.</span>
+              <span class="label-hint">Internal render resolution for shader layers. Native renders at output size; lower tiers render smaller and upscale.</span>
             </div>
             <select value={$settings.ui.shaderQuality} onchange={handleShaderQualityChange}>
-              <option value="full">Full</option>
-              <option value="high">High (0.75x)</option>
-              <option value="medium">Medium (0.5x)</option>
-              <option value="low">Low (0.25x)</option>
+              {#each shaderQualityModes as mode}
+                <option value={mode.value}>{mode.label}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <span class="label-text">GPU Instrument Budget</span>
+              <span class="label-hint">Caps expensive WebGPU shader internals like particles, volume grids, emitters, and ray steps. Auto adapts live; fixed modes stay stable.</span>
+            </div>
+            <select value={$settings.performance.gpuInstrumentQuality ?? 'auto'} onchange={handleGpuInstrumentQualityChange}>
+              {#each gpuInstrumentQualityModes as mode}
+                <option value={mode.value}>{mode.label}</option>
+              {/each}
             </select>
           </div>
         </section>
@@ -1659,13 +1933,138 @@
               </p>
             </div>
 
+            <!-- Mappings table.
+                 Reported by a user: they had learned a pad onto a parameter
+                 inside a pre-made effect and could not unlearn it without
+                 finding that exact effect and parameter again, and there was
+                 nowhere in the app that listed what was mapped. midiStore has
+                 held removeMappingById and clearAllMappings the whole time;
+                 nothing ever rendered the array.
+
+                 Grouped by control, not by parameter, because that is the
+                 question being asked. A parameter holds one mapping, a pad can
+                 hold many, so "what is this pad doing" is a group and
+                 "unlearn it" is one button. -->
+            <h3 style="margin-top: 18px;">Mappings ({$midiStore.mappings.length})</h3>
+            <p class="settings-hint" style="margin-bottom: 10px;">
+              Everything you have learned, grouped by the pad, key or knob it sits
+              on. Removing a mapping here is the same as clearing it from the
+              parameter itself. Mappings are saved for this machine, not inside the
+              project, so they follow you between projects.
+            </p>
+
+            <div class="setting-row">
+              <div class="setting-label">
+                <span class="label-text">Find a control</span>
+                <span class="label-hint">
+                  Press a pad, key or knob and its mappings are highlighted below.
+                  Nothing is triggered while this is on, so it is safe to press the
+                  one you want to get rid of.
+                </span>
+              </div>
+              <button
+                class="secondary-btn midi-learn-btn"
+                class:active={$midiStore.identifyMode}
+                disabled={$midiStore.mappings.length === 0 || midiDevices.length === 0}
+                onclick={() => midiStore.setIdentifyMode(!$midiStore.identifyMode)}
+              >
+                {$midiStore.identifyMode ? 'Stop finding' : 'Find a control'}
+              </button>
+            </div>
+
+            {#if $midiStore.identifyMode}
+              <div class="mm-identify">
+                <span class="mm-identify-pulse"></span>
+                {#if $midiStore.lastMessage}
+                  Heard <strong>{$midiStore.lastMessage.type === 'note'
+                    ? `Note ${$midiStore.lastMessage.number}`
+                    : $midiStore.lastMessage.type === 'cc'
+                      ? `CC ${$midiStore.lastMessage.number}`
+                      : 'Pitch bend'}</strong>
+                  on channel {$midiStore.lastMessage.channel + 1}
+                {:else}
+                  Waiting for a control. Routing is paused.
+                {/if}
+              </div>
+            {/if}
+
+            {#if $midiStore.mappings.length === 0}
+              <div class="osc-empty">
+                Nothing mapped yet. Turn on MIDI Learn above, click a control in the
+                app, then move something on your controller.
+              </div>
+            {:else}
+              <div class="mm-groups">
+                {#each midiMappingGroups as group (group.key)}
+                  <div
+                    class="mm-group"
+                    class:found={$midiStore.identifyMode && groupMatchesMessage(group, $midiStore.lastMessage)}
+                  >
+                    <div class="mm-group-head">
+                      <span class="mm-control">{group.controlLabel}</span>
+                      <span class="mm-channel">{group.channelLabel}</span>
+                      <span class="mm-count">
+                        {group.mappings.length} mapping{group.mappings.length === 1 ? '' : 's'}
+                      </span>
+                      <button
+                        class="mm-clear"
+                        onclick={() => clearMidiControl(group)}
+                        title="Remove every mapping on this control"
+                      >Clear control</button>
+                    </div>
+
+                    {#each group.mappings as m (m.id)}
+                      {@const target = describeTarget(m.path, m.label, $project)}
+                      <div class="mm-row" class:orphan={target.orphaned}>
+                        <span class="mm-target">
+                          {#if target.context}<span class="mm-context">{target.context}</span>{/if}
+                          <span class="mm-label">{target.label}</span>
+                          {#if target.orphaned}
+                            <span
+                              class="mm-orphan"
+                              title="This effect is not in the project that is open. The mapping still holds the control."
+                            >not in this project</span>
+                          {/if}
+                        </span>
+                        <span class="mm-mode">{m.mode}</span>
+                        <button
+                          class="mm-del"
+                          onclick={() => midiStore.removeMappingById(m.id)}
+                          title="Remove this mapping"
+                        >×</button>
+                      </div>
+                    {/each}
+                  </div>
+                {/each}
+              </div>
+
+              <div class="osc-add-row">
+                {#if confirmClearMidiMappings}
+                  <span class="settings-hint" style="margin: 0;">
+                    Remove all {$midiStore.mappings.length}?
+                  </span>
+                  <button
+                    class="osc-add-btn"
+                    onclick={() => { midiStore.clearAllMappings(); confirmClearMidiMappings = false; }}
+                  >Yes, clear everything</button>
+                  <button class="osc-add-btn" onclick={() => confirmClearMidiMappings = false}>Cancel</button>
+                {:else}
+                  <button class="osc-add-btn" onclick={() => confirmClearMidiMappings = true}>
+                    Clear all mappings
+                  </button>
+                {/if}
+              </div>
+            {/if}
+
+            <ControllerLightsSettings />
+
             <!-- MIDI Clock — sync to / from external transport -->
             <h3 style="margin-top: 18px;">MIDI Clock</h3>
 
             <div class="setting-row">
               <div class="setting-label">
                 <span class="label-text">Receive MIDI Clock</span>
-                <span class="label-hint">Sync BPM from a DAW, drum machine, or other clock master</span>
+                <span class="label-hint">Sync BPM from a DAW, drum machine, or other clock master via the selected input device</span>
               </div>
               <label class="toggle">
                 <input type="checkbox"
@@ -1757,6 +2156,20 @@
                 </div>
                 <span class="clock-status-dot" class:on={$abletonLink.peers > 0}></span>
               </div>
+
+              <!-- Beat / phase readout. Tempo alone was never enough to tell
+                   whether Ghost Arcade was actually following the session's
+                   downbeat; this shows the phase it is acting on. -->
+              <div class="setting-row" style="padding-left: 16px; align-items: flex-start;">
+                <div class="setting-label">
+                  <span class="label-text">Beat</span>
+                  <span class="label-hint">
+                    The highlighted beat should march in time with the music from your
+                    other Link app. Clip launch quantization follows this phase.
+                  </span>
+                </div>
+                <AbletonLinkMonitor />
+              </div>
             {/if}
             {#if $abletonLink.error}
               <div class="setting-row" style="padding-left: 16px;">
@@ -1797,7 +2210,7 @@
                 checked={$oscStore.enabled}
                 onchange={(e) => oscStore.setEnabled((e.target as HTMLInputElement).checked)}
               />
-              <span class="slider"></span>
+              <span class="toggle-slider"></span>
             </label>
           </div>
 
@@ -1813,6 +2226,141 @@
               onchange={(e) => oscStore.setPort(parseInt((e.target as HTMLInputElement).value) || 8000)}
             />
           </div>
+
+          <!-- MCP. Off by default and never auto-enabled: this is an open
+               port that can black out the output mid-show, so switching it on
+               should be a decision, not a convenience. -->
+          <div class="setting-row" style="margin-top: 14px;">
+            <div class="setting-label">
+              <span class="label-text">AI control (MCP)</span>
+              <span class="label-hint">
+                Let an AI client such as Claude Desktop operate Ghost Arcade: fire
+                clips, move faders, launch columns, and look at the output to check
+                the result. Listens on this machine only, and every request needs
+                the token below.
+              </span>
+            </div>
+            <label class="toggle">
+              <input
+                type="checkbox"
+                checked={$mcpStore.enabled}
+                onchange={(e) => mcpStore.setEnabled((e.target as HTMLInputElement).checked)}
+              />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          {#if $mcpStore.enabled}
+            <div class="setting-row">
+              <div class="setting-label">
+                <span class="label-text">Port</span>
+                <span class="label-hint">Bound to 127.0.0.1. Nothing outside this machine can reach it.</span>
+              </div>
+              <input
+                type="number" min="1" max="65535" step="1"
+                class="port-input"
+                value={$mcpStore.port}
+                onchange={(e) => mcpStore.setPort(parseInt((e.target as HTMLInputElement).value) || 7420)}
+              />
+            </div>
+
+            <div class="setting-row">
+              <div class="setting-label">
+                <span class="label-text">Status</span>
+                <span class="label-hint">
+                  {#if $mcpStore.running}
+                    <span class="osc-status-dot listening"></span>
+                    Serving on http://127.0.0.1:{$mcpStore.port}/
+                  {:else if $mcpStore.lastError}
+                    <span class="osc-status-dot error"></span>
+                    {$mcpStore.lastError}
+                  {:else}
+                    <span class="osc-status-dot idle"></span>
+                    Not running
+                  {/if}
+                </span>
+              </div>
+            </div>
+
+            {#if $mcpStore.running && $mcpStore.token}
+              <div class="setting-row">
+                <div class="setting-label">
+                  <span class="label-text">Token</span>
+                  <span class="label-hint">
+                    Send as <code>Authorization: Bearer &lt;token&gt;</code>. A new one is
+                    issued each time this is switched on, so toggling it off and back
+                    on revokes whatever a client is holding.
+                  </span>
+                </div>
+                <button
+                  class="osc-add-btn"
+                  onclick={() => navigator.clipboard?.writeText($mcpStore.token ?? '')}
+                >Copy token</button>
+              </div>
+            {/if}
+
+            {#if $mcpStore.recentCalls.length > 0}
+              <div class="setting-row">
+                <div class="setting-label">
+                  <span class="label-text">Recent calls</span>
+                  <span class="label-hint">
+                    {#each $mcpStore.recentCalls.slice(0, 5) as call (call.seq)}
+                      <span class="mcp-call" class:failed={!call.ok}>{call.name}</span>
+                    {/each}
+                  </span>
+                </div>
+              </div>
+            {/if}
+          {/if}
+
+          <!-- Output / feedback. Receive-only OSC leaves a surface guessing:
+               a fader moved in the app never reaches the hardware. Sending
+               state back is what makes a layout track the app. -->
+          <div class="setting-row">
+            <div class="setting-label">
+              <span class="label-text">Send feedback</span>
+              <span class="label-hint">
+                Mirror app state back to your controller, so faders follow and clip
+                buttons light when their clip is live. Uses the bindings below:
+                whatever address you map, we answer on.
+              </span>
+            </div>
+            <label class="toggle">
+              <input
+                type="checkbox"
+                checked={$oscStore.outputEnabled}
+                onchange={(e) => oscStore.setOutputEnabled((e.target as HTMLInputElement).checked)}
+              />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          {#if $oscStore.outputEnabled}
+            <div class="setting-row">
+              <div class="setting-label">
+                <span class="label-text">Send to</span>
+                <span class="label-hint">
+                  Host and port your controller listens on. 127.0.0.1 for an app on
+                  this machine; use the tablet's IP for TouchOSC over Wi-Fi.
+                </span>
+              </div>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <input
+                  type="text"
+                  class="port-input"
+                  style="width: 120px;"
+                  value={$oscStore.outputHost}
+                  onchange={(e) => oscStore.setOutputTarget((e.target as HTMLInputElement).value, $oscStore.outputPort)}
+                />
+                <input
+                  type="number" min="1" max="65535" step="1"
+                  class="port-input"
+                  value={$oscStore.outputPort}
+                  onchange={(e) => oscStore.setOutputTarget($oscStore.outputHost, parseInt((e.target as HTMLInputElement).value) || 9000)}
+                />
+              </div>
+            </div>
+          {/if}
 
           <!-- Live status row — listening dot + error string. -->
           <div class="setting-row">
@@ -1862,12 +2410,15 @@
             <div>
               <strong>VJ / Pro DJ Link OSC template</strong>
               <p>
-                Installs A/B clip and column triggers for a 4 × 8 deck, plus master,
-                stop-all, and crossfader controls. Send from Beat Link Trigger,
-                Open Beat Control, a DAW, or any OSC controller.
+                Installs A/B clip and column triggers sized to your current deck,
+                plus master, stop-all, and crossfader controls. Send from Beat Link
+                Trigger, Open Beat Control, a DAW, or any OSC controller. Re-run it
+                after adding layers or columns to cover the new cells.
               </p>
               <code>/ghost/vj/a/layer/1/clip/1</code>
               <span>→ Deck A, layer 1, clip 1</span>
+              <code>/ghost/vj/a/column/1</code>
+              <span>→ Deck A, fires column 1 across every layer at once</span>
             </div>
             <button class="osc-add-btn template" onclick={() => oscStore.installVjTemplate()}>
               Install template
@@ -2021,7 +2572,7 @@
         <section class="settings-section">
           <h3>Keyboard Control</h3>
           <p class="settings-hint" style="margin-bottom: 12px;">
-            Map computer-keyboard keys to any control — the same param paths MIDI and OSC use (e.g. <code>vj:column:0</code>, <code>vj:0:opacity</code>). Works with or without a controller plugged in.
+            Map computer-keyboard keys to any control — the same param paths MIDI and OSC use (e.g. <code>vj:column:0</code>, <code>vj:layer:0:opacity</code>). Works with or without a controller plugged in.
           </p>
 
           <div class="setting-row">
@@ -2035,7 +2586,7 @@
                 checked={$keyboardStore.enabled}
                 onchange={(e) => keyboardStore.setEnabled((e.target as HTMLInputElement).checked)}
               />
-              <span class="slider"></span>
+              <span class="toggle-slider"></span>
             </label>
           </div>
 
@@ -2099,7 +2650,7 @@
                     type="text"
                     value={b.path}
                     onchange={(e) => keyboardStore.updateBinding(b.id, { path: (e.target as HTMLInputElement).value })}
-                    placeholder="vj:0:opacity"
+                    placeholder="vj:layer:0:opacity"
                   />
                   <select
                     value={b.mode}
@@ -2194,8 +2745,9 @@
         {#if selectedSection === 'integrations:wled'}
         <section class="settings-section">
           <h3>WLED LED Controllers</h3>
+          <button class="osc-add-btn" onclick={() => openExternalUrl('https://ghostarcade.live/docs/wled')}>WLED setup guide ↗</button>
           <p class="settings-hint" style="margin-bottom: 12px;">
-            Send the final composite to WLED LEDs on your local network. Colors and bright regions are spatially sampled across the image and shipped over UDP at ~60Hz. WLED's default port is 21324; max 490 LEDs per controller for the DRGB protocol.
+            Send the final composite to WLED LEDs on your local network. Colors and bright regions are spatially sampled across the image and shipped over UDP. Native output uses a shared preview stream, targeting 20 updates per second. WLED's default port is 21324; max 490 LEDs per controller for the DRGB protocol.
           </p>
 
           {#if ($project.wledControllers ?? []).length === 0}
@@ -2254,6 +2806,30 @@
         </section>
 
         {/if}
+        <!-- Art-Net / sACN pixel mapping. Fixtures sample regions of the
+             final composite and are sent as DMX universes from the main
+             process. See src/lib/pixelmap/ + electron/pixelmap-output.cjs. -->
+        {#if selectedSection === 'integrations:pixelmap'}
+        <section class="settings-section">
+          <h3>Art-Net and sACN Pixel Mapping</h3>
+          <p class="settings-hint" style="margin-bottom: 12px;">
+            Drive LED fixtures on Art-Net or sACN (E1.31) nodes from the final composite. Each fixture samples a region of the image, like a WLED controller, and is patched across universes automatically: 170 RGB or 128 RGBW pixels per universe, never splitting a pixel. Output runs at the frame rate you set, up to 60 fps. Turning output off, blackout, or disabling a fixture sends one black frame and then stops; sACN streams are terminated cleanly. LED FX from VJ mode (chase, strobe and the rest) run on fixtures too: target a fixture directly, or add it to an LED group below.
+          </p>
+          <PixelMapPanel />
+          <!-- The same LED groups as the WLED section: fixtures join groups
+               here and run LED FX (VJ mode) exactly like WLED controllers. -->
+          <WLEDGroupsPanel />
+        </section>
+        {/if}
+        {#if selectedSection === 'integrations:dmxinput'}
+        <section class="settings-section">
+          <h3>Art-Net and sACN DMX Input</h3>
+          <p class="settings-hint" style="margin-bottom: 12px;">
+            Let a lighting desk drive the show. Ghost Arcade listens for Art-Net (UDP 6454) and sACN (UDP 5568) and binds desk channels to layer opacity, effect parameters, macros, the crossfader, and clip or column triggers. Faders can be 8-bit or 16-bit (coarse and fine), buttons fire on a threshold with hysteresis, and every binding has its own range and invert. Bindings save with the project; the on switch and network settings stay with this machine. Off by default.
+          </p>
+          <DmxInputPanel />
+        </section>
+        {/if}
         <!-- MediaPipe gesture input — runs Hand Landmarker + Gesture
              Recognizer in a worker, maps signals (palm position,
              pinch, canned gestures) to MIDI-style param paths via the
@@ -2265,6 +2841,44 @@
             Use the webcam as a control input. Hand landmarks, pinch distance, palm position, and the canned MediaPipe gestures (open palm, fist, victory, thumb up/down, etc.) become signals that bind to any MIDI-mappable parameter through the same router OSC uses.
           </p>
           <MediaPipePanel />
+        </section>
+        {/if}
+        <!-- Show control: timecode, schedule, start at boot, projectors.
+             See src/lib/show/ and src/lib/components/show/. -->
+        {#if selectedSection === 'show:timecode'}
+        <section class="settings-section">
+          <h3>Timecode</h3>
+          <p class="settings-hint" style="margin-bottom: 12px;">
+            Chase SMPTE timecode from LTC on an audio input or MTC over MIDI. The show timeline follows it and its markers fire their cues; cues with a timecode fire as it passes. Saved with the project.
+          </p>
+          <ShowControlSettings section="timecode" />
+        </section>
+        {/if}
+        {#if selectedSection === 'show:schedule'}
+        <section class="settings-section">
+          <h3>Schedule</h3>
+          <p class="settings-hint" style="margin-bottom: 12px;">
+            Daily or weekly show times with date exceptions. The scheduler fires a cue at each start, stops the cue list at each stop, and can power the projectors. Saved with the project.
+          </p>
+          <ShowControlSettings section="schedule" />
+        </section>
+        {/if}
+        {#if selectedSection === 'show:startup'}
+        <section class="settings-section">
+          <h3>Start at Boot</h3>
+          <p class="settings-hint" style="margin-bottom: 12px;">
+            For installs: start with the computer, open a show and run it without anyone at the machine. These settings belong to this computer, not the project.
+          </p>
+          <ShowControlSettings section="startup" />
+        </section>
+        {/if}
+        {#if selectedSection === 'show:projectors'}
+        <section class="settings-section">
+          <h3>Projectors</h3>
+          <p class="settings-hint" style="margin-bottom: 12px;">
+            PJLink (class 1, TCP 4352) power, shutter and input control with password authentication, and status polling. Cues and the scheduler can command these. Saved with the project.
+          </p>
+          <ShowControlSettings section="projectors" />
         </section>
         {/if}
         <!-- AI Settings Section -->
@@ -2417,6 +3031,28 @@
 
         </section>
         {/if}
+
+        </svelte:boundary>
+
+        {#if sectionFailure && sectionFailure.section === selectedSection}
+          <section class="settings-section settings-section-failed">
+            <h3>This section could not load</h3>
+            <p class="settings-failed-text">
+              Something in this part of Settings failed. Everything else still works,
+              so you can pick another section on the left.
+            </p>
+            <code class="settings-failed-message">{sectionFailure.error instanceof Error ? sectionFailure.error.message : String(sectionFailure.error)}</code>
+            <div class="settings-failed-actions">
+              <button class="osc-add-btn" onclick={retrySection}>Try again</button>
+              <button class="osc-add-btn" onclick={leaveFailedSection}>Go to Appearance</button>
+            </div>
+            <p class="label-hint">
+              The error was saved under Diagnostics at the bottom of this panel, so it can be
+              copied into a bug report.
+            </p>
+          </section>
+        {/if}
+        {/key}
       </div>
       </div><!-- /.settings-body -->
 
@@ -2799,6 +3435,92 @@
     cursor: pointer;
     padding: 0;
   }
+  .native-runtime-row {
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .native-runtime-detail {
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+  .native-runtime-warning {
+    color: #fbbf24;
+  }
+  .native-runtime-pill {
+    flex: 0 0 auto;
+    min-width: 84px;
+    max-width: 140px;
+    padding: 5px 9px;
+    border: 1px solid rgba(251, 191, 36, 0.45);
+    border-radius: 4px;
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.08);
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-align: center;
+    text-transform: uppercase;
+    overflow-wrap: anywhere;
+  }
+  .native-runtime-pill.ok {
+    border-color: rgba(76, 175, 80, 0.45);
+    color: #4caf50;
+    background: rgba(76, 175, 80, 0.08);
+  }
+  .native-runtime-pill.warn {
+    border-color: rgba(251, 191, 36, 0.45);
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.08);
+  }
+  .native-runtime-gates {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 6px;
+    margin: -2px 0 12px;
+    padding: 0 0 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .native-runtime-gate {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    padding: 7px 8px;
+    border: 1px solid rgba(251, 191, 36, 0.28);
+    border-radius: 4px;
+    background: rgba(251, 191, 36, 0.06);
+    color: #fbbf24;
+    font-size: 11px;
+    line-height: 1.2;
+  }
+  .native-runtime-gate.ok {
+    border-color: rgba(76, 175, 80, 0.32);
+    background: rgba(76, 175, 80, 0.07);
+    color: #7ee787;
+  }
+  .native-runtime-gate-state {
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+  }
+  .native-runtime-gate-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .native-runtime-blockers {
+    margin: -4px 0 12px;
+    padding: 8px 10px;
+    border: 1px solid rgba(251, 191, 36, 0.25);
+    border-radius: 4px;
+    background: rgba(251, 191, 36, 0.06);
+    color: #fbbf24;
+    font-size: 11px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
   .select-input {
     background: #1c1c20;
     color: var(--text-primary, #ddd);
@@ -2914,7 +3636,7 @@
     color: var(--text-primary, #ddd);
     border-radius: 4px;
     padding: 5px 8px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 13px;
   }
   .port-input:focus { border-color: #4cd1ff; outline: none; }
@@ -2925,11 +3647,59 @@
     margin-right: 6px;
     vertical-align: middle;
   }
+  /* Names what an agent has been doing, so its work is visible rather than
+     inferred from the output changing on its own. */
+  /* Section render failure. Amber like the other notices in this panel:
+     it reports a problem, it is not an alarm the user caused. */
+  .settings-section-failed {
+    border: 1px solid rgba(255, 176, 0, 0.35);
+    border-radius: 4px;
+    padding: 14px 16px;
+  }
+  .settings-failed-text {
+    margin: 6px 0 10px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #9ca3af;
+  }
+  .settings-failed-message {
+    display: block;
+    margin-bottom: 12px;
+    padding: 8px 10px;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.35);
+    color: #ffb000;
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .settings-failed-actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .mcp-call {
+    display: inline-block;
+    margin: 0 4px 2px 0;
+    padding: 1px 5px;
+    border-radius: 2px;
+    background: rgba(163, 230, 53, 0.12);
+    border: 1px solid rgba(163, 230, 53, 0.3);
+    color: #a3e635;
+    font-size: 9px;
+  }
+  .mcp-call.failed {
+    background: rgba(255, 176, 0, 0.12);
+    border-color: rgba(255, 176, 0, 0.35);
+    color: #ffb000;
+  }
+
   .osc-status-dot.listening { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6); }
   .osc-status-dot.error     { background: #ff5252; }
   .osc-status-dot.idle      { background: #555; }
   .osc-last {
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     color: #b6e8ff;
     font-size: 12px;
     background: rgba(76,209,255,0.06);
@@ -2997,13 +3767,13 @@
     text-transform: uppercase;
     padding: 4px 4px;
   }
-  .osc-binding-row input[type="text"], .osc-binding-row input[type="number"], .osc-binding-row select {
+  .osc-binding-row input[type="text"], .osc-binding-row input[type="number"] {
     background: var(--bg-tertiary, #14141a);
     border: 1px solid #2a2a30;
     color: var(--text-primary, #ddd);
     border-radius: 3px;
     padding: 4px 6px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 12px;
     width: 100%;
   }
@@ -3087,7 +3857,7 @@
     background: var(--bg-tertiary, #14141a);
     border: 1px solid #2a2a30;
     border-radius: 4px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .osc-path-valid, .osc-path-error { font-size: 11px; }
   .osc-path-valid { color: #4ade80; }
@@ -3118,6 +3888,12 @@
   }
   .osc-path-grid button:hover { border-color: #4cd1ff; }
   .osc-path-grid code { color: #4cd1ff; overflow-wrap: anywhere; }
+  .osc-add-btn.learn.active {
+    background: rgba(255,214,102,0.22);
+    border-color: #ffd166;
+    color: #fff;
+    box-shadow: 0 0 12px rgba(255,214,102,0.22);
+  }
   .keyboard-add-bindings { margin-top: 8px; }
   .keyboard-edit-row {
     align-items: center;
@@ -3153,6 +3929,154 @@
     color: var(--text-primary, #ddd);
   }
 
+  /* ── MIDI mappings table ────────────────────────────────────────
+     A block per physical control with its bindings under it, rather than
+     a flat list of parameters: the question people arrive with is "what is
+     this pad doing", and a flat list makes them answer it themselves. */
+  .mm-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .mm-group {
+    border: 1px solid var(--border-subtle, #2a2a2a);
+    border-radius: 4px;
+    overflow: hidden;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+
+  /* The control the user just pressed while finding. */
+  .mm-group.found {
+    border-color: #BB86FC;
+    box-shadow: 0 0 0 1px #BB86FC55;
+  }
+
+  .mm-group-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    background: var(--bg-elevated, #1a1a1a);
+  }
+
+  .mm-control {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    color: var(--text-primary, #ddd);
+    font-weight: 600;
+  }
+
+  .mm-channel,
+  .mm-count {
+    font-size: 11px;
+    color: var(--text-muted, #888);
+  }
+
+  .mm-count {
+    margin-left: auto;
+  }
+
+  .mm-clear,
+  .mm-del {
+    background: none;
+    border: 1px solid var(--border-subtle, #2a2a2a);
+    color: var(--text-muted, #888);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 3px 8px;
+  }
+
+  .mm-clear:hover,
+  .mm-del:hover {
+    color: #ff6b6b;
+    border-color: #ff6b6b55;
+  }
+
+  .mm-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border-top: 1px solid var(--border-subtle, #2a2a2a);
+    font-size: 12px;
+  }
+
+  .mm-target {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .mm-context {
+    color: var(--text-muted, #888);
+  }
+
+  .mm-context::after {
+    content: ' ·';
+  }
+
+  .mm-label {
+    color: var(--text-primary, #ddd);
+  }
+
+  /* The mapping points at an effect that is not in the open project. It
+     still holds the control, which is exactly why it is worth showing. */
+  .mm-orphan {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #e0a458;
+    border: 1px solid #e0a45844;
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+
+  .mm-mode {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted, #888);
+  }
+
+  .mm-del {
+    font-size: 14px;
+    line-height: 1;
+    padding: 1px 7px;
+  }
+
+  /* Routing is paused while this is up, so it says so. */
+  .mm-identify {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    border: 1px solid #BB86FC44;
+    border-radius: 4px;
+    background: #BB86FC11;
+    font-size: 12px;
+    color: var(--text-primary, #ddd);
+  }
+
+  .mm-identify-pulse {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #BB86FC;
+    animation: mm-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes mm-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
+
   .toggle {
     position: relative;
     display: inline-block;
@@ -3166,7 +4090,15 @@
     height: 0;
   }
 
-  .toggle-slider {
+  /* Scoped to .toggle on purpose. These rules are what give the slider its
+     size, and it is absolutely positioned with all four offsets pinned: on a
+     label that is not .toggle (no position, no width) the containing block
+     becomes .settings-overlay and one slider paints an opaque box over the
+     whole window, swallowing every click. That shipped in 2.0.3 as two
+     toggles in the OSC section written with a class that has no CSS, and read
+     as "the OSC tab blanks the app". Requiring the parent makes a stray
+     slider render nothing instead of a full-screen blackout. */
+  .toggle .toggle-slider {
     position: absolute;
     cursor: pointer;
     top: 0;
@@ -3178,7 +4110,7 @@
     border-radius: 26px;
   }
 
-  .toggle-slider::before {
+  .toggle .toggle-slider::before {
     position: absolute;
     content: "";
     height: 20px;
@@ -3445,7 +4377,7 @@
 
   .key-input {
     flex: 1;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     min-width: 120px;
   }
 
@@ -3561,7 +4493,7 @@
     color: var(--text-muted, #888);
     min-width: 32px;
     text-align: right;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
 
   .crop-grid .secondary-btn {
@@ -3762,7 +4694,7 @@
     border-radius: 4px;
     padding: 4px 8px;
     font-size: 13px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .slice-input:focus {
     border-color: rgba(187, 134, 252, 0.4);
@@ -3802,7 +4734,7 @@
   .master-canvas-row .dim-x {
     color: #777;
     margin: 0 -4px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .secondary-btn.small {
     padding: 2px 8px;

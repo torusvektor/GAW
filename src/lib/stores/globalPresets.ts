@@ -74,6 +74,8 @@ function createGlobalStagePresetsStore() {
     rename(id: string, name: string) {
       update(list => list.map(p => p.id === id ? { ...p, name } : p));
     },
+    /** Overwrite an existing global stage preset with new layers/thumbnail.
+     * Keeps the same id + name + createdAt so the UI position is stable. */
     /** Overwrite an existing global preset with a complete Stage snapshot.
      * Keeps identity and list position stable while updating its owned
      * surface, Stage FX, automation, and 3D scene with the layers. */

@@ -16,7 +16,7 @@ const ALLOWED_IPC_COMMANDS = new Set([
   // Spout
   'spout_is_available', 'spout_list_senders', 'spout_start_sender', 'spout_stop_sender',
   'spout_send_frame', 'spout_send_image', 'spout_get_status',
-  'spout_start_receiver', 'spout_stop_receiver', 'spout_receive_frame',
+  'spout_start_receiver', 'spout_stop_receiver', 'spout_receive_frame', 'spout_receive_texture_info',
   'spout_start_osr', 'spout_stop_osr', 'spout_send_shared_texture',
   // Multi-slice zero-copy senders (atlas OSR + native fan-out).
   // slice-atlas window publishes its packed layout here; main (re)builds
@@ -32,7 +32,7 @@ const ALLOWED_IPC_COMMANDS = new Set([
   // operator had no visible signal that zero-copy was off.
   'spout_osr_ready', 'spout_osr_resize',
   // Display/window
-  'get_displays', 'get_output_display_info',
+  'get_displays', 'get_output_display_info', 'set_interface_scale',
   'create_output_window', 'configure_next_output_window',
   'close_output_window', 'move_output_window',
   'resize_output_window', 'show_main_window',
@@ -46,6 +46,9 @@ const ALLOWED_IPC_COMMANDS = new Set([
   // SRC tab Capture chooser — enumerates screens + app windows
   // with thumbnails so the renderer can show a Zoom/Slack-style picker.
   'screen_sources_list',
+  'native_live_capture_available', 'native_live_capture_list_cameras',
+  'native_live_capture_start_camera', 'native_live_capture_start_screen',
+  'native_live_capture_stop', 'native_live_capture_texture_info',
   // License
   'license_get_status', 'license_activate', 'license_deactivate', 'license_validate_online',
   // HTTP proxy
@@ -56,7 +59,10 @@ const ALLOWED_IPC_COMMANDS = new Set([
   'save_shader_source', 'list_shader_sources', 'delete_shader_source',
   // File system
   'pick_directory', 'save_file_binary', 'save_file_bytes', 'save_file_text', 'save_project_dialog',
-  'jpeg_sequence_start', 'jpeg_sequence_write_frame', 'jpeg_sequence_finish', 'jpeg_sequence_cancel',
+  'jpeg_sequence_start', 'jpeg_sequence_write_frame', 'jpeg_sequence_write_frame_file', 'jpeg_sequence_finish', 'jpeg_sequence_cancel',
+  // Native frame encoders — offline render + native live REC
+  'mp4_frame_encoder_live_control', 'mp4_frame_encoder_capture_live', 'mp4_frame_encoder_start', 'mp4_frame_encoder_write_frame', 'mp4_frame_encoder_write_frame_file', 'mp4_frame_encoder_finish', 'mp4_frame_encoder_cancel',
+  'jpeg_frame_encoder_start', 'jpeg_frame_encoder_encode_file', 'jpeg_frame_encoder_finish', 'jpeg_frame_encoder_cancel',
   'save_generated_asset',
   'video_loop_create', 'video_append_segment',
   // Native FFmpeg converter
@@ -66,6 +72,8 @@ const ALLOWED_IPC_COMMANDS = new Set([
   // destination path without round-tripping its bytes through base64+IPC.
   // Saves seconds per gigabyte over save_file_binary for large videos/.glb.
   'copy_file_to_project',
+  'project_media_scan', 'project_media_relink', 'project_media_collect',
+  'inspect_video_import',
   'open_project_dialog',
   'download_demo_zip', 'read_project_file',
   // Update installer download + launch
@@ -75,16 +83,16 @@ const ALLOWED_IPC_COMMANDS = new Set([
   // Output window controls
   'output_toggle_fullscreen',
   'output_fullscreen_external',
-  'output_window_status',
   'output_set_cursor',
   // Per-slice multi-output windows (Phase 2 multi-output system)
   'output_open_slice_window',
   'output_close_slice_window',
   'output_list_slice_windows',
+  'slice_native_presentation_state',
   // Ping
   'ping',
-  // Restart the app — used when experimental flags (renderer / GPU
-  // settings) need a fresh process to take effect.
+  // Restart the app — used when renderer / GPU settings need a fresh
+  // process to take effect.
   'app_relaunch',
   // Error reporting
   'report_error',
@@ -94,15 +102,79 @@ const ALLOWED_IPC_COMMANDS = new Set([
   'http_fetch_stream',
   // License machine ID
   'license_get_machine_id',
-  // Native renderer stubs
+  // Native renderer process bridge
+  'native_renderer_audio_devices', 'native_renderer_audio_status', 'native_renderer_audio_output', 'native_renderer_audio_scope',
+  'native_renderer_audio_tap_start', 'native_renderer_audio_tap_stop',
   'native_renderer_start', 'native_renderer_stop', 'native_renderer_submit_batch',
-  'native_renderer_submit_commands', 'native_renderer_upload_source_gpu_shared_texture',
-  'native_renderer_prefetch_media', 'native_renderer_set_decode_policy',
+  'native_renderer_submit_commands', 'native_renderer_run_compute_graph',
+  'native_renderer_schedule_launch', 'native_renderer_cancel_launch', 'native_renderer_launch_status',
+  'native_renderer_upload_source_gpu_shared_texture',
+  // Offscreen hosts for three.js / p5.js sources (js-source-host.js)
+  'js_source_open', 'js_source_close', 'js_source_params', 'js_source_audio', 'js_source_status',
+  'js_source_thumbnail',
+  'native_renderer_prefetch_media', 'native_renderer_clear_prefetch_cache',
+  'native_renderer_clear_decode_preview_cache', 'native_renderer_clear_runtime_caches',
+  'native_renderer_set_vram_budget', 'native_renderer_set_target_fps',
+  'native_renderer_set_render_clock',
+  'native_renderer_set_command_drain_policy', 'native_renderer_set_auto_present_policy',
+  'native_renderer_set_decode_cpu_backup_policy',
+  'native_renderer_set_decode_synthetic_fallback_policy',
+  'native_renderer_set_texture_pool_cap', 'native_renderer_set_shader_precompile_policy',
+  'native_renderer_set_native_quality_policy',
+  'native_renderer_set_media_prefetch_policy', 'native_renderer_set_media_drop_policy',
+  'native_renderer_set_decode_preview_policy', 'native_renderer_set_decode_target_policy',
+  'native_renderer_set_decode_upload_policy', 'native_renderer_set_decode_handoff_policy',
+  'native_renderer_set_decode_estimate_cache_policy', 'native_renderer_set_present_policy',
+  'native_renderer_set_metadata_cache_caps', 'native_renderer_attach_output_window',
+  'native_renderer_detach_output_window', 'native_renderer_get_status',
+  'native_renderer_get_layers_snapshot',
+  'native_renderer_capture_layer_source_frame',
+  'native_renderer_get_layer_source_readiness',
+  'native_renderer_get_source_frame_readiness',
+  'native_renderer_release_source_frame',
+  'native_renderer_get_stats', 'native_renderer_get_snapshot',
+	  'native_renderer_get_frame_snapshot',
+	  'native_renderer_export_frame_snapshot',
+	  'native_renderer_get_output_shared_texture',
+	  'native_renderer_get_output_shared_texture_snapshot',
+	  'native_renderer_set_stage3d_scene',
+  'native_renderer_get_stage3d_scene_summary',
+  'native_renderer_set_projection_sim_scene',
+  'native_renderer_get_projection_sim_scene_summary',
+  'native_renderer_set_projection_sim_meshes',
+  'native_renderer_set_projection_sim_view',
+  'native_renderer_set_projection_sim_overlay',
+  'native_renderer_projection_sim_view_snapshot',
+  'native_renderer_get_capabilities',
+  'native_renderer_get_readiness_report', 'native_renderer_export_snapshot_json',
+  'native_renderer_reset_stats', 'native_renderer_set_decode_policy',
+  'native_renderer_set_prefetch_policy', 'native_renderer_get_decode_capabilities',
+  'native_renderer_set_output_window',
+  'native_preview_attach', 'native_preview_update', 'native_preview_set_overlay', 'native_preview_detach',
+  'native_preview_get_status',
+  // Deck A/B confidence monitors — named presenter views beside Program
+  'deck_monitor_attach', 'deck_monitor_detach',
+  // Native output live recording — main-process IOSurface capture
+  'native_output_recording_start', 'native_recording_mux_audio', 'native_output_recording_stop',
+  'native_recording_codecs', 'native_renderer_set_record_target', 'native_renderer_get_record_target_state',
+  'native_renderer_get_slice_output_state',
+  'native_viewport_set_layer_interaction',
   // WLED — UDP DRGB packets to LED controllers on the LAN
   'wled_send_frame', 'wled_close_socket',
+  // Art-Net / sACN pixel mapping — DMX universes over UDP
+  'pixelmap_send_frame', 'pixelmap_stop', 'pixelmap_get_stats',
+  // PJLink projector control — power, shutter, input and status over TCP 4352
+  'pjlink_command', 'pjlink_set_password', 'pjlink_has_password',
+  // Start at boot / show mode (launch at login, startup project, prompts)
+  'show_startup_get', 'show_startup_set',
   // Ableton Link — LAN tempo/beat sync (session lives in main; the
   // renderer polls state and bridges tempo into the master BPM).
   'link_enable', 'link_disable', 'link_set_tempo', 'link_get_state',
+  // Window controls for the frameless editor. The transparent BrowserWindow
+  // that the native preview underlay requires has no OS title bar on
+  // Windows/Linux, so the toolbar drives min/maximize/close over IPC.
+  'win_minimize', 'win_maximize_toggle', 'win_is_maximized', 'win_close',
+  'win_drag_start', 'win_drag_end',
 ]);
 
 // Expose a bridge that mirrors Tauri's invoke() API
@@ -123,7 +195,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * Returns a cleanup function that removes the listener.
    */
   on: (channel, callback) => {
-    const allowed = ['director-stream-chunk', 'director-stream-end', 'demo-download-progress', 'update-download-progress', 'spout-osr-status', 'texshare-atlas-status', 'stage3d-fullscreen-changed', 'projection-sim-fullscreen-changed', 'video-converter-progress', 'video-loop-progress'];
+    const allowed = ['app-before-quit', 'director-stream-chunk', 'director-stream-end', 'demo-download-progress', 'update-download-progress', 'spout-osr-status', 'texshare-atlas-status', 'stage3d-fullscreen-changed', 'projection-sim-fullscreen-changed', 'sim-window-moved', 'video-converter-progress', 'video-loop-progress'];
     if (!allowed.includes(channel)) return () => {};
     const handler = (_event, ...args) => callback(...args);
     ipcRenderer.on(channel, handler);
@@ -186,6 +258,15 @@ contextBridge.exposeInMainWorld('ghostNDI', {
   createReceiver: (sourceName) => ipcRenderer.invoke('ndi_create_receiver', { sourceName }),
   destroyReceiver: (sourceName) => ipcRenderer.invoke('ndi_destroy_receiver', { sourceName }),
   receiveFrame: (sourceName) => ipcRenderer.invoke('ndi_receive_frame', { sourceName }),
+  receiveTextureInfo: (sourceName) => ipcRenderer.invoke('ndi_receive_texture_info', { sourceName }),
+  // Composite output pump — main process streams the native renderer's
+  // full-frame composite over NDI (no per-frame IPC from the renderer).
+  //   outputStart({ name, fps? }) → { ok, active, name?, fps?, reason? }
+  //   outputStop() → { ok }
+  //   outputStatus() → { available, active, name, fps, reason? }
+  outputStart: (opts) => ipcRenderer.invoke('ndi_output_start', opts || {}),
+  outputStop: () => ipcRenderer.invoke('ndi_output_stop'),
+  outputStatus: () => ipcRenderer.invoke('ndi_output_status'),
 });
 
 // OSC (Open Sound Control) UDP listener bridge.
@@ -200,6 +281,12 @@ contextBridge.exposeInMainWorld('ghostOSC', {
   start: ({ port } = {}) => ipcRenderer.invoke('osc_start', { port }),
   stop: () => ipcRenderer.invoke('osc_stop'),
   status: () => ipcRenderer.invoke('osc_status'),
+  //   send({ host, port, messages }) → pushes feedback out to a control
+  //     surface. Batched: one call per burst of state changes, not per value.
+  //   stopSending() → closes the shared send socket.
+  send: ({ host, port, messages } = {}) =>
+    ipcRenderer.invoke('osc_send', { host, port, messages }),
+  stopSending: () => ipcRenderer.invoke('osc_send_stop'),
   onMessage: (cb) => {
     const handler = (_e, msgs) => { try { cb(msgs); } catch (err) { console.warn('[OSC] renderer handler', err); } };
     ipcRenderer.on('osc-msg', handler);
@@ -210,6 +297,64 @@ contextBridge.exposeInMainWorld('ghostOSC', {
     ipcRenderer.on('osc-status', handler);
     return () => ipcRenderer.removeListener('osc-status', handler);
   },
+});
+
+// Art-Net / sACN DMX input. Off until start() is called.
+//   start(config) → { ok, error?, status }  (bindAddress, artnet, sacn,
+//     sacnMulticast, universes, mergeMode, timeoutMs, rateHz)
+//   update(patch) → merge rule, timeout and rate without reopening sockets.
+//   onChanges(cb) → cb({ universes: [{ protocol, universe, changes }] }),
+//     where changes is [channelIndex, value, ...] for changed channels only.
+contextBridge.exposeInMainWorld('ghostDMX', {
+  start: (config) => ipcRenderer.invoke('dmx_input_start', config || {}),
+  stop: () => ipcRenderer.invoke('dmx_input_stop'),
+  update: (patch) => ipcRenderer.invoke('dmx_input_update', patch || {}),
+  status: () => ipcRenderer.invoke('dmx_input_status'),
+  resync: () => ipcRenderer.invoke('dmx_input_resync'),
+  snapshot: (target) => ipcRenderer.invoke('dmx_input_snapshot', target || {}),
+  onChanges: (cb) => {
+    const handler = (_e, batch) => { try { cb(batch); } catch (err) { console.warn('[DMX in] renderer handler', err); } };
+    ipcRenderer.on('dmx-input-changes', handler);
+    return () => ipcRenderer.removeListener('dmx-input-changes', handler);
+  },
+  onStatus: (cb) => {
+    const handler = (_e, status) => { try { cb(status); } catch (err) { console.warn('[DMX in] renderer status handler', err); } };
+    ipcRenderer.on('dmx-input-status', handler);
+    return () => ipcRenderer.removeListener('dmx-input-status', handler);
+  },
+});
+
+// LAN remote pairing. info() → { token, wsPort, httpPort }; reset() issues a
+// new token, which disconnects and unpairs every phone, and returns the same.
+contextBridge.exposeInMainWorld('ghostRemote', {
+  info: () => ipcRenderer.invoke('remote_pairing_info'),
+  reset: () => ipcRenderer.invoke('remote_pairing_reset'),
+});
+
+// MCP bridge. The server lives in main (it owns the socket); tools run here
+// (the renderer owns the stores), so main forwards each call and waits for
+// the reply this exposes.
+contextBridge.exposeInMainWorld('ghostMCP', {
+  start: ({ port } = {}) => ipcRenderer.invoke('mcp_start', { port }),
+  stop: () => ipcRenderer.invoke('mcp_stop'),
+  status: () => ipcRenderer.invoke('mcp_status'),
+  /** Register the tool executor. Returns an unsubscribe. */
+  onToolCall: (cb) => {
+    const handler = (_e, payload) => {
+      try { cb(payload); } catch (err) {
+        // A throwing executor must still answer, or the client hangs until
+        // the call times out with no explanation.
+        ipcRenderer.send('mcp-tool-result', {
+          callId: payload?.callId,
+          error: err?.message || String(err),
+        });
+      }
+    };
+    ipcRenderer.on('mcp-tool-call', handler);
+    return () => ipcRenderer.removeListener('mcp-tool-call', handler);
+  },
+  respond: ({ callId, result, error }) =>
+    ipcRenderer.send('mcp-tool-result', { callId, result, error }),
 });
 
 // OSR zero-copy status events from main process
@@ -234,6 +379,17 @@ contextBridge.exposeInMainWorld('electronOSR', {
 // designed. Main process configures the resulting BrowserWindow via
 // setWindowOpenHandler. See outputSharedTexturePresenter.ts and
 // OutputSharedTextureDisplayApp.svelte for the renderer-side glue.)
+
+// Show mode for THIS launch, read synchronously so the renderer can skip
+// its first-run prompts before it draws anything. Main-window only: output
+// and helper windows have no prompts to suppress.
+try {
+  const isHelperWindow = typeof window !== 'undefined' && /[?&]mode=/.test(window.location.search);
+  const startup = isHelperWindow ? null : ipcRenderer.sendSync('show_startup_session');
+  contextBridge.exposeInMainWorld('ghostShowStartup', { session: startup || null });
+} catch {
+  contextBridge.exposeInMainWorld('ghostShowStartup', { session: null });
+}
 
 // Also set a detection flag (replaces __TAURI_INTERNALS__)
 contextBridge.exposeInMainWorld('__ELECTRON__', true);

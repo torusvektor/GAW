@@ -12,8 +12,9 @@
  * STAGE 3D VIEWPORT, which renders to the default framebuffer with
  * preserveDrawingBuffer:false. Stage3DRenderer.captureFrame() reads
  * the framebuffer synchronously right after the scene render — the
- * only reliable window — and hands back top-down RGBA for the same
- * JPEG → FFmpeg → libx264 path.
+ * only reliable window — and hands back top-down RGBA. Electron streams
+ * those frames directly to native FFmpeg; browser fallback still uses
+ * JPEG intermediates before libx264.
  *
  * Runs in the Stage 3D pop-out window (the only window that has both
  * the layer engine AND the live Stage3DRenderer).
@@ -25,6 +26,7 @@ import {
   formatErr,
   downloadBlob,
   thumbnailFromBlob,
+  thumbnailFromVideoUrl,
   offlineRender,
   getOfflineSegmentFrameCount,
   encodeOfflineJpegSegment,
@@ -37,25 +39,42 @@ import {
   writeNativeJpegSequenceFrame,
   finishNativeJpegSequence,
   cancelNativeJpegSequence,
+  startNativeMp4FrameEncoder,
+  writeNativeMp4Frame,
+  writeNativeRendererJpegSequenceFrame,
+  writeNativeRendererMp4Frame,
+  finishNativeMp4FrameEncoder,
+  cancelNativeMp4FrameEncoder,
   frameSequenceManifest,
   frameSequenceBaseName,
   describeFrameTarget,
   type FrameSequenceTarget,
   type NativeJpegSequenceSession,
+  type NativeMp4FrameEncoderSession,
 } from './offlineRender';
 import { setISFManualTime } from '../isf/renderer';
 import { setStageEffectsManualTime } from '../stores/stageEffects';
 import { keyframeTimeline } from '../stores/keyframeTimeline';
 import { layerSequencer } from '../stores/layerSequencer';
 import { vjLayerSequencer } from '../stores/vjLayerSequencer';
+import { showTimeline } from '../stores/showTimeline';
+import { project } from '../stores/layers';
 import { mediaLibrary } from '../stores/media';
 import { generateUUID } from '../utils/uuid';
-import { createAssetRefFromGeneratedBlob } from '../storage/assetRegistry';
+import { createAssetRefFromGeneratedBlob, pathToFileUrl, type AssetRef } from '../storage/assetRegistry';
+import { isElectron } from '../bridge';
+import {
+  getNativeRendererCapabilities,
+  getNativeRendererStatus,
+  setNativeRendererStage3DScene,
+  submitNativeRendererCommands,
+} from '../api/native-renderer';
 import { stage3DRendererControls, stage3dScene } from '../stage3d/store';
 import {
   evaluateShotCamera, sequenceDuration, shotAtTime,
   type DemoShot, type DemoReelSettings,
 } from '../stage3d/demoReel';
+import { buildNativeStage3DScene } from '../stage3d/nativeSceneBridge';
 
 export type ReelRenderStatus =
   | 'idle' | 'choosing-folder' | 'loading-ffmpeg' | 'rendering' | 'encoding' | 'saving'
@@ -91,9 +110,8 @@ function nextFrame(): Promise<void> {
   return new Promise(resolve => requestAnimationFrame(() => resolve()));
 }
 
-/** RGBA (top-down) → JPEG bytes via a scratch 2D canvas. Same
- *  heap-budget reasoning as the 2D pipeline: raw RGBA would OOM the
- *  ffmpeg wasm FS on any non-trivial reel. */
+/** Browser fallback only: RGBA (top-down) → JPEG bytes via a scratch
+ *  2D canvas. Electron streams raw RGBA directly into native FFmpeg. */
 let scratch: HTMLCanvasElement | null = null;
 let scratchCtx: CanvasRenderingContext2D | null = null;
 type CapturedFrame = { data: Uint8Array; width: number; height: number };
@@ -180,6 +198,10 @@ function blendFrames(a: CapturedFrame, b: CapturedFrame, amount: number): Captur
   return { data: out, width: a.width, height: a.height };
 }
 
+function nativePixelFormatForOutput(format: string | null | undefined): 'rgba' | 'bgra' {
+  return /bgra/i.test(String(format ?? '')) ? 'bgra' : 'rgba';
+}
+
 interface ShotSpan {
   index: number;
   shot: DemoShot;
@@ -243,10 +265,11 @@ function createReelRenderStore() {
     const durationSeconds = sequenceDuration(shots);
     const totalFrames = Math.max(1, Math.round(durationSeconds * settings.fps));
     const outputMode = settings.outputMode ?? 'mp4';
+    const useNativeMp4Encoder = outputMode === 'mp4' && isElectron;
     cancelRequested = false;
     set({
       ...INITIAL,
-      status: outputMode === 'frames' ? 'choosing-folder' : 'loading-ffmpeg',
+      status: outputMode === 'frames' ? 'choosing-folder' : (useNativeMp4Encoder ? 'rendering' : 'loading-ffmpeg'),
       totalFrames,
       startedAtMs: performance.now(),
     });
@@ -261,7 +284,13 @@ function createReelRenderStore() {
     let ffmpeg: Awaited<ReturnType<typeof loadFFmpeg>> | null = null;
     let frameTarget: FrameSequenceTarget | null = null;
     let nativeJpegSequence: NativeJpegSequenceSession | null = null;
+    let nativeMp4FrameEncoder: NativeMp4FrameEncoderSession | null = null;
     let nativeJpegSequenceFinished = false;
+    let nativeMp4FrameEncoderFinished = false;
+    let nativeStageCaptureActive = false;
+    let nativeOutputNeedsRestore = false;
+    let nativeCapturePixelFormat: 'rgba' | 'bgra' = 'rgba';
+    const nativeStageCaptureEligible = isElectron && (settings.transition ?? 'cut') !== 'cross-dissolve';
     const frameBaseName = frameSequenceBaseName(settings.filename, 'stage-reel');
     if (outputMode === 'frames') {
       try {
@@ -271,7 +300,7 @@ function createReelRenderStore() {
         setStatus('error', formatErr(err));
         return false;
       }
-    } else {
+    } else if (!useNativeMp4Encoder) {
       try {
         ffmpeg = await loadFFmpeg();
       } catch (err) {
@@ -284,7 +313,7 @@ function createReelRenderStore() {
     setStatus('rendering');
     let lastShotIndex = -1;
     const spans = shotTimeline(shots);
-    const segmentFrameCount = outputMode === 'frames'
+    const segmentFrameCount = outputMode === 'frames' || useNativeMp4Encoder
       ? totalFrames
       : getOfflineSegmentFrameCount(settings);
     const segmentNames: string[] = [];
@@ -296,10 +325,50 @@ function createReelRenderStore() {
       engine.resize(settings.width, settings.height);
       canvas.width = settings.width;
       canvas.height = settings.height;
+      if (nativeStageCaptureEligible) {
+        try {
+          const caps = await getNativeRendererCapabilities();
+          const canCaptureNativeStage = !!(
+            caps?.core_capabilities_confirmed &&
+            caps?.features?.frame_snapshot_export &&
+            caps?.features?.native_frame_export &&
+            caps?.features?.native_stage3d &&
+            caps?.features?.native_stage3d_recording_parity &&
+            caps?.implemented_methods?.includes('export_frame_snapshot') &&
+            caps?.implemented_methods?.includes('set_stage3d_scene')
+          );
+          if (canCaptureNativeStage) {
+            await submitNativeRendererCommands([
+              { type: 'set_output', width: settings.width, height: settings.height, refresh_hz: settings.fps },
+            ]);
+            nativeOutputNeedsRestore = true;
+            const nativeStatus = await getNativeRendererStatus().catch(() => null);
+            nativeCapturePixelFormat = nativePixelFormatForOutput(nativeStatus?.output_format);
+            nativeStageCaptureActive = true;
+          }
+        } catch (err) {
+          console.warn('[stageReelRender] native Stage3D capture unavailable; using live viewport capture:', err);
+          nativeStageCaptureActive = false;
+        }
+      }
       if (outputMode === 'frames' && frameTarget) {
-        nativeJpegSequence = await startNativeJpegSequence(frameTarget, settings, frameBaseName, totalFrames);
+        nativeJpegSequence = await startNativeJpegSequence(
+          frameTarget,
+          settings,
+          frameBaseName,
+          totalFrames,
+          nativeStageCaptureActive ? nativeCapturePixelFormat : 'rgba',
+        );
+        if (nativeStageCaptureActive && !nativeJpegSequence) nativeStageCaptureActive = false;
+      } else if (outputMode === 'mp4' && useNativeMp4Encoder) {
+        nativeMp4FrameEncoder = await startNativeMp4FrameEncoder(
+          settings,
+          totalFrames,
+          nativeStageCaptureActive ? nativeCapturePixelFormat : 'rgba',
+        );
       }
       await nextFrame();
+      const nativeSceneLayers = get(project).layers;
 
       async function captureShotFrame(index: number, shot: DemoShot, progress: number): Promise<CapturedFrame> {
         if (index !== lastShotIndex) {
@@ -338,6 +407,30 @@ function createReelRenderStore() {
           keyframeTimeline.seek(virtualTime);
           layerSequencer.seek(virtualTime);
           vjLayerSequencer.seek(virtualTime);
+          // Show timeline drives the LED content's preset arrangement too,
+          // so a Demo Reel of a programmed show cuts presets where the show
+          // does. No-op when the timeline is empty.
+          showTimeline.seek(virtualTime);
+
+          if (nativeStageCaptureActive) {
+            const at = shotAtTime(shots, virtualTime);
+            if (!at) throw new Error('Could not evaluate Stage 3D reel shot for native capture');
+            const camera = evaluateShotCamera(at.shot, at.progress);
+            await nextFrame();
+            await setNativeRendererStage3DScene(
+              buildNativeStage3DScene(at.shot.stage, nativeSceneLayers, { camera }),
+            );
+
+            if (outputMode === 'frames') {
+              if (!nativeJpegSequence) throw new Error('Native Stage 3D frame export folder is not ready');
+              await writeNativeRendererJpegSequenceFrame(nativeJpegSequence, globalFrame, virtualTime);
+            } else {
+              if (!nativeMp4FrameEncoder) throw new Error('Native Stage 3D MP4 encoder is not ready');
+              await writeNativeRendererMp4Frame(nativeMp4FrameEncoder, globalFrame, virtualTime);
+            }
+            update(s => ({ ...s, currentFrame: globalFrame + 1 }));
+            continue;
+          }
 
           // Shot clock — camera every frame, stage snapshot on entry.
           let frame: CapturedFrame | null = null;
@@ -364,14 +457,23 @@ function createReelRenderStore() {
               await writeFrameTargetBytes(frameTarget, frameName, jpegBytes);
             }
           } else {
-            if (!ffmpeg) throw new Error('FFmpeg encoder not ready');
-            const jpegBytes = await rgbaToJpeg(frame.data, frame.width, frame.height, 0.92);
-            await ffmpeg.writeFile(`frame_${String(localFrame).padStart(6, '0')}.jpg`, jpegBytes);
+            if (nativeMp4FrameEncoder) {
+              await writeNativeMp4Frame(nativeMp4FrameEncoder, globalFrame, frame);
+            } else {
+              if (!ffmpeg) throw new Error('FFmpeg encoder not ready');
+              const jpegBytes = await rgbaToJpeg(frame.data, frame.width, frame.height, 0.92);
+              await ffmpeg.writeFile(`frame_${String(localFrame).padStart(6, '0')}.jpg`, jpegBytes);
+            }
           }
           update(s => ({ ...s, currentFrame: globalFrame + 1 }));
         }
 
         if (outputMode === 'frames') {
+          currentSegmentFrames = 0;
+          continue;
+        }
+
+        if (nativeMp4FrameEncoder) {
           currentSegmentFrames = 0;
           continue;
         }
@@ -427,6 +529,44 @@ function createReelRenderStore() {
         return true;
       }
 
+      if (nativeMp4FrameEncoder && !nativeMp4FrameEncoderFinished) {
+        setStatus('encoding');
+        const encoded = await finishNativeMp4FrameEncoder(nativeMp4FrameEncoder);
+        nativeMp4FrameEncoderFinished = true;
+        update(s => ({ ...s, encodeProgress: 1 }));
+        if (cancelRequested) { setStatus('cancelled'); return false; }
+
+        setStatus('saving');
+        const url = pathToFileUrl(encoded.outputPath);
+        const thumbnail = await thumbnailFromVideoUrl(url, Math.min(2, durationSeconds * 0.4));
+        const niceName = `${settings.filename || 'Stage Reel'} ${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}`;
+        const assetRef: AssetRef = {
+          kind: 'local-file',
+          originalPath: encoded.outputPath,
+          name: `${niceName}.mp4`,
+          mime: 'video/mp4',
+          size: encoded.size,
+          lastModified: Date.now(),
+        };
+        mediaLibrary.addItem({
+          id: generateUUID(),
+          name: niceName,
+          type: 'video',
+          src: url,
+          thumbnail,
+          _assetRef: assetRef,
+        });
+        update(s => ({
+          ...s,
+          status: 'complete',
+          lastOutputUrl: url,
+          lastOutputName: niceName,
+          lastOutputKind: 'video',
+          lastOutputPath: encoded.outputPath,
+        }));
+        return true;
+      }
+
       if (!ffmpeg) throw new Error('FFmpeg encoder not ready');
 
       setStatus('encoding');
@@ -474,6 +614,10 @@ function createReelRenderStore() {
           await cancelNativeJpegSequence(nativeJpegSequence);
           nativeJpegSequenceFinished = true;
         }
+        if (nativeMp4FrameEncoder && !nativeMp4FrameEncoderFinished) {
+          await cancelNativeMp4FrameEncoder(nativeMp4FrameEncoder);
+          nativeMp4FrameEncoderFinished = true;
+        }
       } catch { /* best-effort */ }
       setStatus('error', formatErr(err));
       return false;
@@ -483,11 +627,24 @@ function createReelRenderStore() {
       if (nativeJpegSequence && !nativeJpegSequenceFinished) {
         await cancelNativeJpegSequence(nativeJpegSequence).catch(() => {});
       }
+      if (nativeMp4FrameEncoder && !nativeMp4FrameEncoderFinished) {
+        await cancelNativeMp4FrameEncoder(nativeMp4FrameEncoder).catch(() => {});
+      }
+      if (nativeOutputNeedsRestore) {
+        await submitNativeRendererCommands([
+          { type: 'set_output', width: restoreWidth, height: restoreHeight, refresh_hz: settings.fps },
+        ]).catch(() => {});
+      }
       controls.releaseCamera();
       engine.manualTime = restoreManual;
       setISFManualTime(null);
       setStageEffectsManualTime(null);
       try { stage3dScene.loadScene(restoreScene); } catch { /* keep last shot's scene */ }
+      if (nativeStageCaptureActive || nativeOutputNeedsRestore) {
+        await setNativeRendererStage3DScene(
+          buildNativeStage3DScene(restoreScene, get(project).layers),
+        ).catch(() => {});
+      }
       try { engine.resize(restoreWidth, restoreHeight); } catch { /* nothing we can do */ }
     }
   }

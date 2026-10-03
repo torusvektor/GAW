@@ -1,0 +1,39 @@
+[package]
+name = "ghost-render-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[dependencies]
+cpal = "0.16.0"
+base64 = "0.22.1"
+bytemuck = { version = "1.24.0", features = ["derive"] }
+image = { version = "0.25.8", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+naga = { version = "30.0.0", features = ["wgsl-in", "glsl-in"] }
+pollster = "0.4.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+snap = "1.1.1"
+# NOTE: the `static-dxc` feature would bundle DXC into the binary, but it needs
+# ATL (`atls.lib`), which the VS Build Tools install here does not ship. We use
+# Dx12Compiler::DynamicDxc instead and load dxcompiler.dll/dxil.dll from beside
+# the executable — see the shader_compiler setting in main.rs.
+wgpu = { version = "30.0.0", features = ["glsl"] }
+winit = "0.30.12"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "CFString"] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["IOSurfaceRef", "IOSurfaceTypes", "objc2-core-foundation"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSApplication", "NSGraphics", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.2.2", default-features = false, features = ["NSThread"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Media_MediaFoundation", "Win32_Media_Multimedia", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Threading", "Win32_System_Variant"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

@@ -1,3 +1,6 @@
+import { effectParamLabels } from '../effects/effectUX';
+import { nativeAudioMaster } from '../audio/nativeClipAudio';
+import { releaseTempoNudgeInputs, setTempoNudgeInput, resyncLaunchClock } from '../stores/launchClock';
 // MIDI Router - Routes MIDI messages to correct store update functions
 // Uses a prebuilt lookup table for O(1) dispatch with 16ms throttle per path
 import { get } from 'svelte/store';
@@ -10,7 +13,47 @@ import { setBaseValue as setModulationBase } from '../audio/modulation';
 import type { MidiMapping, MidiMessageType } from './midiTypes';
 import type { BlendMode } from '../types';
 import { getPluginByEffectType } from '../plugins/registry';
-import { normalizeControlPath } from '../control/controlPaths';
+import { isVideoScratchPath, normalizeControlPath } from '../control/controlPaths';
+import { audioStore } from '../stores/audio';
+import { buildNativeAnchor, needsNativeReanchor, predictNativePlayheadSeconds } from '../media/nativeTransport';
+import { createNativeVideoScratchController } from '../renderer/nativeVideoScratch';
+
+const videoScratch = createNativeVideoScratchController(key => {
+  const [scope, index] = key.split(':');
+  if (scope === 'map') {
+    const layer = get(selectedLayer);
+    return layer?.id === index && layer.source?.type === 'video' ? layer.source : null;
+  }
+  const state = get(vjClipLauncher);
+  const clip = (scope === 'B' ? state.bankBLayerStates : state.layerStates)[Number(index)]?.activeClip;
+  return clip?.type === 'video' ? clip : null;
+}, (key, source, patch) => {
+  const [scope, index] = key.split(':');
+  if (scope === 'map') {
+    const layer = get(selectedLayer);
+    const current = layer?.source;
+    if (layer?.id === index && current?.id === source.id && current.src === source.src
+      && Number(current._nativePlaybackSeekSeq ?? 0) <= patch._nativePlaybackSeekSeq) {
+      project.updateLayer(layer.id, { source: { ...current, ...patch } });
+    }
+  } else {
+    const state = get(vjClipLauncher);
+    const current = (scope === 'B' ? state.bankBLayerStates : state.layerStates)[Number(index)]?.activeClip;
+    if (current?.id === source.id && current.src === source.src
+      && Number(current._nativePlaybackSeekSeq ?? 0) <= patch._nativePlaybackSeekSeq) {
+      vjClipLauncher.updateActiveClipVideoProps(Number(index), patch, scope === 'B' ? 'B' : 'A');
+    }
+  }
+});
+let observingVideoScratch = false;
+function observeVideoScratch() {
+  if (observingVideoScratch) return;
+  observingVideoScratch = true;
+  // Delay subscriptions until the first control event: these stores and the
+  // MIDI router share initialization dependencies during project loading.
+  selectedLayer.subscribe(() => videoScratch.refresh());
+  vjClipLauncher.subscribe(() => videoScratch.refresh());
+}
 
 // Prebuilt lookup: "cc:74" -> [MidiMapping, ...]
 // Rebuilt automatically when mappings change
@@ -73,6 +116,18 @@ export function registerSnapshotRecaller(recaller: (index: number) => void) {
   _snapshotRecaller = recaller;
 }
 
+/**
+ * Late-bound cue list control for `show:go`, `show:back`, `show:stop`,
+ * `show:reset` and `show:cue:<index>`. Registered by the show-control
+ * runtime (src/lib/show/cueExecutor.ts) so the router does not import the
+ * cue engine. Fires on the rising edge only (value > 0), like a pad.
+ */
+export type ShowControlAction = 'go' | 'back' | 'stop' | 'reset' | { cue: number };
+let _showControl: ((action: ShowControlAction) => void) | null = null;
+export function registerShowControl(handler: ((action: ShowControlAction) => void) | null) {
+  _showControl = handler;
+}
+
 class MidiRouter {
   routeMessage(channel: number, type: MidiMessageType, number: number, value: number) {
     const key = `${type}:${number}`;
@@ -85,10 +140,17 @@ class MidiRouter {
       // Channel filter
       if (mapping.channel !== -1 && mapping.channel !== channel) continue;
 
-      // Throttle check
-      const lastTime = lastUpdateTime.get(mapping.path) || 0;
-      if (now - lastTime < THROTTLE_MS) continue;
-      lastUpdateTime.set(mapping.path, now);
+      const isClipTrigger = /^(vj|vj-b):\d+:trigger:\d+$/.test(normalizeControlPath(mapping.path));
+      const isTempoNudge = /^vj:tempo:(nudge-up|nudge-down|resync)$/.test(normalizeControlPath(mapping.path));
+      const isVideoCue = /^(vj|vj-b):\d+:video:cue(?:-set|-clear)?:[0-7]$/.test(normalizeControlPath(mapping.path));
+      const isLayerFader = /^(vj|vj-b):\d+:opacity$/.test(normalizeControlPath(mapping.path));
+      // Preserve fader zero crossings, pad releases and final scratch targets.
+      // The native scrubber coalesces pending targets without dropping it.
+      if (!isVideoScratchPath(mapping.path) && !isClipTrigger && !isLayerFader && !isVideoCue && !isTempoNudge) {
+        const lastTime = lastUpdateTime.get(mapping.path) || 0;
+        if (now - lastTime < THROTTLE_MS) continue;
+        lastUpdateTime.set(mapping.path, now);
+      }
 
       // User interaction suppression — skip if user is manually dragging this control
       const suppressUntil = userInteractingPaths.get(mapping.path) || 0;
@@ -98,7 +160,7 @@ class MidiRouter {
       const targetValue = this.convertValue(value, mapping, type);
 
       // Dispatch to correct store
-      this.dispatch(mapping.path, targetValue, mapping);
+      this.dispatch(mapping.path, (isClipTrigger || isVideoCue || isTempoNudge) && type === 'note' && value === 0 ? 0 : targetValue, mapping, `midi:${mapping.id}:${channel}:${number}`);
     }
   }
 
@@ -149,7 +211,9 @@ class MidiRouter {
    * `discreteValues` lets callers target the discrete-cycle params
    * (e.g. crossfader transition, blend mode) with named values.
    */
-  public dispatchPath(path: string, value: number, opts: { discreteValues?: string[] } = {}) {
+  public releaseInputs(prefix: string) { vjClipLauncher.releaseInputs(prefix); releaseTempoNudgeInputs(prefix); }
+
+  public dispatchPath(path: string, value: number, opts: { discreteValues?: string[]; inputId?: string } = {}) {
     const mapping: MidiMapping = {
       id: '__macro__',
       channel: -1,
@@ -164,13 +228,13 @@ class MidiRouter {
       discreteValues: opts.discreteValues,
     };
     try {
-      this.dispatch(path, value, mapping);
+      this.dispatch(path, value, mapping, opts.inputId ?? `path:${path}`);
     } catch (err) {
       console.warn(`[MIDI Router] dispatchPath failed for ${path}:`, err);
     }
   }
 
-  private dispatch(path: string, value: number, mapping: MidiMapping) {
+  private dispatch(path: string, value: number, mapping: MidiMapping, inputId?: string) {
     path = normalizeControlPath(path);
     const parts = path.split(':');
     const scope = parts[0]; // 'map', 'vj', 'vj-b', 'sv'
@@ -182,20 +246,33 @@ class MidiRouter {
           break;
         case 'vj':
           // Bank A is the canonical deck — most controllers use this scope.
-          this.dispatchVJ(parts, value, mapping, 'A');
+          this.dispatchVJ(parts, value, mapping, 'A', inputId);
           break;
         case 'vj-b':
           // Bank B parallels vj: opacity / solo / mute / trigger / column /
           // block all route to bankBLayerStates + bankBClipGrid via the
           // same dispatcher with bank='B'. Same path shape minus the scope.
-          this.dispatchVJ(parts, value, mapping, 'B');
+          this.dispatchVJ(parts, value, mapping, 'B', inputId);
           break;
         case 'sv':
           this.dispatchPerformer(parts, value, mapping);
           break;
+        case 'show':
+          this.dispatchShow(parts, value);
+          break;
       }
     } catch (err) {
       console.warn(`[MIDI Router] Error dispatching to ${path}:`, err);
+    }
+  }
+
+  private dispatchShow(parts: string[], value: number) {
+    if (!(value > 0) || !_showControl) return;
+    const action = parts[1];
+    if (action === 'go' || action === 'back' || action === 'stop' || action === 'reset') {
+      _showControl(action);
+    } else if (action === 'cue' && /^\d+$/.test(parts[2] ?? '')) {
+      _showControl({ cue: Number(parts[2]) });
     }
   }
 
@@ -229,31 +306,63 @@ class MidiRouter {
     const layer = get(selectedLayer);
     if (!layer) return;
 
-    // Mapping media transport: map:media:play|restart|position
+    // Mapping media transport: map:media:play|restart|position|scratch
     // These actions target the selected layer's live media object so they
     // work outside VJ mode as well as from OSC/MIDI learn.
     if (contentType === 'media') {
       const source = layer.source;
       const video = source?.videoElement;
-      if (!source || source.type !== 'video' || !video) return;
+      if (!source || source.type !== 'video') return;
+      const scratchKey = `map:${layer.id}`;
+      if (property === 'scratch') {
+        if (mapping.mode === 'absolute') {
+          observeVideoScratch();
+          videoScratch.seek(scratchKey, value);
+        }
+        return;
+      }
 
       const trimStart = Math.max(0, Math.min(1, source.trimStart ?? 0));
       const trimEnd = Math.max(trimStart, Math.min(1, source.trimEnd ?? 1));
-      const startTime = Number.isFinite(video.duration) ? video.duration * trimStart : 0;
+      const duration = Number(source.durationSeconds ?? video?.duration);
+      const startTime = Number.isFinite(duration) ? duration * trimStart : 0;
 
       if (property === 'play' && value > 0) {
-        const shouldPlay = video.paused || source.isPlaying === false;
-        project.setLayerSource(layer.id, { ...source, isPlaying: shouldPlay });
-        if (shouldPlay) void video.play().catch(() => undefined);
-        else video.pause();
+        videoScratch.cancel(scratchKey);
+        const shouldPlay = source.isPlaying === false;
+        const time = predictNativePlayheadSeconds(source);
+        project.updateLayer(layer.id, { source: { ...source, isPlaying: shouldPlay,
+          _nativePlaybackTimeSeconds: time, _nativePlaybackUpdatedAtMs: performance.now() } });
+        if (shouldPlay && source.audioPlayback) void video?.play().catch(() => undefined);
+        else video?.pause();
       } else if (property === 'restart' && value > 0) {
-        video.currentTime = startTime;
-        project.setLayerSource(layer.id, { ...source, isPlaying: true });
-        void video.play().catch(() => undefined);
+        videoScratch.cancel(scratchKey);
+        // Re-anchor the native clock, not just the element: under the native
+        // engine the element is not what renders. Restart is a discrete press,
+        // so it always seeks — no drift gate.
+        project.setLayerSource(layer.id, {
+          ...source,
+          isPlaying: true,
+          ...buildNativeAnchor(source, startTime),
+        });
+        if (source.audioPlayback && video) {
+          try { video.currentTime = startTime; } catch { /* native stays authoritative */ }
+          void video.play().catch(() => undefined);
+        }
       } else if (property === 'position') {
         const normalized = Math.max(0, Math.min(1, value));
         const sourcePosition = trimStart + normalized * (trimEnd - trimStart);
-        if (Number.isFinite(video.duration)) video.currentTime = video.duration * sourcePosition;
+        if (Number.isFinite(duration)) {
+          const target = duration * sourcePosition;
+          // An external timeline sends this continuously; only correct once it
+          // has actually drifted, or the decoder re-arms tens of times a second.
+          if (needsNativeReanchor(source, target)) {
+            project.setLayerSource(layer.id, { ...source, ...buildNativeAnchor(source, target) });
+            if (source.audioPlayback && video) {
+              try { video.currentTime = target; } catch { /* native stays authoritative */ }
+            }
+          }
+        }
       }
       return;
     }
@@ -387,10 +496,40 @@ class MidiRouter {
     }
   }
 
-  private dispatchVJ(parts: string[], value: number, mapping: MidiMapping, bank: 'A' | 'B' = 'A') {
+  private dispatchVJ(parts: string[], value: number, mapping: MidiMapping, bank: 'A' | 'B' = 'A', inputId?: string) {
     // parts: ['vj' | 'vj-b', layerIndex|'master'|'crossfader'|..., property, ...]
     const layerPart = parts[1];
     const property = parts[2];
+    if (layerPart === 'group') {
+      if (!Number.isFinite(value)) return;
+      let id: string;
+      try { id = decodeURIComponent(parts[2]); } catch { return; }
+      const group = get(vjClipLauncher).groups?.find(group => group.id === id);
+      if (!group) return;
+      if (parts[3] === 'level') vjClipLauncher.updateGroup(id, { opacity: Math.max(0, Math.min(1, value)) });
+      else if (parts[3] === 'column' && value > 0 && /^\d+$/.test(parts[4] ?? '')) vjClipLauncher.triggerColumn(Number(parts[4]), bank, id);
+      else if (parts[3] === 'fx') {
+        const effect = group.effects.find(effect => effect.id === parts[4]);
+        if (!effect) return;
+        const key = parts[5];
+        if (key === 'mix') vjClipLauncher.updateGroupEffect(id, effect.id, { opacity: Math.max(0, Math.min(1, value)) });
+        else if (key === 'enabled') vjClipLauncher.updateGroupEffect(id, effect.id, { enabled: value >= 0.5 });
+        else if (key === 'param') {
+          const schema = effectParamLabels[effect.type] ?? {};
+          const param = Object.keys(schema).find(key => key.toLowerCase() === parts[6]);
+          const meta = param ? schema[param] : undefined;
+          if (meta && param) vjClipLauncher.updateGroupEffect(id, effect.id, { params: { [param]: Math.max(meta.min, Math.min(meta.max, value)) } });
+        }
+      }
+      return;
+    }
+
+    if (parts[1] === 'tempo' && ['nudge-up', 'nudge-down', 'resync'].includes(parts[2])) {
+      if (parts[2] === 'resync') { if (value > 0) resyncLaunchClock(); }
+      else setTempoNudgeInput(inputId ?? `path:${parts.join(':')}`, value > 0 ? (parts[2] === 'nudge-up' ? 1 : -1) : 0);
+      return;
+    }
+
 
     // VJ Mode toggle: vj:mode. Rising edge enters/leaves the full VJ
     // workspace so controller users can return to regular mapping mode
@@ -407,6 +546,8 @@ class MidiRouter {
     }
 
     if (layerPart === 'master') {
+      if (property === 'audiovolume') nativeAudioMaster.update(v => ({ ...v, volume: Math.max(0, Math.min(1, value)) }));
+      if (property === 'audiomute' && value > 0) nativeAudioMaster.update(v => ({ ...v, muted: !v.muted }));
       if (property === 'opacity') {
         vjClipLauncher.setMasterOpacity(value);
       }
@@ -532,6 +673,15 @@ class MidiRouter {
       return;
     }
 
+    // Master tempo: vj:tempo — a DAW or timeline source telling us the BPM.
+    // Writes the manual override, which is what the quantizer falls back to
+    // when no Link session is running; a live Link session still outranks it,
+    // because a real session phase beats a number sent over UDP.
+    if (layerPart === 'tempo' && bank === 'A') {
+      if (Number.isFinite(value) && value > 0) audioStore.setManualBPM(value);
+      return;
+    }
+
     if (layerPart === 'stopall') {
       if (value > 0) vjClipLauncher.stopAll();
       return;
@@ -630,6 +780,13 @@ class MidiRouter {
           vjClipLauncher.setLayerBlendMode(layerIndex, blendVal as BlendMode, bank);
         }
         break;
+      case 'audiovolume':
+      case 'audiopan':
+        vjClipLauncher.setLayerAudio(layerIndex, { [property === 'audiovolume' ? 'audioVolume' : 'audioPan']: value }, bank);
+        break;
+      case 'autopilot':
+        if (value > 0) vjClipLauncher.toggleLayerAutopilot(layerIndex, bank);
+        break;
       case 'solo':
         if (value > 0) vjClipLauncher.toggleLayerSolo(layerIndex, bank);
         break;
@@ -670,27 +827,68 @@ class MidiRouter {
         const layerStates = bank === 'B' ? state.bankBLayerStates : state.layerStates;
         const clip = layerStates[layerIndex]?.activeClip;
         const video = clip?.type === 'video' ? clip.videoElement : undefined;
-        if (!clip || clip.type !== 'video' || !video) break;
+        if (!clip || clip.type !== 'video') break;
+        if (action === 'audiovolume' || action === 'audiopan') {
+          vjClipLauncher.updateActiveClipVideoProps(layerIndex, { [action === 'audiovolume' ? 'audioVolume' : 'audioPan']: value }, bank);
+          break;
+        }
+        if (action === 'audio' || action === 'audiomute') {
+          if (value > 0) vjClipLauncher.updateActiveClipVideoProps(layerIndex, action === 'audio'
+            ? { audioPlayback: clip.audioPlayback === false } : { audioMuted: !clip.audioMuted }, bank);
+          break;
+        }
+        const scratchKey = `${bank}:${layerIndex}`;
+        if (['cue', 'cue-set', 'cue-clear'].includes(action)) {
+          if (value <= 0 || !/^[0-7]$/.test(parts[4] ?? '')) break;
+          const cueIndex = Number(parts[4]);
+          if (action === 'cue') {
+            videoScratch.cancel(scratchKey);
+            vjClipLauncher.pressCuePoint(layerIndex, cueIndex, bank);
+          } else vjClipLauncher.setActiveClipCuePoint(layerIndex, cueIndex,
+            action === 'cue-clear' ? null : predictNativePlayheadSeconds(clip), bank);
+          break;
+        }
+        if (action === 'scratch') {
+          if (mapping.mode === 'absolute') {
+            observeVideoScratch();
+            videoScratch.seek(scratchKey, value);
+          }
+          break;
+        }
 
         const trimStart = Math.max(0, Math.min(1, clip.trimStart ?? 0));
         const trimEnd = Math.max(trimStart, Math.min(1, clip.trimEnd ?? 1));
-        const startTime = Number.isFinite(video.duration) ? video.duration * trimStart : 0;
+        const duration = Number(clip.durationSeconds ?? video?.duration);
+        const startTime = Number.isFinite(duration) ? duration * trimStart : 0;
 
         if (action === 'play' && value > 0) {
-          const shouldPlay = video.paused || clip.isPlaying === false;
-          vjClipLauncher.updateActiveClipVideoProps(layerIndex, { isPlaying: shouldPlay }, bank);
-          if (shouldPlay) void video.play().catch(() => undefined);
-          else video.pause();
+          videoScratch.cancel(scratchKey);
+          const shouldPlay = clip.isPlaying === false;
+          vjClipLauncher.updateActiveClipVideoProps(layerIndex, { isPlaying: shouldPlay,
+            _nativePlaybackTimeSeconds: predictNativePlayheadSeconds(clip),
+            _nativePlaybackUpdatedAtMs: performance.now() }, bank);
+          if (shouldPlay && clip.audioPlayback) void video?.play().catch(() => undefined);
+          else video?.pause();
         } else if (action === 'restart' && value > 0) {
-          video.currentTime = startTime;
-          vjClipLauncher.updateActiveClipVideoProps(layerIndex, { isPlaying: true }, bank);
-          void video.play().catch(() => undefined);
+          videoScratch.cancel(scratchKey);
+          vjClipLauncher.updateActiveClipVideoProps(layerIndex, {
+            isPlaying: true, ...buildNativeAnchor(clip, startTime),
+          }, bank);
+          if (clip.audioPlayback && video) {
+            video.currentTime = startTime;
+            void video.play().catch(() => undefined);
+          }
         } else if (action === 'mirror' && value > 0) {
           vjClipLauncher.updateActiveClipVideoProps(layerIndex, { mirrorX: !clip.mirrorX }, bank);
         } else if (action === 'position') {
+          // Position drives the NATIVE transport, not the DOM element. Writing
+          // videoElement.currentTime alone moved a clock nothing renders from,
+          // which is why an external timeline appeared to be ignored.
           const normalized = Math.max(0, Math.min(1, value));
           const sourcePosition = trimStart + normalized * (trimEnd - trimStart);
-          if (Number.isFinite(video.duration)) video.currentTime = video.duration * sourcePosition;
+          if (Number.isFinite(duration)) {
+            vjClipLauncher.syncActiveClipPosition(layerIndex, duration * sourcePosition, bank);
+          }
         }
         break;
       }
@@ -719,8 +917,9 @@ class MidiRouter {
       }
       case 'trigger': {
         const colIdx = parseInt(parts[3], 10);
-        if (!isNaN(colIdx) && value > 0) {
-          vjClipLauncher.triggerClip(layerIndex, colIdx, bank);
+        if (!isNaN(colIdx)) {
+          if (value > 0) vjClipLauncher.triggerClip(layerIndex, colIdx, bank, inputId);
+          else vjClipLauncher.releaseClip(layerIndex, colIdx, bank, inputId);
         }
         break;
       }

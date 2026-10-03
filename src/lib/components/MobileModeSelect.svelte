@@ -2,8 +2,8 @@
   export let onSelect: (mode: 'standalone' | 'remote') => void;
 </script>
 
-<div class="mode-select">
-  <img src="{import.meta.env.BASE_URL}logo.png" alt="Ghost Arcade" class="logo" />
+<div data-help-page="mobile-control" class="mode-select">
+  <img src="{import.meta.env.BASE_URL}icon-new.png" alt="Ghost Arcade" class="logo" />
   <h1>Ghost Arcade</h1>
   <p class="tagline">Projection mapping & VJ — right on your phone</p>
 

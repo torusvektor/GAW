@@ -8,6 +8,9 @@
  * particles have mode + source, etc.). The shape is opaque to the
  * runner — the panel renders it via the shader's paramSchema.
  */
+import type { GhostGpuRuntime } from './gpuRuntime';
+import type { GhostGpuGovernorSnapshot, GhostGpuQualityTier } from './gpuCaps';
+
 export interface GpuShaderImpl {
   /** Apply the user's params (merged with defaults). Cheap setter
    *  — called every frame from the render loop. */
@@ -41,9 +44,54 @@ export interface GpuShaderImpl {
    *  Pure fragment shaders can ignore it (they sample resolution
    *  from the bind-group uniform). */
   resize?(width: number, height: number): void;
+  /** Optional dev/profiling hook. Implementations can expose lightweight
+   *  pass/resource stats without coupling the renderer to each shader's
+   *  internal engine. */
+  getDebugStats?(): Record<string, any>;
   /** Free GPU resources. Called when the user switches to a
    *  different shader within the same layer or removes the layer. */
   dispose(): void;
+}
+
+export interface GpuShaderQualityContext {
+  capsTier: GhostGpuQualityTier;
+  suggestedTier: GhostGpuQualityTier;
+  qualityScale: number;
+  adaptive: boolean;
+  governor?: GhostGpuGovernorSnapshot | null;
+}
+
+export interface GpuShaderQualityTierBudget {
+  /** Clamp expensive numeric params at this tier while preserving
+   *  user-authored values below the cap. Numeric strings are preserved
+   *  as strings so select-backed params like gridSize stay valid. */
+  maxParams?: Record<string, number>;
+  /** Params whose caps should also follow the adaptive qualityScale. */
+  scaleMaxParams?: string[];
+  /** This tier's OPERATING POINT — the value the tier targets for a
+   *  workload param the operator has left at the shader default.
+   *
+   *  `maxParams` alone can only ever make an instrument cheaper, so a
+   *  project sitting on shader defaults renders identically at every
+   *  tier and "Ultra" means nothing. `tierParams` is what makes a tier
+   *  visible: pick Ultra and the untouched knobs move up to the tier's
+   *  target; pick Live Saver and they move down.
+   *
+   *  It is deliberately conservative about operator intent — a param
+   *  whose value differs from the shader default is treated as authored
+   *  and is never raised or lowered by the tier, only clamped by
+   *  `maxParams`. Tier targets are still subject to `maxParams`, so a
+   *  target may never exceed the tier's declared ceiling. */
+  tierParams?: Record<string, any>;
+  /** Last-resort fixed overrides for a tier. Use sparingly; maxParams
+   *  keeps user intent intact and should be preferred. */
+  forceParams?: Record<string, any>;
+}
+
+export interface GpuShaderQualityApplyResult {
+  params: Record<string, any>;
+  applied: Record<string, { from: any; to: any; cap?: number }>;
+  context: GpuShaderQualityContext;
 }
 
 /**
@@ -103,7 +151,15 @@ export interface GpuShaderDef {
    *  'Source-driven', 'Post-effect'). */
   category: string;
   /** Build an instance bound to a device. */
-  create(device: any, presentFormat: any): GpuShaderImpl;
+  create(device: any, presentFormat: any, runtime?: GhostGpuRuntime): GpuShaderImpl;
+  /** Optional lightweight warm-up used by the picker before a shader is
+   *  selected. Prefer compiling/caching modules + pipelines here without
+   *  allocating full simulation buffers. */
+  prewarm?(device: any, presentFormat: any, runtime?: GhostGpuRuntime): void | Promise<void>;
+  /** Optional internal budgets for adaptive quality. These do not add
+   *  visible UI controls; they cap hidden cost so heavy instruments can
+   *  stay live on slower GPUs and recover when the governor steps back up. */
+  qualityBudgets?: Partial<Record<GhostGpuQualityTier, GpuShaderQualityTierBudget>>;
   /** Schema for UI generation + initial param population. */
   paramSchema: ParamControl[];
   /** Convenience: derived from paramSchema by gpuShaderCatalog at

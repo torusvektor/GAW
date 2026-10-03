@@ -215,7 +215,7 @@
 </script>
 
 {#if $midiStore.editMode}
-  <div class="midi-overlay-root">
+  <div data-help-page="midi-audio" class="midi-overlay-root">
     <!-- Overlay indicators on each control — keyed by revision to batch position updates -->
     {#key overlayRevision}
       {#each overlayItems as item (item.path)}
@@ -381,7 +381,7 @@
   .midi-last-msg {
     color: #666;
     font-size: 11px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
 
   .midi-map-count {

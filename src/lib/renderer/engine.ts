@@ -1,16 +1,17 @@
 import * as THREE from 'three';
-import type { Layer, WarpCorners, BlendMode, MeshWarpGrid, Effect, ColorContent, MaskConfig, LayerShapeType, Point2D, ContentFitMode, EdgeEffect, GroupConfig } from '../types';
+import type { Layer, WarpCorners, BlendMode, MeshWarpGrid, Effect, ColorContent, MaskConfig, LayerShapeType, Point2D, ContentFitMode, EdgeEffect, GroupConfig, TransitionStyle } from '../types';
 import { GpuEffectRunner, isGpuEffect } from './gpuEffectRunner';
-import { getShapeVertices } from '../types';
+import { evaluateMeshGrid, layerRenderMeshGrid, meshGridHasTangents } from '../utils/meshWarp';
 
 // ── Group rendering types ──────────────────────────────────────────────────
 type RenderUnit =
   | { kind: 'standalone'; layer: Layer }
-  | { kind: 'mask'; layer: Layer }
   | { kind: 'group'; group: Layer; children: Layer[] };
 // Edge effects still use old drawing types for temporary element construction
 import type { DrawingElement, PointClickLineShape } from '../drawing/types';
 import { createDefaultShapeWarp, createDefaultShapeMesh } from '../drawing/types';
+import { edgeEffectOutline, normalizeEdgeEffectStyle, renderedEdgeEffects } from '../drawing/edgeEffects';
+import { DEFAULT_DRAWING_STYLE } from '../drawing/drawingStyle';
 import type { LineElement } from '../lines/types';
 import { warpVertexShader, textureFragmentShader, blendShaders, passthroughVertexShader, opaqueOutputFragmentShader } from './shaders';
 import { createEffectMaterial, updateEffectUniforms, effectVertexShader, polygonMaskShader, polygonMaskAlphaShader, applyExternalMaskShader, layerShapeMaskShader } from './effects';
@@ -18,7 +19,6 @@ import { TemporalMagnificationRunner, isTemporalMagnificationEffect } from './te
 import { domeProjectionShader } from './shaders/dome';
 import { getTransition, applyFaderCurve, type TransitionDef } from './crossfadeTransitions';
 import { getVisualAudioSnapshot } from '../audio/visualAudio';
-import { stageTextureNeedsVerticalFlip } from '../utils/stageTextureOrientation';
 // Geometry imports kept for potential future use with shape control point warping
 // import { createShapeGeometry, updateGeometryFromControlPoints } from './geometry';
 
@@ -50,6 +50,8 @@ interface LayerRenderObject {
   geometry: THREE.BufferGeometry;
   warpMode: 'corners' | 'mesh';
   meshGridSize?: { rows: number; cols: number };
+  // A Bezier mesh is tessellated finer than its grid, so it needs new geometry
+  meshBezier?: boolean;
   // Store original UV coordinates for mesh warp (so we can reapply warp each frame)
   originalUVs?: Float32Array;
   // Track the shape type for geometry recreation when shape changes
@@ -215,14 +217,6 @@ export class RenderEngine {
   // sweep when this is non-zero. See crossfadeTransitions.ts.
   private crossfadeBlendModeIndex: number = 0;
   private crossfadeStartTime: number = performance.now() / 1000;
-  // Operator confidence monitors. These display the already-rendered bank
-  // targets; they never create another layer renderer or rerun a source.
-  private deckMonitorCanvasA: HTMLCanvasElement | null = null;
-  private deckMonitorCanvasB: HTMLCanvasElement | null = null;
-  private deckMonitorContextA: CanvasRenderingContext2D | null = null;
-  private deckMonitorContextB: CanvasRenderingContext2D | null = null;
-  private deckMonitorLastUpdate = 0;
-  private readonly deckMonitorFrameInterval = 1000 / 30;
 
   // Per-VJ-layer crossfade FBOs. When stage mode is on AND a single VJ
   // layer index has both Bank A and Bank B clips active, we crossfade
@@ -688,12 +682,16 @@ export class RenderEngine {
     // Always use 'quad' for geometry. Shape type only used for legacy control point warping.
     const currentShapeType: LayerShapeType | 'quad' = 'quad';
 
-    // Check if we need to recreate for mesh warp mode change
+    // Check if we need to recreate for mesh warp mode change. A warped mesh
+    // stays applied in corner mode too (see layerRenderMeshGrid).
+    const renderMesh = layerRenderMeshGrid(layer);
+    const renderMeshBezier = meshGridHasTangents(renderMesh);
     const needsRecreate = obj && (
-      (layer.warpMode === 'mesh' && obj.warpMode !== 'mesh') ||
-      (layer.warpMode !== 'mesh' && obj.warpMode === 'mesh') ||
-      (layer.warpMode === 'mesh' && layer.meshGrid &&
-        (obj.meshGridSize?.rows !== layer.meshGrid.rows || obj.meshGridSize?.cols !== layer.meshGrid.cols))
+      (renderMesh && obj.warpMode !== 'mesh') ||
+      (!renderMesh && obj.warpMode === 'mesh') ||
+      (renderMesh &&
+        (obj.meshGridSize?.rows !== renderMesh.rows || obj.meshGridSize?.cols !== renderMesh.cols
+          || (obj.meshBezier ?? false) !== renderMeshBezier))
     );
 
     // Store existing texture before recreating
@@ -711,10 +709,12 @@ export class RenderEngine {
       let geometry: THREE.BufferGeometry;
       const defaultControlPoints: Point2D[] | undefined = undefined;
 
-      if (layer.warpMode === 'mesh' && layer.meshGrid) {
-        // For mesh warp, create geometry that matches the grid
-        const segmentsX = layer.meshGrid.cols - 1;
-        const segmentsY = layer.meshGrid.rows - 1;
+      if (renderMesh) {
+        // For mesh warp, create geometry that matches the grid. Bezier cells
+        // are curved, so each one gets 8 segments a side to stay smooth.
+        const perCell = renderMeshBezier ? 8 : 1;
+        const segmentsX = (renderMesh.cols - 1) * perCell;
+        const segmentsY = (renderMesh.rows - 1) * perCell;
         geometry = new THREE.PlaneGeometry(2, 2, segmentsX, segmentsY);
       } else {
         // For corner warp, use higher subdivisions for smooth bilinear interpolation
@@ -746,8 +746,9 @@ export class RenderEngine {
         material,
         renderTarget,
         geometry,
-        warpMode: layer.warpMode === 'mesh' ? 'mesh' : 'corners',
-        meshGridSize: layer.meshGrid ? { rows: layer.meshGrid.rows, cols: layer.meshGrid.cols } : undefined,
+        warpMode: renderMesh ? 'mesh' : 'corners',
+        meshGridSize: renderMesh ? { rows: renderMesh.rows, cols: renderMesh.cols } : undefined,
+        meshBezier: renderMeshBezier,
         originalUVs,
         shapeType: currentShapeType,
         defaultControlPoints,
@@ -763,38 +764,17 @@ export class RenderEngine {
   // originalUVs: the original UV coordinates (0-1) stored when geometry was created
   private applyMeshWarp(geometry: THREE.BufferGeometry, meshGrid: MeshWarpGrid, corners: WarpCorners, originalUVs: Float32Array): void {
     const positions = geometry.attributes.position;
-    const rows = meshGrid.rows;
-    const cols = meshGrid.cols;
 
     for (let i = 0; i < positions.count; i++) {
       // Get original UV coordinates (0-1) from stored array
       // This is critical - we can't read from positions because they get modified each frame
       const uvX = originalUVs[i * 2];
-      // Flip Y coordinate - Three.js plane has Y going up, but we need it going down for proper orientation
-      const uvY = 1.0 - originalUVs[i * 2 + 1];
+      const uvY = originalUVs[i * 2 + 1];
 
-      // First: get mesh deformation (local coords 0-1)
-      const gridX = uvX * (cols - 1);
-      const gridY = uvY * (rows - 1);
-
-      const col0 = Math.floor(gridX);
-      const col1 = Math.min(col0 + 1, cols - 1);
-      const row0 = Math.floor(gridY);
-      const row1 = Math.min(row0 + 1, rows - 1);
-
-      const tx = gridX - col0;
-      const ty = gridY - row0;
-
-      // Bilinear interpolation of mesh grid points
-      const p00 = meshGrid.points[row0][col0];
-      const p10 = meshGrid.points[row0][col1];
-      const p01 = meshGrid.points[row1][col0];
-      const p11 = meshGrid.points[row1][col1];
-
-      const meshX = (1 - tx) * (1 - ty) * p00.x + tx * (1 - ty) * p10.x +
-                    (1 - tx) * ty * p01.x + tx * ty * p11.x;
-      const meshY = (1 - tx) * (1 - ty) * p00.y + tx * (1 - ty) * p10.y +
-                    (1 - tx) * ty * p01.y + tx * ty * p11.y;
+      // First: get mesh deformation (local coords 0-1). The plane's Y goes
+      // up, which is the mesh's own convention (row 0 is y=1): bilinear for
+      // straight cells, the Coons patch of a Bezier cell otherwise.
+      const { x: meshX, y: meshY } = evaluateMeshGrid(meshGrid, uvX, uvY);
 
       // Second: apply corner warp to the mesh-deformed position
       // Bilinear interpolation using the corner positions
@@ -1705,13 +1685,10 @@ export class RenderEngine {
       if (layer.parentGroupId) continue;
       if (!layer.visible) continue;
 
-      if (layer.type === 'mask') {
-        units.push({ kind: 'mask', layer });
-      } else if (layer.type === 'group') {
+      if (layer.type === 'group') {
         const groupHasSource = !!(layer.source?.texture);
         const children = layers.filter(l =>
-          l.parentGroupId === layer.id && l.visible &&
-          (l.type === 'mask' || groupHasSource || this.hasLayerTexture(l))
+          l.parentGroupId === layer.id && l.visible && (groupHasSource || this.hasLayerTexture(l))
         );
         if (children.length > 0) {
           units.push({ kind: 'group', group: layer, children });
@@ -1897,12 +1874,6 @@ export class RenderEngine {
     // Apply dome projection (after watermark, before final output)
     this.applyDomeProjection();
 
-    // Refresh the editor-only A/B confidence monitors from the two bank
-    // render targets. This is deliberately before the final program blit:
-    // the renderer canvas is restored to the clean master below before
-    // output capture, recording, or the browser compositor can observe it.
-    this.updateDeckMonitorFrames();
-
     // Render final composite to screen
     if (this.transitionProgress < 1) {
       // Transition active: blend snapshot with live composite
@@ -2016,23 +1987,6 @@ export class RenderEngine {
     }
   }
 
-  /** Apply a mask-only hierarchy layer to the composite accumulated so far. */
-  private applyHierarchyMask(layer: Layer): boolean {
-    const mask = layer.mask;
-    if (
-      !mask?.enabled ||
-      !mask.shapes?.some((shape) => shape.closed && shape.points.length >= 3)
-    ) return false;
-
-    const maskedTexture = this.applyMask(this.compositeTarget.texture, mask, layer.id);
-    if (maskedTexture === this.compositeTarget.texture) return false;
-
-    this._copyMaterial.map = maskedTexture;
-    this.renderer.setRenderTarget(this.compositeTarget);
-    this.renderer.render(this._copyScene, this.camera);
-    return true;
-  }
-
   /**
    * Render a group's children to a group render target and return the texture.
    * Individual mode: each child renders normally to the group target.
@@ -2064,13 +2018,7 @@ export class RenderEngine {
     this.compositeTarget = groupTarget;
 
     let childIdx = 0;
-    let activeHierarchyMask: Layer | null = null;
     for (const child of children) {
-      if (child.type === 'mask') {
-        activeHierarchyMask = child;
-        continue;
-      }
-
       // Determine texture source for this child
       const useGroupTexture = groupSourceTexture != null;
 
@@ -2078,33 +2026,15 @@ export class RenderEngine {
 
       // ── Inject group's texture as child's source ──────────────────────
       let origChildTexture: any = null;
-      let hadChildSource = false;
       let origContentFit: any = null;
       let origCropRegion: any = null;
       let origCropEnabled: boolean = false;
-      let hadStageTextureCoordinates = false;
-      let origStageTextureCoordinates: unknown;
       if (useGroupTexture) {
-        hadChildSource = child.source != null;
         if (!child.source) {
-          (child as any).source = {
-            texture: groupSourceTexture,
-            type: 'shader',
-            src: '',
-            id: 'group-inject',
-            name: 'group',
-            __stageTextureCoordinates: (group.source as any)?.__stageTextureCoordinates === true,
-          };
+          (child as any).source = { texture: groupSourceTexture, type: 'shader', src: '', id: 'group-inject', name: 'group' };
         } else {
           origChildTexture = child.source.texture;
-          hadStageTextureCoordinates = Object.prototype.hasOwnProperty.call(
-            child.source,
-            '__stageTextureCoordinates',
-          );
-          origStageTextureCoordinates = (child.source as any).__stageTextureCoordinates;
           (child.source as any).texture = groupSourceTexture;
-          (child.source as any).__stageTextureCoordinates =
-            (group.source as any)?.__stageTextureCoordinates === true;
         }
 
         origContentFit = child.contentFit;
@@ -2145,14 +2075,7 @@ export class RenderEngine {
       const obj = this.getOrCreateLayerObject(child);
       const layerTexture = this.getLayerTexture(child, obj);
       if (layerTexture) {
-        let finalTexture = this.processLayerPipeline(child, obj, layerTexture);
-        if (activeHierarchyMask?.mask?.enabled) {
-          finalTexture = this.applyMask(
-            finalTexture,
-            activeHierarchyMask.mask,
-            activeHierarchyMask.id,
-          );
-        }
+        const finalTexture = this.processLayerPipeline(child, obj, layerTexture);
         // Continuous-mode gate (see renderUnitsToCurrentTarget comment).
         const childSeqGate = (child as any)._seqGate;
         const childCompositeOpacity = child.opacity * (typeof childSeqGate === 'number' ? childSeqGate : 1);
@@ -2168,13 +2091,8 @@ export class RenderEngine {
         (child as any).edgeEffects = origEdge;
       }
       if (useGroupTexture) {
-        if (hadChildSource && child.source) {
+        if (origChildTexture !== null && child.source) {
           (child.source as any).texture = origChildTexture;
-          if (hadStageTextureCoordinates) {
-            (child.source as any).__stageTextureCoordinates = origStageTextureCoordinates;
-          } else {
-            delete (child.source as any).__stageTextureCoordinates;
-          }
         } else if ((child.source as any)?.id === 'group-inject') {
           (child as any).source = null;
         }
@@ -2393,10 +2311,7 @@ export class RenderEngine {
 
     // Flip, content fit, aspect
     obj.material.uniforms.uFlipH.value = !!layer.flipH !== !!layer.source?.mirrorX;
-    const stageTextureFlipV =
-      (layer.source as any)?.__stageTextureCoordinates === true
-      && stageTextureNeedsVerticalFlip(layer);
-    obj.material.uniforms.uFlipV.value = !!layer.flipV !== stageTextureFlipV;
+    obj.material.uniforms.uFlipV.value = layer.flipV || false;
     const contentFitMap: Record<string, number> = { stretch: 0, fill: 1, crop: 2 };
     obj.material.uniforms.uContentFit.value = contentFitMap[layer.contentFit || 'stretch'] ?? 0;
     let sourceAspect = this.width / this.height;
@@ -2467,8 +2382,9 @@ export class RenderEngine {
       }
     }
 
-    if (layer.warpMode === 'mesh' && layer.meshGrid && obj.originalUVs) {
-      this.applyMeshWarp(obj.geometry, layer.meshGrid, layer.corners, obj.originalUVs);
+    const renderMesh = layerRenderMeshGrid(layer);
+    if (renderMesh && obj.originalUVs) {
+      this.applyMeshWarp(obj.geometry, renderMesh, layer.corners, obj.originalUVs);
       obj.material.uniforms.uUseMeshPosition.value = true;
     } else {
       obj.material.uniforms.uUseMeshPosition.value = false;
@@ -2494,7 +2410,10 @@ export class RenderEngine {
       // uCropRegion: sampledUv = xy + sampledUv * zw
       // So xy = offset, zw = scale (portion of texture to show)
       obj.material.uniforms.uCropEnabled.value = true;
-      obj.material.uniforms.uCropRegion.value.set(minX, 1 - maxY, maxX - minX, maxY - minY);
+      // Corners and texture V both grow upward, so the band a child shows is
+      // its own corner box (Apply Stage wrote Y-down corners until
+      // 2026-09-11; those are converted on load).
+      obj.material.uniforms.uCropRegion.value.set(minX, minY, maxX - minX, maxY - minY);
 
       // CRITICAL: when the child screen has a polygon shape with fit
       // mode 'warp' or 'fill', the shader's custom-shape pass (further
@@ -2711,60 +2630,12 @@ export class RenderEngine {
       return sourceTexture;
     }
 
-    // Get polygon vertices from shape (in UV space 0-1)
-    // For layers without a custom shape, use default rectangle edges
-    const uvVertices = layer.layerShape
-      ? getShapeVertices(layer.layerShape)
-      : [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
-    if (uvVertices.length < 3) return sourceTexture;
-
-    // Transform UV-space vertices through the layer's corner warp to screen space (0-1 normalized)
-    const corners = layer.corners;
-    const screenVertices = uvVertices.map(uv => {
-      const topX = corners.topLeft.x + (corners.topRight.x - corners.topLeft.x) * uv.x;
-      const topY = corners.topLeft.y + (corners.topRight.y - corners.topLeft.y) * uv.x;
-      const botX = corners.bottomLeft.x + (corners.bottomRight.x - corners.bottomLeft.x) * uv.x;
-      const botY = corners.bottomLeft.y + (corners.bottomRight.y - corners.bottomLeft.y) * uv.x;
-      return {
-        x: botX + (topX - botX) * uv.y,
-        y: botY + (topY - botY) * uv.y,
-      };
-    });
-
-    // Inset vertices toward the centroid so the stroke renders INSIDE the
-    // layer boundary, not centered on it. This means thicker strokes grow
-    // inward and the outer edge stays aligned with the layer bounds.
-    // Use aspect-corrected inset so the inset looks uniform in pixels on
-    // both axes (0-1 normalized coords are stretched on a 16:9 canvas).
-    const cx = screenVertices.reduce((s, v) => s + v.x, 0) / screenVertices.length;
-    const cy = screenVertices.reduce((s, v) => s + v.y, 0) / screenVertices.length;
+    // The outline (layer shape through the mesh and corner warp, inset so
+    // strokes grow inward) comes from the contract the native core shares.
     const targetW = this.compositeTarget?.width || 1920;
     const targetH = this.compositeTarget?.height || 1080;
-    const insetPx = 5; // pixels of inset
-    const insetVertices = screenVertices.map(v => {
-      const dx = cx - v.x;
-      const dy = cy - v.y;
-      // Convert direction to pixel space, normalize, scale by insetPx, convert back
-      const dxPx = dx * targetW;
-      const dyPx = dy * targetH;
-      const lenPx = Math.sqrt(dxPx * dxPx + dyPx * dyPx) || 1;
-      return {
-        x: v.x + (dxPx / lenPx) * insetPx / targetW,
-        y: v.y + (dyPx / lenPx) * insetPx / targetH,
-      };
-    });
-
-    // Shaders support max 64 custom vertices — downsample if needed
-    let vertices: Point2D[];
-    if (insetVertices.length <= 64) {
-      vertices = insetVertices;
-    } else {
-      vertices = [];
-      const step = insetVertices.length / 64;
-      for (let i = 0; i < 64; i++) {
-        vertices.push(insetVertices[Math.floor(i * step)]);
-      }
-    }
+    const vertices: Point2D[] = edgeEffectOutline(layer, targetW, targetH);
+    if (vertices.length < 3) return sourceTexture;
 
     // Create edge effect render target if needed
     if (!this.edgeEffectTarget) {
@@ -2774,10 +2645,9 @@ export class RenderEngine {
     let currentTexture = sourceTexture;
     const useDrawingRenderer = !!this.shapeRendererRef;
 
-    for (const effect of layer.edgeEffects.effects) {
-      if (!effect.enabled) continue;
-
+    for (const effect of renderedEdgeEffects(layer.edgeEffects)) {
       let element: any;
+      const style = normalizeEdgeEffectStyle(effect);
 
       if (useDrawingRenderer) {
         // Use DrawingRenderer — full fill, animation, and stroke support
@@ -2797,9 +2667,9 @@ export class RenderEngine {
             closed: true,
             cornerStyle: 'sharp',
           } as PointClickLineShape,
-          fill: effect.fill,
-          stroke: effect.stroke,
-          animation: effect.animation,
+          fill: style.fill,
+          stroke: style.stroke,
+          animation: style.animation,
           warpCorners: createDefaultShapeWarp(),
           warpEnabled: false,
           meshWarp: createDefaultShapeMesh(),
@@ -2839,10 +2709,9 @@ export class RenderEngine {
       }
 
       // Render the edge effect to the edge effect target
-      const effectTexture = renderer.renderElements(
-        [element],
-        this.edgeEffectTarget
-      );
+      const effectTexture = useDrawingRenderer
+        ? renderer.renderElements([element], this.edgeEffectTarget, { styleBase: DEFAULT_DRAWING_STYLE })
+        : renderer.renderElements([element], this.edgeEffectTarget);
 
       // Composite edge effect onto current texture using the effect's blend mode
       // Copy current texture to temp target
@@ -2862,7 +2731,7 @@ export class RenderEngine {
       const blendMat = this.blendMaterials.get(effect.blendMode) || this.blendMaterials.get('normal')!;
       blendMat.uniforms.uBase.value = this.tempTarget.texture;
       blendMat.uniforms.uLayer.value = effectTexture;
-      blendMat.uniforms.uOpacity.value = effect.opacity;
+      blendMat.uniforms.uOpacity.value = Math.max(0, Math.min(1, effect.opacity ?? 1));
       this.compositeQuad.material = blendMat;
 
       // Use effectTargetA as output for the blended result
@@ -2961,7 +2830,6 @@ export class RenderEngine {
     this.bankBTarget?.dispose();
     this.bankATarget = null;
     this.bankBTarget = null;
-    this.setDeckMonitorCanvases(null, null);
     for (const mat of this.crossfadeMaterials.values()) {
       try { mat.dispose(); } catch {}
     }
@@ -3078,77 +2946,6 @@ export class RenderEngine {
     return this.crossfadeActive;
   }
 
-  /**
-   * Attach the VJ operator's A/B confidence-monitor canvases. The monitor
-   * pixels come from bankATarget / bankBTarget in this renderer, so stateful
-   * shaders and videos still execute exactly once per frame.
-   */
-  public setDeckMonitorCanvases(
-    deckA: HTMLCanvasElement | null,
-    deckB: HTMLCanvasElement | null,
-  ): void {
-    if (this.deckMonitorCanvasA === deckA && this.deckMonitorCanvasB === deckB) return;
-    this.deckMonitorCanvasA = deckA;
-    this.deckMonitorCanvasB = deckB;
-    this.deckMonitorContextA = deckA
-      ? deckA.getContext('2d', { alpha: false, desynchronized: true })
-      : null;
-    this.deckMonitorContextB = deckB
-      ? deckB.getContext('2d', { alpha: false, desynchronized: true })
-      : null;
-    this.deckMonitorLastUpdate = 0;
-  }
-
-  private updateDeckMonitorFrames(): void {
-    if (
-      !this.crossfadeActive ||
-      !this.bankATarget ||
-      !this.bankBTarget ||
-      !this.deckMonitorCanvasA ||
-      !this.deckMonitorCanvasB ||
-      !this.deckMonitorContextA ||
-      !this.deckMonitorContextB
-    ) return;
-
-    const now = performance.now();
-    if (now - this.deckMonitorLastUpdate < this.deckMonitorFrameInterval) return;
-    this.deckMonitorLastUpdate = now;
-
-    const outputMaterial = this.outputQuad.material as THREE.ShaderMaterial;
-    const previousTexture = outputMaterial.uniforms.uTexture.value;
-    const sourceCanvas = this.renderer.domElement;
-    const monitors = [
-      {
-        target: this.bankATarget,
-        canvas: this.deckMonitorCanvasA,
-        context: this.deckMonitorContextA,
-      },
-      {
-        target: this.bankBTarget,
-        canvas: this.deckMonitorCanvasB,
-        context: this.deckMonitorContextB,
-      },
-    ];
-
-    this.renderer.setRenderTarget(null);
-    for (const monitor of monitors) {
-      outputMaterial.uniforms.uTexture.value = monitor.target.texture;
-      this.renderer.render(this.outputScene, this.camera);
-      monitor.context.drawImage(
-        sourceCanvas,
-        0,
-        0,
-        sourceCanvas.width,
-        sourceCanvas.height,
-        0,
-        0,
-        monitor.canvas.width,
-        monitor.canvas.height,
-      );
-    }
-    outputMaterial.uniforms.uTexture.value = previousTexture;
-  }
-
   /** Allocate the bank FBOs the first time the crossfader is enabled.
    *  Same dimensions/format as compositeTarget so the existing layer
    *  blend pipeline composites into them transparently. */
@@ -3199,10 +2996,6 @@ export class RenderEngine {
   private renderUnitsToCurrentTarget(units: RenderUnit[], startIdx: number = 0): void {
     let compositeIdx = startIdx;
     for (const unit of units) {
-      if (unit.kind === 'mask') {
-        if (compositeIdx > 0) this.applyHierarchyMask(unit.layer);
-        continue;
-      }
       if (unit.kind === 'group') {
         const groupTexture = this.renderGroupToTexture(unit.group, unit.children);
         if (groupTexture) {
@@ -3375,18 +3168,9 @@ export class RenderEngine {
 // us at one ShaderMaterial / one program compile. Snapshot is the OLD frame
 // frozen at switch time; live is the NEW preset rendered each frame.
 
-export type TransitionType =
-  | 'dissolve'    // Crossfade with subtle radial drift to break the frozen-snapshot feel
-  | 'wipeUp'      // New emerges from bottom, sweeping up
-  | 'wipeDown'    // New emerges from top, sweeping down
-  | 'wipeLeft'    // New sweeps in from right edge
-  | 'wipeRight'   // New sweeps in from left edge
-  | 'wave'        // Sinusoidal vertical wipe (Disney projection-mapping style)
-  | 'iris'        // Circular reveal expanding from center
-  | 'voxelize'    // Pixel-block reveal — chunks flip from snapshot to live
-  | 'warp'        // Snapshot warps outward radially, blending into live
-  | 'explode'     // Snapshot fragments fly outward, live fades in beneath
-  | 'pixelMelt';  // Snapshot drips/melts down per-column, live revealed above
+/** Alias of `types.ts` TransitionStyle — that is the canonical list, so the
+ *  preset tray, the show timeline and this shader registry cannot drift. */
+export type TransitionType = TransitionStyle;
 
 export const TRANSITION_TYPE_INDEX: Record<TransitionType, number> = {
   dissolve: 0,

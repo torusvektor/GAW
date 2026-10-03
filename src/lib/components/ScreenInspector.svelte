@@ -19,9 +19,26 @@
    * same store, so warp-handle drags and slider edits both reflect
    * live on the editor canvas.
    */
+  import ProjectorCalibrationPanel from './ProjectorCalibrationPanel.svelte';
+  import { onMount } from 'svelte';
   import type { OutputSlice } from '../stores/settings';
-  import { screenActions } from '../stores/screens';
+  import { screenActions, selectedScreenMaskId, screenMaskPlacing } from '../stores/screens';
+  import { recordDiscreteAction, scheduleHistorySnapshot } from '../stores/historyHooks';
   import { isDesktopApp, getTextureShareLabel } from '$lib/bridge';
+  import { projectionSimScene } from '../projectionSim/store';
+
+  // Is the NDI native addon built + the NDI runtime initialized? Gates
+  // the NDI transport option below. Probed once on mount (same probe
+  // SettingsPanel uses); false outside Electron / without the addon.
+  let ndiAvailable = $state(false);
+  let ndiReason = $state('Checking NDI output support…');
+  onMount(async () => {
+    try {
+      const r = await (window as any).ghostNDI?.outputStatus?.();
+      ndiAvailable = !!r?.available;
+      ndiReason = r?.reason || 'NDI output requires the desktop app and optional NDI runtime.';
+    } catch { ndiAvailable = false; ndiReason = 'Could not check NDI output support. See Settings → Output → NDI Output.'; }
+  });
 
   type DisplayInfo = {
     id: number; label: string; width: number; height: number;
@@ -40,8 +57,18 @@
 
   const tsLabel = getTextureShareLabel();
 
+  // A Screen shows either a slice of the master or a Map Sim projector view.
+  const mapSimProjector = $derived(
+    screen.mapSimProjectorId
+      ? $projectionSimScene.projectors.find((p) => p.id === screen.mapSimProjectorId) ?? null
+      : null,
+  );
+
+  // Inspector edits are undoable; a slider drag or a burst of typing
+  // settles into one step.
   function update(partial: Partial<OutputSlice>) {
     screenActions.update(screen.id, partial);
+    scheduleHistorySnapshot();
   }
 
   function clampNumber(value: number, min: number, max: number) {
@@ -97,6 +124,11 @@
     update({ brightness, contrast, gamma });
   }
 
+  function selectMask(maskId: string) {
+    if ($selectedScreenMaskId !== maskId) screenMaskPlacing.set(false);
+    selectedScreenMaskId.set(maskId);
+  }
+
   const colorPresets = [
     { label: 'Neutral', brightness: 1, contrast: 1, gamma: 1 },
     { label: 'Punch', brightness: 1.05, contrast: 1.12, gamma: 1.05 },
@@ -104,7 +136,7 @@
   ];
 </script>
 
-<div class="inspector">
+<div data-help-page="masks-slices" class="inspector">
   <!-- Identity & target ─────────────────────────────────────────── -->
   <section class="sec">
     <input
@@ -128,10 +160,67 @@
       </select>
     </label>
 
+    {#if (screen.targetType ?? 'sender') === 'sender'}
+      <!-- Transport sub-select. undefined outputType = platform-local
+           texture share (Syphon on macOS / Spout on Windows). 'ndi'
+           engages the main-process composite NDI pump (see
+           stores/screens.ts engagement subscription). -->
+      <label class="field">
+        <span class="lbl">Transport</span>
+        <select
+          value={screen.outputType === 'ndi' ? 'ndi' : 'local'}
+          onchange={(e) => {
+            const v = (e.target as HTMLSelectElement).value;
+            update({ outputType: v === 'ndi' ? 'ndi' : undefined });
+          }}
+        >
+          <option value="local">{tsLabel} (local)</option>
+          <option value="ndi" disabled={!ndiAvailable}>NDI® (full composition)</option>
+        </select>
+      </label>
+    {/if}
+
+    {#if !ndiAvailable}
+      <p class="ndi-attribution">{ndiReason}</p>
+    {:else if screen.outputType === 'ndi'}
+      <p class="ndi-attribution">Sends one full composition. This screen’s crop and warp do not apply to NDI.</p>
+    {/if}
     <p class="ndi-attribution">
       <a href="https://ndi.video/" target="_blank" rel="noreferrer">NDI®</a>
       is a registered trademark of Vizrt NDI AB.
     </p>
+
+    <label class="field">
+      <span class="lbl">Source</span>
+      <select
+        aria-label="Screen source"
+        value={screen.mapSimProjectorId ?? ''}
+        onchange={(e) => {
+          const v = (e.target as HTMLSelectElement).value;
+          update({ mapSimProjectorId: v || null });
+        }}
+      >
+        <option value="">Slice of the output</option>
+        {#each $projectionSimScene.projectors as projector (projector.id)}
+          <option value={projector.id}>Map Sim: {projector.name}</option>
+        {/each}
+        {#if screen.mapSimProjectorId && !mapSimProjector}
+          <option value={screen.mapSimProjectorId}>Map Sim: missing projector</option>
+        {/if}
+      </select>
+    </label>
+    {#if screen.mapSimProjectorId}
+      <p class="hint">
+        {#if mapSimProjector}
+          Shows what {mapSimProjector.name} must emit: the 3D model through its lens with the content mapped on. Calibrate it in Map Sim.
+        {:else}
+          The Map Sim projector this Screen showed is gone. Pick another source.
+        {/if}
+        {#if (screen.targetType ?? 'sender') !== 'display'}
+          Map Sim views render on physical display outputs; switch Send to to Physical display.
+        {/if}
+      </p>
+    {/if}
 
     {#if (screen.targetType ?? 'sender') === 'display'}
       <label class="field">
@@ -176,20 +265,109 @@
   </section>
 
   <!-- Slice ────────────────────────────────────────────────────────
-       Per-Screen geometric warp (corners/mesh) was removed — all
-       geometric warping is now done ONCE, globally, by the Master Warp.
-       A Screen is simply a rectangular SLICE of that warped total
-       output. Set the slice rectangle by dragging on the editor canvas
-       or the top-down preview; only orientation lives here. -->
+       A Screen takes a slice of the total (master-warped) output. By
+       default that slice is a rectangle; Corner pin and Mesh let one
+       projector sample a skewed or curved region of the master instead
+       (the core's slice_warp_uv), with Bezier tangents on the mesh.
+       Geometry is dragged on the editor canvas; orientation and the warp
+       shape live here. -->
   <section class="sec">
     <h4>Slice</h4>
-    <p class="hint">This screen takes a rectangular slice of the total (master-warped) output. Drag its rectangle on the canvas or the preview above to set it.</p>
+    <div class="preset-strip" role="group" aria-label="Screen warp shape">
+      {#each [['rect', 'Rectangle'], ['corners', 'Corner pin'], ['mesh', 'Mesh']] as [mode, label] (mode)}
+        <button class="chip-btn" class:active={(screen.warpMode ?? 'rect') === mode}
+          onclick={() => screenActions.setWarpMode(screen.id, mode as 'rect' | 'corners' | 'mesh')}>{label}</button>
+      {/each}
+    </div>
+    {#if (screen.warpMode ?? 'rect') === 'rect'}
+      <p class="hint">This screen takes a rectangular slice of the total (master-warped) output. Drag its rectangle on the canvas or the preview above to set it.</p>
+    {:else}
+      {#if screen.warpMode === 'mesh' && screen.meshGrid}
+        <label class="field check-field">
+          <input type="checkbox" aria-label="Bezier curves" checked={screen.meshGrid.bezier ?? false}
+            onchange={(e) => screenActions.setMeshBezier(screen.id, (e.target as HTMLInputElement).checked)} />
+          <span>Bezier curves</span>
+        </label>
+      {/if}
+      <p class="hint">
+        {screen.warpMode === 'mesh' && screen.meshGrid?.bezier
+          ? 'Drag the points on the canvas. Click a point to show its curve handles: drag one to bend, Alt-drag to move it on its own, double-click to straighten.'
+          : 'Drag the points on the canvas to choose what this screen samples from the master.'}
+      </p>
+      <div class="preset-strip">
+        <button class="chip-btn" onclick={() => screenActions.resetWarp(screen.id)}>Reset warp</button>
+      </div>
+    {/if}
     <label class="field">
       <span class="lbl">Rotation</span>
       <select value={screen.rotation} onchange={(e) => update({ rotation: parseInt((e.target as HTMLSelectElement).value) as 0 | 90 | 180 | 270 })}>
         <option value={0}>0°</option><option value={90}>90°</option><option value={180}>180°</option><option value={270}>270°</option>
       </select>
     </label>
+  </section>
+
+  <ProjectorCalibrationPanel {screen} />
+
+  <!-- Masks ─────────────────────────────────────────────────────────
+       Polygon masks cut from this screen's frame after its crop and
+       warp, so they stay on the surface when the screen is re-pinned.
+       Geometry is edited on the canvas; this section is the list plus
+       enable / invert / feather. -->
+  <section class="sec controls-sec">
+    <div class="section-row">
+      <h4>Masks</h4>
+      <button class="section-action" onclick={() => screenActions.addMask(screen.id)}>Add mask</button>
+    </div>
+    {#if (screen.masks ?? []).length === 0}
+      <p class="hint">Add a mask, then click on the canvas to place its points. Masks keep the inside of their shape; Invert cuts a hole instead.</p>
+    {:else}
+      <div class="mask-list">
+        {#each screen.masks ?? [] as m (m.id)}
+          {@const active = $selectedScreenMaskId === m.id}
+          <div class="mask-row" class:active>
+            <div class="mask-head">
+              <input type="checkbox" aria-label="Enable {m.name}" checked={m.enabled}
+                onchange={(e) => { screenActions.updateMask(screen.id, m.id, { enabled: (e.target as HTMLInputElement).checked }); recordDiscreteAction(); }} />
+              <input class="mask-name" aria-label="Mask name" value={m.name}
+                onfocus={() => selectMask(m.id)}
+                onchange={(e) => { screenActions.updateMask(screen.id, m.id, { name: (e.target as HTMLInputElement).value }); recordDiscreteAction(); }} />
+              <button class="chip-btn" class:active={active} onclick={() => selectMask(m.id)}
+                title="Show this mask's points on the canvas">Edit</button>
+              <button class="icon-btn" aria-label="Delete {m.name}" title="Delete mask"
+                onclick={() => screenActions.removeMask(screen.id, m.id)}>✕</button>
+            </div>
+            {#if active}
+              <div class="preset-strip mask-tools">
+                <button class="chip-btn" class:active={$screenMaskPlacing}
+                  onclick={() => screenMaskPlacing.set(!$screenMaskPlacing)}>
+                  {$screenMaskPlacing ? 'Done placing' : 'Place points'}
+                </button>
+                <button class="chip-btn" class:active={m.invert}
+                  onclick={() => { screenActions.updateMask(screen.id, m.id, { invert: !m.invert }); recordDiscreteAction(); }}>Invert</button>
+                <span class="mask-count" class:warn={m.points.length < 3}>
+                  {m.points.length} point{m.points.length === 1 ? '' : 's'}{m.points.length < 3 ? ', needs 3' : ''}
+                </span>
+              </div>
+              <div class="range-row">
+                <span class="range-label">Feather</span>
+                <input aria-label="Mask feather" type="range" min="0" max="1" step="0.01" value={m.feather}
+                  oninput={(e) => { screenActions.updateMask(screen.id, m.id, { feather: numberFromEvent(e) }); scheduleHistorySnapshot(); }} />
+                <span class="value-wrap">
+                  <input class="value-box" aria-label="Mask feather percent" type="number" min="0" max="100" step="1" value={Math.round(m.feather * 100)}
+                    onchange={(e) => { screenActions.updateMask(screen.id, m.id, { feather: numberFromEvent(e) / 100 }); recordDiscreteAction(); }} />
+                  <span class="unit">%</span>
+                </span>
+              </div>
+              <p class="hint">
+                {$screenMaskPlacing
+                  ? 'Click on the canvas to add points. Click the first point, right-click, or press Enter to close the mask.'
+                  : 'Drag points on the canvas. Click a + to add a point on that edge. Double-click a point to curve it, then drag its round handles (Alt moves one alone). Right-click or Alt-click a point to remove it.'}
+              </p>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
   </section>
 
   <!-- Edge blend ───────────────────────────────────────────────── -->
@@ -431,6 +609,13 @@
     margin-bottom: 7px;
   }
   .field:last-child { margin-bottom: 0; }
+  .field.check-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
   .field .lbl {
     flex: 0 0 66px;
     color: #918b9b;
@@ -599,7 +784,7 @@
     border-radius: 4px;
     color: #e7e1ef;
     font-size: 11.5px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     text-align: right;
   }
   .no-unit .value-box {
@@ -609,7 +794,56 @@
     width: 11px;
     color: #77717d;
     font-size: 11px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
+  }
+  .mask-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mask-row {
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 5px;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+  .mask-row.active {
+    border-color: rgba(77, 216, 255, 0.4);
+    background: rgba(77, 216, 255, 0.04);
+  }
+  .mask-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .mask-head input[type="checkbox"] {
+    accent-color: #4dd8ff;
+    margin: 0;
+  }
+  .mask-name {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 6px;
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    border-radius: 4px;
+    color: #e6e1ee;
+    font-size: 12px;
+    font-family: inherit;
+  }
+  .mask-tools {
+    align-items: center;
+    margin-bottom: 0;
+  }
+  .mask-count {
+    color: #8f8998;
+    font-size: 11px;
+    margin-left: auto;
+  }
+  .mask-count.warn {
+    color: #ffc875;
   }
   .swatch {
     width: 7px;
@@ -636,7 +870,7 @@
     border: 1px solid rgba(255, 255, 255, 0.2);
     border-radius: 3px;
     padding: 0 5px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 11px;
   }
   .ndi-attribution {

@@ -19,13 +19,6 @@
   // Fill the entire window — the OSR window is sized to the Spout output resolution
   let width = window.innerWidth;
   let height = window.innerHeight;
-  let isOutputWindow = false;
-
-  function exitOutputFullscreen() {
-    invoke('output_exit_fullscreen').catch((err: any) => {
-      console.error('[Output] Failed to exit fullscreen:', err);
-    });
-  }
 
   onMount(() => {
     console.log('[SpoutOutput] OSR renderer started', width, 'x', height);
@@ -51,7 +44,7 @@
     window.addEventListener('resize', onResize);
 
     // Double-click to toggle fullscreen (for output window mode)
-    isOutputWindow = !!(window as any).__OUTPUT_WINDOW_MODE__;
+    const isOutputWindow = (window as any).__OUTPUT_WINDOW_MODE__;
     const onDblClick = () => {
       if (isOutputWindow) {
         invoke('output_toggle_fullscreen').catch((err: any) => {
@@ -60,14 +53,6 @@
       }
     };
     window.addEventListener('dblclick', onDblClick);
-
-    const onKeydown = (e: KeyboardEvent) => {
-      if (isOutputWindow && e.key === 'Escape') {
-        e.preventDefault();
-        exitOutputFullscreen();
-      }
-    };
-    window.addEventListener('keydown', onKeydown);
 
     // Signal to main process that the renderer is ready after a delay
     // (allows Three.js to initialize and first state to arrive)
@@ -82,7 +67,6 @@
     return () => {
       window.removeEventListener('resize', onResize);
       window.removeEventListener('dblclick', onDblClick);
-      window.removeEventListener('keydown', onKeydown);
       if (readyTimer) clearTimeout(readyTimer);
     };
   });

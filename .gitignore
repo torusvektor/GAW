@@ -4,6 +4,7 @@ dist-native-mobile/
 dist-web/
 dist-electron*/
 dist-release/
+build-resources/ffmpeg/
 .vite/
 *.log
 .DS_Store
@@ -11,6 +12,7 @@ Thumbs.db
 
 # Tauri build artifacts
 src-tauri/target/
+native-renderer/target/
 
 # Electron native addon build artifacts
 electron/native/build/
@@ -91,3 +93,11 @@ native-mobile/android/app/release/
 ghost-arcade-release.keystore
 android/keystore.properties
 native-mobile/android/keystore.properties
+
+# Release-reference git worktree + local Blender scratch
+.worktrees/
+*.blend
+*.blend1
+
+# Local render scratch (1.5GB of project output, not source)
+/output/

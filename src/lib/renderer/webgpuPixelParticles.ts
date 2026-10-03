@@ -1,3 +1,8 @@
+import type { GhostGpuBufferHandle } from './gpuRuntime';
+import { getGhostGpuRuntime } from './webgpuShared';
+import { createAndWarmWgslShaderModule, resolveGhostWgsl } from './wgsl';
+import { getParticleDirectorShaderSource } from './particleDirector';
+
 /**
  * WebGPUPixelParticles — turn any 2D source (image / video / canvas
  * / GPUTexture) into a cloud of 3D animated particles. Each pixel
@@ -123,6 +128,22 @@ const DEPTH_MOTION_IDS: Record<PixelDepthMotion, number> = {
   'breathe': 5,
 };
 
+export const PIXEL_PARTICLES_NATIVE_SHADER_IDS = Object.freeze({
+  compute: 'pixel-particles/compute',
+  render: 'pixel-particles/render',
+  renderLit: 'pixel-particles/render-lit',
+});
+
+/** Globals and render uniform sizes. Must match build_pixel_particles_*_bytes
+ *  in native-renderer/src/main.rs. */
+export const PIXEL_PARTICLES_GLOBALS_BYTES = 208;
+export const PIXEL_PARTICLES_RENDER_UNIFORM_BYTES = 160;
+
+/** Clip planes of the soft and lit projections. The lit render needs them to
+ *  turn a grain's radius into a depth offset. */
+const PIXEL_PARTICLES_NEAR = 0.1;
+const PIXEL_PARTICLES_FAR = 100;
+
 const COMPUTE_WGSL = /* wgsl */ `
 struct Particle {
   pos:   vec3<f32>,
@@ -181,6 +202,14 @@ struct Globals {
   depth_motion:  vec4<f32>,    // x=motion_id, y=amount, z=speed, w=scale
   depth_motion2: vec4<f32>,    // x=center, y=depth_coupling, z=phase, w=_
   native_depth_params: vec4<f32>, // x=enabled, y=minDepth, z=maxDepth, w=_
+  // Motion reactivity (depth-shift): x=amount, y=how fast the remembered luma
+  // catches up per second. The memory lives in p.life, which depth-shift did
+  // not otherwise use.
+  signal_params: vec4<f32>,
+  // Lit grains: x=on, y=shadow strength, z=shadow reach (UV), w=shadow
+  // softness as a fraction of depth amount. With grains on, p.vel carries
+  // (shadow, motion, 0) for the lit render instead of a Lambert tint.
+  grain_params:  vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -259,6 +288,57 @@ fn source_depth(sample_uv: vec2<f32>, rgb: vec3<f32>) -> f32 {
   let contrast = max(u.depth_params.z, 0.01);
   raw = clamp((raw - 0.5) * contrast + 0.5, 0.0, 1.0);
   return pow(raw, max(u.depth_params.y, 0.05));
+}
+
+// Depth for the shadow march: one texture sample. Luma, inverse and
+// saturation match source_depth exactly; edges and native depth, which need
+// neighbours or a second texture, fall back to luma. The march only has to
+// agree with the relief closely enough to cast believable shadows.
+fn fast_depth(sample_uv: vec2<f32>) -> f32 {
+  let rgb = textureSampleLevel(src, samp, sample_uv, 0.0).rgb;
+  let mode = u.depth_params.x;
+  var raw = lum(rgb);
+  if (mode > 2.5 && mode < 3.5) {
+    raw = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
+  } else if (mode > 0.5 && mode < 1.5) {
+    raw = 1.0 - raw;
+  }
+  let contrast = max(u.depth_params.z, 0.01);
+  raw = clamp((raw - 0.5) * contrast + 0.5, 0.0, 1.0);
+  return pow(raw, max(u.depth_params.y, 0.05));
+}
+
+// How much of the light this grain's pixel can see, marched over the relief.
+// Depth-shift is a heightfield: every particle sits at its pixel with Z from
+// depth. So a shadow is just "does the terrain between here and the light
+// rise above the ray", checked at six points. Exact for this geometry, no
+// shadow map, no extra buffers.
+fn relief_shadow(sample_uv: vec2<f32>, depth0: f32, depth_amount: f32, view_x: f32, view_y: f32) -> f32 {
+  let light = u.light_pos.xyz;
+  let horizontal = length(light.xy);
+  if (horizontal < 0.0001 || depth_amount < 0.0001) { return 0.0; }
+  let slope = max(light.z, 0.0) / horizontal;
+  // World X grows with uv.x, world Y falls as uv.y grows.
+  var dir_uv = vec2(light.x / max(view_x, 0.001), -light.y / max(view_y, 0.001));
+  dir_uv = dir_uv / max(length(dir_uv), 0.0001);
+  let world_per_uv = length(vec2(dir_uv.x * 2.0 * view_x, dir_uv.y * 2.0 * view_y));
+  // Mirroring flips which source pixel sits next to this one.
+  var step_dir = dir_uv;
+  if (u.fit_params.x > 0.5) { step_dir.x = -step_dir.x; }
+  let reach = max(u.grain_params.z, 0.001);
+  let soft = max(u.grain_params.w * depth_amount, 0.0005);
+  let center = clamp(u.depth_motion2.x, 0.0, 1.0);
+  let z0 = (depth0 - center) * depth_amount;
+  var occlusion = 0.0;
+  for (var k = 1; k <= 6; k = k + 1) {
+    let t = reach * f32(k) / 6.0;
+    let uv = sample_uv + step_dir * t;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { break; }
+    let terrain = (fast_depth(uv) - center) * depth_amount;
+    let ray = z0 + t * world_per_uv * slope;
+    occlusion = max(occlusion, smoothstep(0.0, soft, terrain - ray));
+  }
+  return occlusion;
 }
 
 fn apply_depth_motion(base: vec3<f32>, uv: vec2<f32>, depth_v: f32, seed: f32) -> vec3<f32> {
@@ -435,6 +515,17 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       rotated.y = rotated.y + ny * n_amp_xy * 2.0;
       rotated.z = rotated.z + nz * n_amp_z;
     }
+
+    // ── Signal: how much this pixel is changing ──
+    // A remembered luma that catches up at signal_params.y per second; the gap
+    // is the change. Stills settle to zero, so only moving video drives it.
+    // Tracked even with reactivity off, so turning it on mid-set does not
+    // push every particle at once against a stale memory.
+    if (p.life < 0.0) { p.life = l; }
+    let change = abs(l - p.life);
+    p.life = mix(p.life, l, 1.0 - exp(-u.dt * max(u.signal_params.y, 0.0)));
+    let motion = change * u.signal_params.x;
+    rotated.z = rotated.z + motion * 0.6;
     p.pos = rotated;
 
     // ── Lighting (optional) ──
@@ -444,7 +535,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // top of the source sample so colored sources keep their colour
     // but get the light/shadow gradient.
     var tint = vec3(1.0);
-    if (u.light_enabled > 0.5) {
+    // Skipped for lit grains, which light themselves: this block is eight or
+    // more texture samples per particle that would be thrown away.
+    if (u.light_enabled > 0.5 && u.grain_params.x < 0.5) {
       let h_scale = u.light_ambient_height.y;
       // Sample neighbours for finite-difference normal. Use the
       // texture size to compute one-pixel offsets; fallback to a
@@ -470,12 +563,22 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let ambient = u.light_ambient_height.x;
       tint = vec3(ambient + diffuse * intensity);
     }
+    if (u.grain_params.x > 0.5) {
+      // Lit grains shade themselves as spheres in the render pass; what they
+      // need from here is whether their pixel is in shadow, and the motion.
+      var shadow = 1.0;
+      if (u.grain_params.y > 0.001) {
+        shadow = 1.0 - relief_shadow(sample_uv, depth_v, depth, view_x, view_y) * clamp(u.grain_params.y, 0.0, 1.0);
+      }
+      tint = vec3(shadow, motion, 0.0);
+    } else {
+      tint = tint * (1.0 + motion * 1.5);
+    }
     // Stash tint in vel (vel is unused by the new stateless modes).
     // Render shader multiplies the source sample by this vec3 to
     // apply the lighting term.
     p.vel = tint;
     p.alpha = col.a;
-    p.life = 1.0;
   } else if (u.mode == 2u) {
     // ── SAND FALL ──
     // Stateless continuous flow. Each particle has a per-particle
@@ -613,6 +716,12 @@ struct RU {
   // original UV from instance id so source colour stays pinned to
   // the source pixel even when motion moves the particle in 3D.
   flags:        vec4<f32>,
+  // Shared with the lit render (see RENDER_LIT_WGSL); the soft render reads
+  // only lens, for depth of field.
+  light:        vec4<f32>,
+  material:     vec4<f32>,
+  lens:         vec4<f32>,    // x=focus distance, y=aperture, z=max blur (NDC), w=_
+  proj:         vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read>      particles: array<Particle>;
@@ -623,6 +732,17 @@ struct RU {
 fn hash11(n: f32) -> f32 {
   let s = sin(n * 78.233 + 12.9898) * 43758.5453;
   return s - floor(s);
+}
+
+// Uniform 0..1 from an instance index. Integer (PCG), because the sin-hash
+// above loses its fractional bits once n reaches the hundreds of thousands:
+// f32 cannot hold sin(n * 78.233) precisely there, the output stops being
+// uniform, and depth-of-field thinning quietly kept most blurred particles.
+fn instance_rand(index: u32) -> f32 {
+  var v = index * 747796405u + 2891336453u;
+  v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+  v = (v >> 22u) ^ v;
+  return f32(v) / 4294967295.0;
 }
 
 fn anchor_uv_for(iid: u32) -> vec2<f32> {
@@ -671,14 +791,38 @@ fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -
   }
 
   let base = u.mu.y;
-  let size_x = base * size_mul;
-  let size_y = base * size_mul * u.mu.x;
+  var size_x = base * size_mul;
 
   // Project the particle's world position via vp matrix; the
   // billboard offsets are added in clip space (post-projection)
   // so size stays constant on screen regardless of depth.
   let world = p.pos;
   let clip_center = u.vp * vec4(world, 1.0);
+
+  // Depth of field for soft discs: a particle away from the focus distance
+  // spreads over a larger disc and dims by the area it now covers, so the
+  // light it carries stays constant. Blending is already on, so one pass.
+  // Thinned rather than only faded, for the overdraw reason RENDER_LIT_WGSL's
+  // grain_vertex explains: three times the energy-exact survivors at a third
+  // of the alpha, so blurred regions cost a small multiple of sharp ones.
+  var dof_fade = 1.0;
+  if (u.lens.y > 0.0) {
+    let w = max(clip_center.w, 0.0001);
+    let blur = min(u.lens.y * 0.08 * abs(w - u.lens.x) / w, u.lens.z);
+    let grown = size_x + blur;
+    let ratio = (size_x * size_x) / (grown * grown);
+    let keep = min(1.0, ratio * 3.0);
+    dof_fade = ratio / keep;
+    if (instance_rand(iid) > keep) {
+      var thinned: VSOut;
+      thinned.clip = vec4(2.0, 2.0, 0.0, 1.0);
+      thinned.uv = vec2(0.0);
+      thinned.color = vec4(0.0);
+      return thinned;
+    }
+    size_x = grown;
+  }
+  let size_y = size_x * u.mu.x;
   // Perspective-divide the offset so size is in NDC; multiply by w
   // to keep the offset in clip space.
   let offset_clip = vec2(corner.x * size_x, corner.y * size_y) * clip_center.w;
@@ -691,7 +835,7 @@ fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -
   if (u.flags.x > 0.5) { resample_uv.x = 1.0 - resample_uv.x; }
   let c = textureSampleLevel(src, samp, clamp(resample_uv, vec2(0.0), vec2(1.0)), 0.0);
   let opacity_env = u.mu.w;
-  let a = clamp(p.alpha * opacity_env, 0.0, 1.0);
+  let a = clamp(p.alpha * opacity_env * dof_fade, 0.0, 1.0);
   // p.vel doubles as a per-particle tint (set by compute shader for
   // lighting in depth-shift; defaults to vec3(1) for everything else).
   let tint = p.vel;
@@ -717,6 +861,232 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let edge = 1.0 - smoothstep(0.7, 1.0, d);
   let alpha = in.color.a * edge;
   return vec4(in.color.rgb * edge, alpha);
+}
+`;
+
+/* ============================================================== */
+/* LIT GRAINS — sphere impostors with real depth                   */
+/* ============================================================== */
+/*
+ * The soft render draws each particle as an additive-looking disc with no
+ * depth, so a dense cloud reads as glow. Lit grains draw each one as a small
+ * sphere: a normal reconstructed from the sprite, lit by one directional
+ * light, and a per-pixel depth written so grains in front genuinely hide the
+ * ones behind. Close up that reads as a physical surface of pigment rather
+ * than a haze of dots.
+ *
+ * Depth of field is per particle rather than a post pass (the native graph
+ * cannot hand one pass's depth texture to another). A grain's circle of
+ * confusion comes from how far it sits from the focus distance. Grains that
+ * are in focus are drawn opaque with depth (vs_sharp); grains that are not
+ * are drawn after them, grown by their blur and faded by the area they now
+ * cover so their energy stays constant, depth-tested against the sharp ones
+ * but not writing (vs_blur + fs_bokeh). With aperture at zero there is one
+ * pass (vs_lit).
+ *
+ * The projection is the soft render's GL-style one; clip Z is remapped to
+ * WebGPU's 0..1 here, which the soft render never needed because it never
+ * depth-tested.
+ */
+const RENDER_LIT_WGSL = /* wgsl */ `
+struct Particle {
+  pos:   vec3<f32>,
+  alpha: f32,
+  vel:   vec3<f32>,   // lit grains: x = shadow, y = motion
+  life:  f32,
+};
+
+struct RU {
+  vp:       mat4x4<f32>,
+  mu:       vec4<f32>,  // x=aspect, y=base_size, z=mode_id, w=opacity
+  flags:    vec4<f32>,  // x=mirror, y=count, z=jitter, w=motion size gain
+  light:    vec4<f32>,  // xyz=light direction in view space, w=ambient
+  material: vec4<f32>,  // x=diffuse, y=specular, z=shininess, w=_
+  lens:     vec4<f32>,  // x=focus distance, y=aperture, z=max blur (NDC), w=_
+  proj:     vec4<f32>,  // x=near, y=far, z=focal (proj[5]), w=_
+};
+
+@group(0) @binding(0) var<storage, read> particles: array<Particle>;
+@group(0) @binding(1) var<uniform> u: RU;
+@group(0) @binding(2) var src: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+
+fn hash11(n: f32) -> f32 {
+  let s = sin(n * 78.233 + 12.9898) * 43758.5453;
+  return s - floor(s);
+}
+
+// Uniform 0..1 from an instance index. Integer (PCG), because the sin-hash
+// above loses its fractional bits once n reaches the hundreds of thousands:
+// f32 cannot hold sin(n * 78.233) precisely there, the output stops being
+// uniform, and depth-of-field thinning quietly kept most blurred particles.
+fn instance_rand(index: u32) -> f32 {
+  var v = index * 747796405u + 2891336453u;
+  v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+  v = (v >> 22u) ^ v;
+  return f32(v) / 4294967295.0;
+}
+
+fn anchor_uv_for(iid: u32) -> vec2<f32> {
+  let total = max(u.flags.y, 1.0);
+  let cols = ceil(sqrt(total));
+  let cx = f32(iid % u32(cols));
+  let cy = floor(f32(iid) / cols);
+  let cell = vec2(cx, cy) / cols;
+  let jitter = clamp(u.flags.z, 0.0, 1.0);
+  let jx = (hash11(f32(iid) * 1.731) - 0.5) * jitter / cols;
+  let jy = (hash11(f32(iid) * 2.137) - 0.5) * jitter / cols;
+  return clamp(cell + vec2(jx, jy), vec2(0.0), vec2(0.99999));
+}
+
+struct LitOut {
+  @builtin(position) clip: vec4<f32>,
+  @location(0) uv:           vec2<f32>,
+  @location(1) color:        vec3<f32>,
+  @location(2) shadow:       f32,
+  @location(3) depth_center: f32,
+  @location(4) depth_scale:  f32,
+  @location(5) alpha:        f32,
+};
+
+fn culled() -> LitOut {
+  var out: LitOut;
+  out.clip = vec4(2.0, 2.0, 0.0, 1.0);
+  return out;
+}
+
+// pass_id: 0 = lit with no depth of field, 1 = sharp grains only, 2 = blurred only
+fn grain_vertex(vid: u32, iid: u32, pass_id: u32) -> LitOut {
+  var corners = array<vec2<f32>, 6>(
+    vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0),
+    vec2(-1.0, 1.0),  vec2(1.0, -1.0), vec2(1.0, 1.0),
+  );
+  let corner = corners[vid];
+  let p = particles[iid];
+  if (p.alpha <= 0.001) { return culled(); }
+
+  let depth_shift = u.mu.z > 0.5 && u.mu.z < 1.5;
+  var size = u.mu.y * (0.5 + clamp(p.alpha, 0.0, 1.0) * 0.5);
+  if (u.mu.z > 3.5 && u.mu.z < 4.5) {
+    size = u.mu.y * clamp(p.life, 0.05, 1.0) * 1.6;
+  }
+  // Only depth-shift packs (shadow, motion) into vel; every other mode leaves
+  // it at vec3(1), which would read as full shadow-free light and full motion.
+  var shadow = 1.0;
+  if (depth_shift) {
+    shadow = clamp(p.vel.x, 0.0, 1.0);
+    size = size * (1.0 + max(p.vel.y, 0.0) * u.flags.w);
+  }
+
+  let clip = u.vp * vec4(p.pos, 1.0);
+  let w = max(clip.w, 0.0001);
+
+  var radius = size;
+  var alpha = u.mu.w;
+  if (pass_id > 0u) {
+    let blur = min(u.lens.y * 0.08 * abs(w - u.lens.x) / w, u.lens.z);
+    let blurred = blur > size * 0.6;
+    if (pass_id == 1u && blurred) { return culled(); }
+    if (pass_id == 2u && !blurred) { return culled(); }
+    if (pass_id == 2u) {
+      radius = size + blur;
+      // Constant energy by thinning, not fading. A grain blurred to radius r
+      // covers (r/size)^2 times its area; fading it by the inverse keeps the
+      // light right but multiplies overdraw by that same factor for every
+      // blurred grain, which was 30+ ms at a million particles. Keeping a
+      // random (size/r)^2 of them at full alpha carries the same expected
+      // light over the same total area as the sharp grains, and blurred
+      // neighbours overlap so heavily that the survivors read as smooth.
+      // Three times the energy-exact survivors, each a third as bright, so
+      // sparse features (a grid line, a few stars) blur into soft light rather
+      // than a handful of separate discs. Overdraw tops out near three times
+      // the sharp pass instead of growing with the blur.
+      let ratio = (size * size) / (radius * radius);
+      let keep = min(1.0, ratio * 3.0);
+      if (instance_rand(iid) > keep) { return culled(); }
+      alpha = alpha * (ratio / keep);
+    }
+  }
+
+  let offset = vec2(corner.x * radius, corner.y * radius * u.mu.x) * w;
+  // GL-style clip Z (-w..w) to WebGPU's 0..w.
+  let z01 = (clip.z + clip.w) * 0.5;
+
+  var sample_uv = anchor_uv_for(iid);
+  if (u.flags.x > 0.5) { sample_uv.x = 1.0 - sample_uv.x; }
+  let c = textureSampleLevel(src, samp, clamp(sample_uv, vec2(0.0), vec2(1.0)), 0.0);
+
+  // Sphere depth: how far in NDC depth the front of a grain of this radius
+  // sits ahead of its centre. radius is in NDC Y units; in view units it is
+  // radius * w / focal, and depth changes by near*far / ((far-near) * w^2)
+  // per view unit at distance w.
+  let near = u.proj.x;
+  let far = u.proj.y;
+  let radius_view = radius * w / max(u.proj.z, 0.0001);
+
+  var out: LitOut;
+  out.clip = vec4(clip.xy + offset, z01, clip.w);
+  out.uv = corner;
+  out.color = c.rgb;
+  out.shadow = shadow;
+  out.depth_center = z01 / w;
+  out.depth_scale = radius_view * near * far / ((far - near) * w * w);
+  out.alpha = alpha * c.a;
+  return out;
+}
+
+@vertex
+fn vs_lit(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> LitOut {
+  return grain_vertex(vid, iid, 0u);
+}
+
+@vertex
+fn vs_sharp(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> LitOut {
+  return grain_vertex(vid, iid, 1u);
+}
+
+@vertex
+fn vs_blur(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> LitOut {
+  return grain_vertex(vid, iid, 2u);
+}
+
+struct GrainFragment {
+  @location(0) color: vec4<f32>,
+  @builtin(frag_depth) depth: f32,
+};
+
+@fragment
+fn fs_lit(in: LitOut) -> GrainFragment {
+  let r2 = dot(in.uv, in.uv);
+  if (r2 > 1.0) { discard; }
+  let nz = sqrt(1.0 - r2);
+  let n = vec3(in.uv.x, in.uv.y, nz);
+  let l = normalize(u.light.xyz);
+  let ndl = dot(n, l);
+  // Wrapped diffuse so the terminator softens instead of cutting to black,
+  // and the unlit side of a grain still reads its colour.
+  let wrapped = clamp(ndl * 0.5 + 0.5, 0.0, 1.0);
+  let diffuse = mix(wrapped * wrapped, max(ndl, 0.0), 0.6) * in.shadow;
+  let halfway = normalize(l + vec3(0.0, 0.0, 1.0));
+  let spec = pow(max(dot(n, halfway), 0.0), max(u.material.z, 1.0)) * u.material.y * in.shadow;
+  let shade = u.light.w + u.material.x * diffuse;
+  var out: GrainFragment;
+  out.color = vec4(in.color * shade + vec3(spec), 1.0);
+  out.depth = clamp(in.depth_center - nz * in.depth_scale, 0.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fs_bokeh(in: LitOut) -> @location(0) vec4<f32> {
+  let r = length(in.uv);
+  if (r > 1.0) { discard; }
+  // An out-of-focus grain is a disc of light, not a lit sphere: shade it as
+  // if it faced the camera, keep the shadow it sits in.
+  let facing = clamp(normalize(u.light.xyz).z * 0.5 + 0.5, 0.0, 1.0);
+  let shade = u.light.w + u.material.x * facing * in.shadow;
+  // A wide, soft falloff: out-of-focus light has no hard rim at this size.
+  let a = in.alpha * (1.0 - smoothstep(0.3, 1.0, r));
+  return vec4(in.color * shade * a, a);
 }
 `;
 
@@ -748,6 +1118,649 @@ export interface PixelParticlesStats {
   hasSource: boolean;
 }
 
+export type PixelParticlesNativeShaderStage = 'compute' | 'render';
+
+export interface PixelParticlesNativeShaderSource {
+  shaderId: string;
+  label: string;
+  stage: PixelParticlesNativeShaderStage;
+  entry: string;
+  source: string;
+}
+
+export interface PixelParticlesNativePrecompileCommand {
+  type: 'precompile_shader';
+  shader_id: string;
+  stage: PixelParticlesNativeShaderStage;
+  entry: string;
+  source: string;
+}
+
+type PixelParticlesNativeGraphBinding = {
+  binding: number;
+  resource?: string;
+  kind?: string;
+  source_id?: string;
+  allow_missing?: boolean;
+};
+
+type PixelParticlesNativeGraphBuffer = {
+  id: string;
+  kind: 'uniform' | 'storage' | 'read-only-storage';
+  byte_length: number;
+  persistent?: boolean;
+  clear?: boolean;
+  initial_b64?: string;
+  initial_buffer?: ArrayBuffer | Uint8Array;
+};
+
+type PixelParticlesNativeGraphPass = {
+  name: string;
+  shader_id: string;
+  entry: string;
+  dispatch: [number, number, number];
+  bindings: PixelParticlesNativeGraphBinding[];
+};
+
+type PixelParticlesNativeGraphRenderPass = {
+  name: string;
+  shader_id: string;
+  vertex_entry: string;
+  fragment_entry: string;
+  target: 'source_frame';
+  source_id: string;
+  seq: number;
+  clear: boolean;
+  clear_color?: [number, number, number, number];
+  include_snapshot?: boolean;
+  blend: 'replace' | 'alpha' | 'add';
+  vertex_count: number;
+  instance_count: number;
+  depth_test?: boolean;
+  depth_write?: boolean;
+  depth_load?: boolean;
+  bindings: PixelParticlesNativeGraphBinding[];
+};
+
+/**
+ * Soft: one blended pass, no depth. Lit: opaque grains with depth; with an
+ * aperture, sharp grains first and then blurred grains over them, testing
+ * against the depth the sharp pass kept. Mirrors the Rust job exactly.
+ */
+function buildPixelParticlesRenderPasses(
+  params: PixelParticlesNativeParams,
+  sourceId: string,
+  seq: number,
+  includeSnapshot: boolean,
+  bindings: PixelParticlesNativeGraphBinding[],
+): PixelParticlesNativeGraphRenderPass[] {
+  const common = {
+    target: 'source_frame' as const,
+    source_id: sourceId,
+    seq,
+    clear_color: [0, 0, 0, 0] as [number, number, number, number],
+    include_snapshot: includeSnapshot,
+    vertex_count: 6,
+    instance_count: params.particleCount,
+    bindings,
+  };
+  if (params.grainShading !== 'lit') {
+    return [{
+      ...common,
+      name: 'pixel-particles-render',
+      shader_id: PIXEL_PARTICLES_NATIVE_SHADER_IDS.render,
+      vertex_entry: 'vs_main',
+      fragment_entry: 'fs_main',
+      clear: true,
+      blend: 'alpha',
+    }];
+  }
+  if (params.aperture <= 0) {
+    return [{
+      ...common,
+      name: 'pixel-particles-render-lit',
+      shader_id: PIXEL_PARTICLES_NATIVE_SHADER_IDS.renderLit,
+      vertex_entry: 'vs_lit',
+      fragment_entry: 'fs_lit',
+      clear: true,
+      blend: 'replace',
+      depth_test: true,
+      depth_write: true,
+    }];
+  }
+  return [
+    {
+      ...common,
+      name: 'pixel-particles-render-sharp',
+      shader_id: PIXEL_PARTICLES_NATIVE_SHADER_IDS.renderLit,
+      vertex_entry: 'vs_sharp',
+      fragment_entry: 'fs_lit',
+      clear: true,
+      blend: 'replace',
+      depth_test: true,
+      depth_write: true,
+    },
+    {
+      ...common,
+      name: 'pixel-particles-render-blur',
+      shader_id: PIXEL_PARTICLES_NATIVE_SHADER_IDS.renderLit,
+      vertex_entry: 'vs_blur',
+      fragment_entry: 'fs_bokeh',
+      clear: false,
+      include_snapshot: false,
+      blend: 'alpha',
+      depth_test: true,
+      depth_write: false,
+      depth_load: true,
+    },
+  ];
+}
+
+export interface PixelParticlesNativeGraphState {
+  particleCount: number;
+  mode: PixelEffectMode;
+  mediaSourceId: string;
+  prevFrameTime: number;
+}
+
+export interface PixelParticlesNativeGraphOptions {
+  sourceId: string;
+  mediaSourceId?: string | null;
+  params?: Record<string, any>;
+  width?: number;
+  height?: number;
+  sourceFrameSize?: number;
+  time?: number;
+  frameDelta?: number;
+  frameIndex?: number;
+  state?: PixelParticlesNativeGraphState | null;
+  reset?: boolean;
+  includeSnapshot?: boolean;
+}
+
+export interface PixelParticlesNativeGraphBuildResult {
+  config: {
+    buffers: PixelParticlesNativeGraphBuffer[];
+    passes: PixelParticlesNativeGraphPass[];
+    render_passes: PixelParticlesNativeGraphRenderPass[];
+    readbacks: string[];
+  };
+  sourceId: string;
+  mediaSourceId: string | null;
+  state: PixelParticlesNativeGraphState;
+  particleCount: number;
+  mode: PixelEffectMode;
+  passCount: number;
+}
+
+type PixelParticlesNativeParams = {
+  particleCount: number;
+  mode: PixelEffectMode;
+  knobs: [number, number, number, number];
+  baseSize: number;
+  opacity: number;
+  anchorJitter: number;
+  fovDeg: number;
+  cameraZ: number;
+  cameraYaw: number;
+  cameraPitch: number;
+  panX: number;
+  panY: number;
+  lightEnabled: boolean;
+  lightX: number;
+  lightY: number;
+  lightZ: number;
+  lightIntensity: number;
+  lightAmbient: number;
+  lightHeightStrength: number;
+  noiseAmpXY: number;
+  noiseAmpZ: number;
+  noiseFreq: number;
+  noiseSpeed: number;
+  depthSource: PixelDepthSource;
+  depthCurve: number;
+  depthContrast: number;
+  depthSmoothing: number;
+  depthCenter: number;
+  depthMotion: PixelDepthMotion;
+  depthMotionAmount: number;
+  depthMotionSpeed: number;
+  depthMotionScale: number;
+  depthMotionCoupling: number;
+  depthMotionPhase: number;
+  mirrorX: boolean;
+  motionReactive: number;
+  motionDecay: number;
+  /** 'soft' is the original glow disc; 'lit' draws sphere grains with depth. */
+  grainShading: 'soft' | 'lit';
+  grainSpecular: number;
+  grainShininess: number;
+  shadowStrength: number;
+  shadowReach: number;
+  shadowSoftness: number;
+  /** 0 = the nearest part of the relief is in focus, 1 = the farthest. */
+  focusDepth: number;
+  /** 0 = everything sharp. */
+  aperture: number;
+};
+
+export function getPixelParticlesNativeShaderSources(): PixelParticlesNativeShaderSource[] {
+  return [
+    {
+      shaderId: PIXEL_PARTICLES_NATIVE_SHADER_IDS.compute,
+      label: 'pixel-particles/compute',
+      stage: 'compute',
+      entry: 'cs_main',
+      source: resolveGhostWgsl(COMPUTE_WGSL, 'pixel-particles/compute'),
+    },
+    {
+      shaderId: PIXEL_PARTICLES_NATIVE_SHADER_IDS.render,
+      label: 'pixel-particles/render',
+      stage: 'render',
+      entry: 'fs_main',
+      source: resolveGhostWgsl(RENDER_WGSL, 'pixel-particles/render'),
+    },
+    {
+      shaderId: PIXEL_PARTICLES_NATIVE_SHADER_IDS.renderLit,
+      label: 'pixel-particles/render-lit',
+      stage: 'render',
+      entry: 'fs_lit',
+      source: resolveGhostWgsl(RENDER_LIT_WGSL, 'pixel-particles/render-lit'),
+    },
+    // Auto Camera's points of interest; the core runs it, not this module.
+    getParticleDirectorShaderSource(),
+  ];
+}
+
+export function buildPixelParticlesNativePrecompileCommands(): PixelParticlesNativePrecompileCommand[] {
+  return getPixelParticlesNativeShaderSources().map((shader) => ({
+    type: 'precompile_shader',
+    shader_id: shader.shaderId,
+    stage: shader.stage,
+    entry: shader.entry,
+    source: shader.source,
+  }));
+}
+
+function clampFinite(value: unknown, min: number, max: number, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function enumParam<T extends string>(value: unknown, allowed: Record<T, number>, fallback: T): T {
+  const key = String(value ?? '').trim() as T;
+  return Object.prototype.hasOwnProperty.call(allowed, key) ? key : fallback;
+}
+
+function pixelKnobsForMode(mode: PixelEffectMode, p: Record<string, any>): [number, number, number, number] {
+  switch (mode) {
+    case 'depth-shift':
+      return [
+        clampFinite(p.depthAmount, 0, 8, 0.6),
+        0,
+        clampFinite(p.depthSpinSpeed, -16, 16, 0),
+        clampFinite(p.depthSpinAxis, 0, 1, 0),
+      ];
+    case 'sand-fall':
+      return [
+        clampFinite(p.sandFallSpeed, 0.001, 16, 0.4),
+        clampFinite(p.sandFloorY, -16, 16, -1),
+        clampFinite(p.sandDrift, 0, 8, 0.02),
+        clampFinite(p.sandDensity, 0, 1, 1),
+      ];
+    case 'scatter':
+      return [
+        clampFinite(p.scatterAmp, 0, 8, 0.04),
+        clampFinite(p.scatterRecovery, 0, 16, 1.5),
+        clampFinite(p.scatterFreq, 0.001, 128, 4),
+        0,
+      ];
+    case 'halftone':
+      return [clampFinite(p.halftoneCellSize, 0.0001, 1, 0.012), 1, 0, 0];
+    case 'stipple-noise':
+      return [
+        clampFinite(p.stippleAmp, 0, 8, 0.008),
+        clampFinite(p.stippleFreq, 0.001, 256, 35),
+        0,
+        0,
+      ];
+    case 'dissolve':
+      return [
+        clampFinite(p.dissolveSpread, 0, 16, 1.6),
+        clampFinite(p.dissolveSpeed, 0.001, 16, 0.6),
+        clampFinite(p.dissolveSwirl, -16, 16, 0.5),
+        0,
+      ];
+    case 'identity':
+    default:
+      return [0, 0, 0, 0];
+  }
+}
+
+function normalizePixelParticlesNativeParams(raw: Record<string, any> | undefined): PixelParticlesNativeParams {
+  const src = raw ?? {};
+  const mode = enumParam(src.mode, MODE_IDS, 'depth-shift');
+  return {
+    particleCount: Math.round(clampFinite(src.particleCount, 1024, MAX_PARTICLES, DEFAULT_PARTICLES)),
+    mode,
+    knobs: pixelKnobsForMode(mode, src),
+    baseSize: clampFinite(src.baseSize, 0.0005, 0.05, 0.005),
+    opacity: clampFinite(src.opacity, 0, 1, 1),
+    anchorJitter: clampFinite(src.anchorJitter, 0, 1, 0.6),
+    fovDeg: clampFinite(src.fovDeg, 10, 120, 50),
+    cameraZ: clampFinite(src.cameraZ, 0.5, 10, 2.2),
+    cameraYaw: clampFinite(src.cameraYaw, -3600, 3600, 0),
+    cameraPitch: clampFinite(src.cameraPitch, -3600, 3600, 0),
+    panX: clampFinite(src.panX, -16, 16, 0),
+    panY: clampFinite(src.panY, -16, 16, 0),
+    lightEnabled: !!src.lightEnabled,
+    lightX: clampFinite(src.lightX, -16, 16, 1),
+    lightY: clampFinite(src.lightY, -16, 16, 1),
+    lightZ: clampFinite(src.lightZ, -16, 16, 1.5),
+    lightIntensity: clampFinite(src.lightIntensity, 0, 16, 1.5),
+    lightAmbient: clampFinite(src.lightAmbient, 0, 4, 0.25),
+    lightHeightStrength: clampFinite(src.lightHeightStrength, 0, 16, 1.5),
+    noiseAmpXY: clampFinite(src.noiseAmpXY, 0, 8, 0),
+    noiseAmpZ: clampFinite(src.noiseAmpZ, 0, 16, 0),
+    noiseFreq: clampFinite(src.noiseFreq, 0.001, 128, 4),
+    noiseSpeed: clampFinite(src.noiseSpeed, 0, 16, 0.5),
+    depthSource: enumParam(src.depthSource, DEPTH_SOURCE_IDS, 'luminance'),
+    depthCurve: clampFinite(src.depthCurve, 0.05, 4, 1),
+    depthContrast: clampFinite(src.depthContrast, 0.01, 4, 1),
+    depthSmoothing: clampFinite(src.depthSmoothing, 0, 1, 0.2),
+    depthCenter: clampFinite(src.depthCenter, 0, 1, 0.5),
+    depthMotion: enumParam(src.depthMotion, DEPTH_MOTION_IDS, 'locked'),
+    depthMotionAmount: clampFinite(src.depthMotionAmount, 0, 2, 0.08),
+    depthMotionSpeed: clampFinite(src.depthMotionSpeed, 0, 4, 0.45),
+    depthMotionScale: clampFinite(src.depthMotionScale, 0.1, 24, 3.5),
+    depthMotionCoupling: clampFinite(src.depthMotionCoupling, 0, 3, 0.7),
+    depthMotionPhase: clampFinite(src.depthMotionPhase, -100000, 100000, 0),
+    mirrorX: !!src.mirrorX,
+    motionReactive: clampFinite(src.motionReactive, 0, 8, 0),
+    motionDecay: clampFinite(src.motionDecay, 0, 60, 3),
+    grainShading: src.grainShading === 'lit' ? 'lit' : 'soft',
+    grainSpecular: clampFinite(src.grainSpecular, 0, 4, 0.35),
+    grainShininess: clampFinite(src.grainShininess, 1, 256, 24),
+    shadowStrength: clampFinite(src.shadowStrength, 0, 1, 0.65),
+    shadowReach: clampFinite(src.shadowReach, 0.001, 0.5, 0.06),
+    shadowSoftness: clampFinite(src.shadowSoftness, 0.001, 1, 0.08),
+    focusDepth: clampFinite(src.focusDepth, 0, 1, 0.5),
+    aperture: clampFinite(src.aperture, 0, 4, 0),
+  };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function bufferToBase64(buffer: ArrayBuffer): string {
+  return bytesToBase64(new Uint8Array(buffer));
+}
+
+function pixelParticlesInitialBuffer(count: number): ArrayBuffer {
+  const particleCount = Math.max(1024, Math.min(MAX_PARTICLES, Math.floor(count)));
+  const data = new Float32Array(particleCount * (PARTICLE_BYTES / 4));
+  for (let i = 0; i < particleCount; i++) {
+    // life < 0: depth-shift's remembered luma has not been read yet, so the
+    // first frame is not mistaken for the whole picture changing. Every other
+    // mode writes life before anything reads it.
+    data[i * 8 + 7] = -1;
+  }
+  return data.buffer;
+}
+
+function identityMat4(): Float32Array {
+  const m = new Float32Array(16);
+  m[0] = m[5] = m[10] = m[15] = 1;
+  return m;
+}
+
+function computePixelParticlesViewProjection(params: PixelParticlesNativeParams, width: number, height: number): Float32Array {
+  const aspect = Math.max(1, width) / Math.max(1, height);
+  const fov = (params.fovDeg * Math.PI) / 180;
+  const near = PIXEL_PARTICLES_NEAR;
+  const far = PIXEL_PARTICLES_FAR;
+  const f = 1 / Math.tan(fov / 2);
+  const proj = new Float32Array(16);
+  proj[0] = f / aspect;
+  proj[5] = f;
+  proj[10] = (far + near) / (near - far);
+  proj[11] = -1;
+  proj[14] = (2 * far * near) / (near - far);
+
+  const yaw = (params.cameraYaw * Math.PI) / 180;
+  const pitch = (params.cameraPitch * Math.PI) / 180;
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const rotY = identityMat4();
+  rotY[0] = cy; rotY[2] = sy; rotY[8] = -sy; rotY[10] = cy;
+  const rotX = identityMat4();
+  rotX[5] = cp; rotX[6] = sp; rotX[9] = -sp; rotX[10] = cp;
+  const trans = identityMat4();
+  trans[12] = params.panX;
+  trans[13] = params.panY;
+  trans[14] = -params.cameraZ;
+  return mat4Mul(proj, mat4Mul(trans, mat4Mul(rotX, rotY)));
+}
+
+function buildPixelParticlesGlobalsUniform(
+  params: PixelParticlesNativeParams,
+  time: number,
+  dt: number,
+  width: number,
+  height: number,
+  sourceFrameSize: number,
+): string {
+  const buffer = new ArrayBuffer(PIXEL_PARTICLES_GLOBALS_BYTES);
+  const f = new Float32Array(buffer);
+  const u = new Uint32Array(buffer);
+  f[0] = time;
+  f[1] = dt;
+  u[2] = params.particleCount >>> 0;
+  u[3] = MODE_IDS[params.mode] >>> 0;
+  f[4] = params.knobs[0];
+  f[5] = params.knobs[1];
+  f[6] = params.knobs[2];
+  f[7] = params.knobs[3];
+  f[8] = sourceFrameSize;
+  f[9] = sourceFrameSize;
+  f[10] = params.anchorJitter;
+  f[11] = params.lightEnabled ? 1 : 0;
+  f[12] = params.lightX;
+  f[13] = params.lightY;
+  f[14] = params.lightZ;
+  f[15] = params.lightIntensity;
+  f[16] = params.lightAmbient;
+  f[17] = params.lightHeightStrength;
+  f[20] = params.noiseAmpXY;
+  f[21] = params.noiseAmpZ;
+  f[22] = params.noiseFreq;
+  f[23] = params.noiseSpeed;
+  const fovRad = params.fovDeg * Math.PI / 180;
+  const canvasAspect = Math.max(1, width) / Math.max(1, height);
+  const viewY = Math.tan(fovRad * 0.5) * params.cameraZ;
+  const viewX = viewY * canvasAspect;
+  f[24] = params.mirrorX ? 1 : 0;
+  f[25] = canvasAspect;
+  f[26] = viewX;
+  f[27] = viewY;
+  f[28] = params.depthSource === 'native-depth' ? DEPTH_SOURCE_IDS.luminance : DEPTH_SOURCE_IDS[params.depthSource];
+  f[29] = params.depthCurve;
+  f[30] = params.depthContrast;
+  f[31] = params.depthSmoothing;
+  f[32] = DEPTH_MOTION_IDS[params.depthMotion];
+  f[33] = params.depthMotionAmount;
+  f[34] = params.depthMotionSpeed;
+  f[35] = params.depthMotionScale;
+  f[36] = params.depthCenter;
+  f[37] = params.depthMotionCoupling;
+  f[38] = params.depthMotionPhase;
+  f[40] = 0;
+  f[41] = 0;
+  f[42] = 1;
+  f[44] = params.motionReactive;
+  f[45] = params.motionDecay;
+  f[48] = params.grainShading === 'lit' ? 1 : 0;
+  f[49] = params.shadowStrength;
+  f[50] = params.shadowReach;
+  f[51] = params.shadowSoftness;
+  return bufferToBase64(buffer);
+}
+
+/** The world light direction the relief is lit from, in view space: grains
+ *  are shaded in view space, while the light belongs to the scene, so it has
+ *  to turn with the camera. */
+export function pixelParticlesLightViewDir(params: Pick<PixelParticlesNativeParams, 'lightX' | 'lightY' | 'lightZ' | 'cameraYaw' | 'cameraPitch'>): [number, number, number] {
+  const len = Math.hypot(params.lightX, params.lightY, params.lightZ) || 1;
+  let x = params.lightX / len;
+  let y = params.lightY / len;
+  let z = params.lightZ / len;
+  const yaw = (params.cameraYaw * Math.PI) / 180;
+  const pitch = (params.cameraPitch * Math.PI) / 180;
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  // rotY then rotX, matching computePixelParticlesViewProjection (column-major).
+  const x1 = cy * x - sy * z;
+  const z1 = sy * x + cy * z;
+  x = x1; z = z1;
+  const y2 = cp * y - sp * z;
+  const z2 = sp * y + cp * z;
+  return [x, y2, z2];
+}
+
+/** Focus distance in view units for a 0..1 focus depth across the relief. */
+export function pixelParticlesFocusDistance(params: Pick<PixelParticlesNativeParams, 'cameraZ' | 'depthCenter' | 'knobs' | 'focusDepth'>): number {
+  const depth = params.knobs[0];
+  const nearest = (1 - params.depthCenter) * depth;
+  const farthest = (0 - params.depthCenter) * depth;
+  return params.cameraZ - (nearest + (farthest - nearest) * params.focusDepth);
+}
+
+function buildPixelParticlesRenderUniform(params: PixelParticlesNativeParams, width: number, height: number): string {
+  const buffer = new ArrayBuffer(PIXEL_PARTICLES_RENDER_UNIFORM_BYTES);
+  const f = new Float32Array(buffer);
+  f.set(computePixelParticlesViewProjection(params, width, height), 0);
+  f[16] = Math.max(1, width) / Math.max(1, height);
+  f[17] = params.baseSize;
+  f[18] = MODE_IDS[params.mode];
+  f[19] = params.opacity;
+  f[20] = params.mirrorX ? 1 : 0;
+  f[21] = params.particleCount;
+  f[22] = params.anchorJitter;
+  f[23] = params.motionReactive > 0 ? 2.5 : 0;
+  const light = pixelParticlesLightViewDir(params);
+  f[24] = light[0];
+  f[25] = light[1];
+  f[26] = light[2];
+  f[27] = params.lightAmbient;
+  f[28] = params.lightIntensity;
+  f[29] = params.grainSpecular;
+  f[30] = params.grainShininess;
+  f[32] = pixelParticlesFocusDistance(params);
+  f[33] = params.aperture;
+  f[34] = 0.03;
+  f[36] = PIXEL_PARTICLES_NEAR;
+  f[37] = PIXEL_PARTICLES_FAR;
+  f[38] = 1 / Math.tan((params.fovDeg * Math.PI) / 360);
+  return bufferToBase64(buffer);
+}
+
+export function buildPixelParticlesNativeComputeGraph(options: PixelParticlesNativeGraphOptions): PixelParticlesNativeGraphBuildResult {
+  const params = normalizePixelParticlesNativeParams(options.params);
+  const sourceId = String(options.sourceId || 'pixel-particles-native-source');
+  const mediaSourceId = options.mediaSourceId ? String(options.mediaSourceId) : '';
+  const time = Math.max(0, Number.isFinite(options.time) ? Number(options.time) : 0);
+  const mustReset = !!options.reset
+    || !options.state
+    || options.state.particleCount !== params.particleCount
+    || options.state.mode !== params.mode
+    || options.state.mediaSourceId !== mediaSourceId;
+  const state: PixelParticlesNativeGraphState = mustReset
+    ? { particleCount: params.particleCount, mode: params.mode, mediaSourceId, prevFrameTime: time }
+    : { ...options.state!, mode: params.mode, mediaSourceId };
+  let dt = typeof options.frameDelta === 'number' && Number.isFinite(options.frameDelta)
+    ? options.frameDelta
+    : (state.prevFrameTime === 0 ? 1 / 60 : time - state.prevFrameTime);
+  dt = Math.min(Math.max(dt, 0), 0.05);
+  state.prevFrameTime = time;
+
+  const prefix = `pixel-particles:${sourceId.replace(/[^a-zA-Z0-9:_-]+/g, '_').slice(0, 160)}:${params.mode}:${params.particleCount}`;
+  const id = (name: string) => `${prefix}:${name}`;
+  const width = Math.round(options.width || 1920);
+  const height = Math.round(options.height || 1080);
+  const sourceFrameSize = Math.max(1, Math.round(options.sourceFrameSize || Math.max(width, height)));
+  const sourceTextureBinding: PixelParticlesNativeGraphBinding = mediaSourceId
+    ? { binding: 2, kind: 'source-frame-texture', source_id: mediaSourceId }
+    : { binding: 2, kind: 'source-frame-texture', allow_missing: true };
+
+  const buffers: PixelParticlesNativeGraphBuffer[] = [
+    {
+      id: id('globals'),
+      kind: 'uniform',
+      byte_length: PIXEL_PARTICLES_GLOBALS_BYTES,
+      initial_b64: buildPixelParticlesGlobalsUniform(params, time, dt, width, height, sourceFrameSize),
+    },
+    {
+      id: id('render-uniform'),
+      kind: 'uniform',
+      byte_length: PIXEL_PARTICLES_RENDER_UNIFORM_BYTES,
+      initial_b64: buildPixelParticlesRenderUniform(params, width, height),
+    },
+    {
+      id: id('particles'),
+      kind: 'storage',
+      byte_length: params.particleCount * PARTICLE_BYTES,
+      persistent: true,
+      clear: mustReset,
+      initial_buffer: mustReset ? pixelParticlesInitialBuffer(params.particleCount) : undefined,
+    },
+  ];
+  const passes: PixelParticlesNativeGraphPass[] = [
+    {
+      name: 'pixel-particles-compute',
+      shader_id: PIXEL_PARTICLES_NATIVE_SHADER_IDS.compute,
+      entry: 'cs_main',
+      dispatch: [Math.ceil(params.particleCount / 64), 1, 1],
+      bindings: [
+        { binding: 0, resource: id('particles'), kind: 'storage' },
+        { binding: 1, resource: id('globals'), kind: 'uniform' },
+        sourceTextureBinding,
+        { binding: 3, kind: 'source-frame-sampler' },
+        { binding: 4, kind: 'source-frame-texture', allow_missing: true },
+      ],
+    },
+  ];
+  const renderBindings: PixelParticlesNativeGraphBinding[] = [
+    { binding: 0, resource: id('particles'), kind: 'read-only-storage' },
+    { binding: 1, resource: id('render-uniform'), kind: 'uniform' },
+    sourceTextureBinding,
+    { binding: 3, kind: 'source-frame-sampler' },
+  ];
+  const seq = Math.max(0, Math.round(options.frameIndex ?? 0));
+  const renderPasses = buildPixelParticlesRenderPasses(params, sourceId, seq, !!options.includeSnapshot, renderBindings);
+
+  return {
+    config: {
+      buffers,
+      passes,
+      render_passes: renderPasses,
+      readbacks: [],
+    },
+    sourceId,
+    mediaSourceId: mediaSourceId || null,
+    state,
+    particleCount: params.particleCount,
+    mode: params.mode,
+    passCount: passes.length + renderPasses.length,
+  };
+}
+
 export class WebGPUPixelParticles {
   static async create(device: any, presentFormat: any): Promise<WebGPUPixelParticles> {
     return new WebGPUPixelParticles(device, presentFormat);
@@ -759,6 +1772,9 @@ export class WebGPUPixelParticles {
   private particleBuffer: any;
   private globalsBuffer: any;
   private renderUniformBuffer: any;
+  private particleBufferHandle: GhostGpuBufferHandle | null = null;
+  private globalsBufferHandle: GhostGpuBufferHandle | null = null;
+  private renderUniformBufferHandle: GhostGpuBufferHandle | null = null;
   private sourceTexture: any = null;
   private nativeDepthTexture: any = null;
   private sourceSampler: any;
@@ -849,9 +1865,18 @@ export class WebGPUPixelParticles {
     this.startTime = performance.now();
     this.lastFrameTime = this.startTime;
 
-    this.particleBuffer = device.createBuffer({
-      size: MAX_PARTICLES * PARTICLE_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    const runtime = getGhostGpuRuntime();
+    const particleBufferSize = MAX_PARTICLES * PARTICLE_BYTES;
+    const particleBufferUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    this.particleBufferHandle = runtime?.resources.acquireBuffer(
+      particleBufferSize,
+      particleBufferUsage,
+      'pixel-particles/particles',
+    ) ?? null;
+    this.particleBuffer = this.particleBufferHandle?.buffer ?? device.createBuffer({
+      label: 'pixel-particles/particles',
+      size: particleBufferSize,
+      usage: particleBufferUsage,
     });
     // Globals struct is 176 bytes:
     //   time, dt, total(u32), mode(u32)            → 16
@@ -865,14 +1890,27 @@ export class WebGPUPixelParticles {
     //   depth_motion vec4                           → 16
     //   depth_motion2 vec4                          → 16
     //   native_depth_params vec4                    → 16
-    this.globalsBuffer = device.createBuffer({
-      size: 176,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    const globalsBufferUsage = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+    this.globalsBufferHandle = runtime?.resources.acquireBuffer(
+      176,
+      globalsBufferUsage,
+      'pixel-particles/globals',
+    ) ?? null;
+    this.globalsBuffer = this.globalsBufferHandle?.buffer ?? device.createBuffer({
+      label: 'pixel-particles/globals',
+      size: PIXEL_PARTICLES_GLOBALS_BYTES,
+      usage: globalsBufferUsage,
     });
     // Render uniform: mat4x4 (64) + vec4 meta (16) + vec4 flags (16) = 96
-    this.renderUniformBuffer = device.createBuffer({
-      size: 96,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    this.renderUniformBufferHandle = runtime?.resources.acquireBuffer(
+      96,
+      globalsBufferUsage,
+      'pixel-particles/render-uniforms',
+    ) ?? null;
+    this.renderUniformBuffer = this.renderUniformBufferHandle?.buffer ?? device.createBuffer({
+      label: 'pixel-particles/render-uniforms',
+      size: PIXEL_PARTICLES_RENDER_UNIFORM_BYTES,
+      usage: globalsBufferUsage,
     });
 
     this.sourceSampler = device.createSampler({
@@ -884,7 +1922,8 @@ export class WebGPUPixelParticles {
 
     // Build pipelines. Bind groups are deferred until a source
     // texture has been provided (because they need to bind it).
-    const computeModule = device.createShaderModule({ code: COMPUTE_WGSL });
+    const shaderRuntime = runtime ?? device;
+    const computeModule = createAndWarmWgslShaderModule(shaderRuntime, COMPUTE_WGSL, 'pixel-particles/compute');
     this.computeBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -899,7 +1938,7 @@ export class WebGPUPixelParticles {
       compute: { module: computeModule, entryPoint: 'cs_main' },
     });
 
-    this.renderModule = device.createShaderModule({ code: RENDER_WGSL });
+    this.renderModule = createAndWarmWgslShaderModule(shaderRuntime, RENDER_WGSL, 'pixel-particles/render');
     this.renderBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
@@ -1526,11 +2565,22 @@ export class WebGPUPixelParticles {
   }
 
   dispose(): void {
-    try { this.particleBuffer?.destroy?.(); } catch { /* */ }
-    try { this.globalsBuffer?.destroy?.(); } catch { /* */ }
-    try { this.renderUniformBuffer?.destroy?.(); } catch { /* */ }
+    if (this.particleBufferHandle) this.particleBufferHandle.release();
+    else try { this.particleBuffer?.destroy?.(); } catch { /* */ }
+    if (this.globalsBufferHandle) this.globalsBufferHandle.release();
+    else try { this.globalsBuffer?.destroy?.(); } catch { /* */ }
+    if (this.renderUniformBufferHandle) this.renderUniformBufferHandle.release();
+    else try { this.renderUniformBuffer?.destroy?.(); } catch { /* */ }
     try { this.sourceTexture?.destroy?.(); } catch { /* */ }
     try { this.nativeDepthTexture?.destroy?.(); } catch { /* */ }
+    this.particleBufferHandle = null;
+    this.globalsBufferHandle = null;
+    this.renderUniformBufferHandle = null;
+    this.particleBuffer = null;
+    this.globalsBuffer = null;
+    this.renderUniformBuffer = null;
+    this.sourceTexture = null;
+    this.nativeDepthTexture = null;
   }
 }
 

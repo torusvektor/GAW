@@ -213,9 +213,9 @@
 <svelte:window onkeydown={handleKey} />
 
 {#if $onboarding.open}
-  <div class="ot-backdrop" onclick={() => onboarding.close()} role="presentation"></div>
+  <div data-help-page="getting-started" class="ot-backdrop" onclick={() => onboarding.close()} role="presentation"></div>
 
-  <div class="ot-modal" role="dialog" aria-modal="true" aria-labelledby="ot-title">
+  <div data-help-page="getting-started" class="ot-modal" role="dialog" aria-modal="true" aria-labelledby="ot-title">
     <button class="ot-close" onclick={() => onboarding.close()} title="Close (Esc) — picks up where you left off">×</button>
 
     <div class="ot-progress">
@@ -418,7 +418,7 @@
     letter-spacing: 0.16em;
   }
   .ot-keyhint kbd {
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 12px;
     color: #FF8577;
     background: rgba(255, 133, 119, 0.1);
@@ -467,7 +467,7 @@
   .ot-skip:hover { color: var(--text-primary, #ccc); border-color: rgba(255, 255, 255, 0.2); }
 
   .ot-counter {
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 11px;
     color: #666;
     text-align: center;

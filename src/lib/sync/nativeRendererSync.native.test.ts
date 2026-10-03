@@ -1,0 +1,3397 @@
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_GPU_SOURCE_ID } from '../renderer/defaultSourceImage';
+import { nativeEffectChainWarning } from '../renderer/nativeEffectChainPolicy';
+import type {
+  NativeEffectPassRuntime,
+} from './nativeRendererSync';
+
+let effectToNativeDescriptor: (effect: any) => string | null;
+let nativeEffectPassFromDescriptor: (descriptor: string | null) => NativeEffectPassRuntime | null;
+let missingNativeGraphRouteRequirements: (
+  features: Record<string, boolean>,
+  instruments: ReadonlySet<string>,
+  manifest: ReadonlyMap<string, any>,
+) => string[];
+let nativeGraphInstrumentIds: (capabilities: any) => string[];
+let nativeGraphManifestById: (capabilities: any) => Map<string, any>;
+let nativeGraphReadyRouteKinds: (
+  features: Record<string, boolean>,
+  instruments: ReadonlySet<string>,
+  manifest: ReadonlyMap<string, any>,
+) => Set<string>;
+let nativeGraphRouteRequirements: () => ReadonlyArray<{
+  kind: string;
+  feature: string;
+  instrument: string;
+  shaderIds: readonly string[];
+}>;
+let nativeEffectPassDescriptorIds: (capabilities: any) => string[];
+let nativeUnsupportedEffectTypes: (layer: any) => string[];
+let nativeEffectPassesForLayer: (layer: any) => NativeEffectPassRuntime[] | null;
+let nativeUnsupportedSourceReason: (
+  layer: any,
+  hasNativeGraphRoute?: boolean,
+  options?: any,
+) => string | null;
+let buildNativeSharedTextureSourceFrameCommand: typeof import('./nativeRendererSync').buildNativeSharedTextureSourceFrameCommand;
+let NativeRendererSyncCtor: typeof import('./nativeRendererSync').NativeRendererSync;
+let nativeLayerMaskState: typeof import('./nativeRendererSync').nativeLayerMaskState;
+let nativeLayerEdgeEffectsState: typeof import('./nativeRendererSync').nativeLayerEdgeEffectsState;
+let nativeGraphCompositeSourceId: typeof import('./nativeRendererSync').nativeGraphCompositeSourceId;
+let nativeGraphInstrumentSourceId: typeof import('./nativeRendererSync').nativeGraphInstrumentSourceId;
+let nativeLayerSourceFromMediaSource: typeof import('./nativeRendererSync').nativeLayerSourceFromMediaSource;
+let isNativeCoreOwnedGraphKind: typeof import('./nativeRendererSync').isNativeCoreOwnedGraphKind;
+let isNativeExternallyQueuedGraphKind: typeof import('./nativeRendererSync').isNativeExternallyQueuedGraphKind;
+let nativeOutputCropY: typeof import('./nativeRendererSync').nativeOutputCropY;
+let nativeWarpCorners: typeof import('./nativeRendererSync').nativeWarpCorners;
+let nativeScreenMasks: typeof import('./nativeRendererSync').nativeScreenMasks;
+let nativeWarpMeshGrid: typeof import('./nativeRendererSync').nativeWarpMeshGrid;
+let isFullQuadStageShape: typeof import('./nativeRendererSync').isFullQuadStageShape;
+let expandCustomScreenRenderBounds: typeof import('./nativeRendererSync').expandCustomScreenRenderBounds;
+let nativeLayerShapeState: typeof import('./nativeRendererSync').nativeLayerShapeState;
+
+beforeAll(async () => {
+  const storage = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+      removeItem: (key: string) => storage.delete(key),
+      clear: () => storage.clear(),
+    },
+  });
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: {
+      documentElement: {
+        style: {
+          setProperty: () => {},
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      matchMedia: () => ({
+        matches: false,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    },
+  });
+  ({
+    effectToNativeDescriptor,
+    missingNativeGraphRouteRequirements,
+    nativeGraphInstrumentIds,
+    nativeGraphManifestById,
+    nativeGraphReadyRouteKinds,
+    nativeGraphRouteRequirements,
+    nativeEffectPassDescriptorIds,
+    nativeEffectPassFromDescriptor,
+    nativeUnsupportedEffectTypes,
+    nativeEffectPassesForLayer,
+    nativeUnsupportedSourceReason,
+    buildNativeSharedTextureSourceFrameCommand,
+    NativeRendererSync: NativeRendererSyncCtor,
+    nativeLayerMaskState,
+    nativeLayerEdgeEffectsState,
+    nativeGraphCompositeSourceId,
+    nativeGraphInstrumentSourceId,
+    nativeLayerSourceFromMediaSource,
+    isNativeCoreOwnedGraphKind,
+    isNativeExternallyQueuedGraphKind,
+    nativeOutputCropY,
+    nativeWarpCorners,
+    nativeScreenMasks,
+    nativeWarpMeshGrid,
+    isFullQuadStageShape,
+    expandCustomScreenRenderBounds,
+    nativeLayerShapeState,
+  } = await import('./nativeRendererSync'));
+});
+
+it('extends a custom stage screen render quad around vertices beyond its original rectangle', async () => {
+  const { createLayer } = await import('../types');
+  const screen = createLayer('screen', 'Screen', 'screen');
+  screen.corners = {
+    topLeft: { x: 0.1, y: 0.8 }, topRight: { x: 0.2, y: 0.8 },
+    bottomLeft: { x: 0.1, y: 0.2 }, bottomRight: { x: 0.2, y: 0.2 },
+  };
+  screen.layerShape = {
+    enabled: true, type: 'custom', params: {
+      customClosed: true,
+      customPoints: [
+        { x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1.5, y: 1 }, { x: 0, y: 1 },
+      ],
+      customBasePoints: [
+        { x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 },
+      ],
+    },
+  } as any;
+  const expanded = expandCustomScreenRenderBounds(screen);
+  expect(expanded.corners.topRight.x).toBeCloseTo(0.25);
+  expect(expanded.corners.bottomRight.x).toBeCloseTo(0.25);
+  expect(expanded.layerShape?.params.customPoints?.[2].x).toBeCloseTo(1);
+  expect(expanded.layerShape?.params.customPoints?.[1].x).toBeCloseTo(2 / 3);
+  expect(expanded.layerShape?.params.customBasePoints?.[2].x).toBe(1);
+  expect(screen.corners.topRight.x).toBe(0.2);
+});
+
+it('lets a rectangular stage screen use the entire warped quad without a second custom crop', async () => {
+  const { createLayer } = await import('../types');
+  const screen = createLayer('screen', 'Screen', 'screen');
+  screen.layerShape = {
+    enabled: true,
+    type: 'custom',
+    params: { customClosed: true, customPoints: [
+      { x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 },
+    ] },
+  } as any;
+  expect(isFullQuadStageShape(screen)).toBe(true);
+  expect(nativeLayerShapeState(screen).shape[0]).toBe(0);
+
+  screen.layerShape!.params.customPoints![1].x = 0.8;
+  expect(isFullQuadStageShape(screen)).toBe(false);
+  expect(nativeLayerShapeState(screen).shape[0]).toBe(6);
+});
+
+function graphCapabilities() {
+  const graphContract = nativeGraphRouteRequirements();
+  return {
+    native_graph_instruments: graphContract.map((entry) => entry.instrument),
+    native_graph_instrument_manifest: graphContract.map((entry) => ({
+      id: entry.instrument,
+      source_uri_prefix: `native-graph://${entry.instrument}/`,
+      shader_ids: [...entry.shaderIds],
+      features: ['compute_graph_host', 'compute_graph_render', 'compute_graph_source_frame_target', entry.feature],
+      render_target: 'source_frame',
+    })),
+    features: Object.fromEntries(graphContract.map((entry) => [entry.feature, true])),
+  };
+}
+
+describe('native renderer sync graph manifest contract', () => {
+  it('routes the VJ crossfade through the native core-owned graph path', () => {
+    expect(isNativeCoreOwnedGraphKind('vj-crossfade')).toBe(true);
+  });
+
+  it('retains externally queued SVG and Lines graph sources in the compositor', () => {
+    expect(isNativeExternallyQueuedGraphKind('svg')).toBe(true);
+    expect(isNativeExternallyQueuedGraphKind('lines')).toBe(true);
+    expect(isNativeExternallyQueuedGraphKind('planet')).toBe(false);
+  });
+
+  it('requires complete shader IDs for each native graph route', () => {
+    const complete = graphCapabilities();
+    expect(
+      missingNativeGraphRouteRequirements(
+        complete.features,
+        new Set(nativeGraphInstrumentIds(complete)),
+        nativeGraphManifestById(complete),
+      ),
+    ).toEqual([]);
+
+    const missingParticleLines = graphCapabilities();
+    missingParticleLines.native_graph_instrument_manifest = missingParticleLines.native_graph_instrument_manifest.map((entry) =>
+      entry.id === 'particle-field'
+        ? { ...entry, shader_ids: entry.shader_ids.filter((shaderId) => shaderId !== 'particle-field/lines') }
+        : entry,
+    );
+    expect(
+      missingNativeGraphRouteRequirements(
+        missingParticleLines.features,
+        new Set(nativeGraphInstrumentIds(missingParticleLines)),
+        nativeGraphManifestById(missingParticleLines),
+      ),
+    ).toContain('particle-field:shader:particle-field/lines');
+    const particleMissingRoutes = nativeGraphReadyRouteKinds(
+      missingParticleLines.features,
+      new Set(nativeGraphInstrumentIds(missingParticleLines)),
+      nativeGraphManifestById(missingParticleLines),
+    );
+    expect(particleMissingRoutes.has('planet')).toBe(true);
+    expect(particleMissingRoutes.has('particle-field')).toBe(false);
+    const requirements = nativeGraphRouteRequirements();
+    expect(requirements.some((entry) => entry.kind === 'point-cloud-fx')).toBe(true);
+    expect(requirements.find((entry) => entry.kind === 'ghostfx')?.shaderIds).toContain(
+      'ghostfx/liquid-render',
+    );
+  });
+});
+
+describe('native renderer sync render clock routing', () => {
+  it('prefers manual render-clock time for native video playback commands', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const src = {
+      videoElement: { currentTime: 12.5 },
+    };
+
+    expect(sync.nativeVideoPlaybackTimeSeconds(src, 5000)).toBe(0);
+
+    sync.setRenderClock(4.25);
+    expect(sync.nativeVideoPlaybackTimeSeconds(src, 5000)).toBe(4.25);
+
+    sync.setRenderClock(null);
+    sync.liveClockOriginMs = 1000;
+    // A new native video with no decoded/browser time always starts at frame
+    // zero. It must never inherit time elapsed since the renderer booted.
+    expect(sync.nativeVideoPlaybackTimeSeconds({ videoElement: { currentTime: Number.NaN } }, 2500)).toBe(0);
+  });
+});
+
+describe('native unified group crops', () => {
+  const cornersFor = (top: number, bottom: number) => ({
+    topLeft: { x: 0, y: top },
+    topRight: { x: 1, y: top },
+    bottomRight: { x: 1, y: bottom },
+    bottomLeft: { x: 0, y: bottom },
+  });
+
+  it('crops each child to its own canvas band, with no flip for core-rendered feeds', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const shaderSource = {
+      id: 'group-shader',
+      type: 'shader',
+      name: 'Gradient',
+      src: '',
+      shaderCode: 'void main() {}',
+    };
+    const group = {
+      id: 'grp',
+      type: 'group',
+      visible: true,
+      opacity: 1,
+      groupConfig: { shaderMode: 'unified', overrideStyles: false, shaderSource },
+    };
+    const upper = {
+      id: 'upper',
+      type: 'screen',
+      visible: true,
+      opacity: 1,
+      parentGroupId: 'grp',
+      corners: cornersFor(0.9, 0.6),
+      flipV: false,
+    };
+    const lower = {
+      id: 'lower',
+      type: 'screen',
+      visible: true,
+      opacity: 1,
+      parentGroupId: 'grp',
+      corners: cornersFor(0.4, 0.1),
+      flipV: false,
+    };
+
+    const resolved = sync.resolveNativeGroupLayers([group, upper, lower] as any);
+    const byId = new Map(resolved.map((layer: any) => [layer.id, layer]));
+
+    // The container is dropped; children render flat.
+    expect(resolved.some((layer: any) => layer.type === 'group')).toBe(false);
+    // A child shows the band of the shared shader it actually covers, and the
+    // shader is upright inside it — the old pre-flip mirrored the whole group.
+    const upperOut: any = byId.get('upper');
+    expect(upperOut.cropRegion.y).toBeCloseTo(0.6, 5);
+    expect(upperOut.cropRegion.height).toBeCloseTo(0.3, 5);
+    expect(upperOut.flipV).toBe(false);
+    expect(upperOut.source).toEqual(shaderSource);
+    const lowerOut: any = byId.get('lower');
+    expect(lowerOut.cropRegion.y).toBeCloseTo(0.1, 5);
+    expect(lowerOut.flipV).toBe(false);
+  });
+});
+
+it('repeats a group VJ feed per screen or crops one feed across the group', async () => {
+  const { createGroupLayer, createLayer, VJ_MIX_SOURCE_INDEX } = await import('../types');
+  const sync = new NativeRendererSyncCtor() as any;
+  const group = createGroupLayer('stage-group', 'Stage Group');
+  group.vjLayerIndex = VJ_MIX_SOURCE_INDEX;
+  const screen = createLayer('stage-screen', 'Screen', 'screen');
+  screen.parentGroupId = group.id;
+  screen.vjLayerIndex = 0;
+  screen.corners = {
+    topLeft: { x: 0.2, y: 0.8 }, topRight: { x: 0.4, y: 0.8 },
+    bottomLeft: { x: 0.2, y: 0.2 }, bottomRight: { x: 0.4, y: 0.2 },
+  };
+  const mix = createLayer('__vj-mix__', 'VJ Mix', 'media');
+  mix.source = { id: 'mix', type: 'effect', name: 'Mix', src: 'plugin://vj-mix' } as any;
+
+  group.groupConfig!.shaderMode = 'individual';
+  const individual = sync.resolveNativeGroupLayers([group, screen, mix]).find((layer: any) => layer.id === screen.id);
+  expect(individual.source.effectSource.vjmixRows[0].layerId).toBe(mix.id);
+  expect(individual.cropRegion).toBeNull();
+
+  group.groupConfig!.shaderMode = 'unified';
+  const unified = sync.resolveNativeGroupLayers([group, screen, mix]).find((layer: any) => layer.id === screen.id);
+  expect(unified.source.effectSource.vjmixRows[0].layerId).toBe(mix.id);
+  expect(unified.cropRegion.x).toBeCloseTo(0.2);
+  expect(unified.cropRegion.y).toBeCloseTo(0.2);
+  expect(unified.cropRegion.width).toBeCloseTo(0.2);
+  expect(unified.cropRegion.height).toBeCloseTo(0.6);
+});
+
+describe('native output stage coordinates', () => {
+  // Settings store crops, corners and meshes with y = 0 at the top of the
+  // canvas; the core's output stage puts y = 0 at the bottom.
+  it('converts a top-edge crop to the core origin', () => {
+    expect(nativeOutputCropY(0, 0.5)).toBeCloseTo(0.5);
+    expect(nativeOutputCropY(0.25, 0.25)).toBeCloseTo(0.5);
+    expect(nativeOutputCropY(0, 1)).toBe(0);
+  });
+
+  it('sends screen masks y-up and leaves out the ones the core would ignore', () => {
+    const sent = nativeScreenMasks([
+      { enabled: true, invert: false, feather: 0.3, points: [{ x: 0.1, y: 0.25 }, { x: 0.9, y: 0.25 }, { x: 0.5, y: 0.75 }] },
+      { enabled: false, invert: true, feather: 0, points: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }] },
+      { enabled: true, invert: true, feather: 2, points: [{ x: 0, y: 0 }, { x: 1, y: 0 }] },
+      { enabled: true, invert: true, feather: -1, points: [{ x: 0.5, y: 0.5 }, { x: 0.75, y: 0.5 }, { x: 0.5, y: 0.75 }] },
+    ]);
+    // A vertex drawn near the top of the screen (y 0.25) must land near the
+    // top of the projected image, which is y 0.75 in the core's frame.
+    expect(sent).toEqual([
+      { invert: false, feather: 0.3, points: [{ x: 0.1, y: 0.75 }, { x: 0.9, y: 0.75 }, { x: 0.5, y: 0.25 }] },
+      { invert: true, feather: 0, points: [{ x: 0.5, y: 0.5 }, { x: 0.75, y: 0.5 }, { x: 0.5, y: 0.25 }] },
+    ]);
+    expect(nativeScreenMasks(undefined)).toEqual([]);
+    expect(nativeScreenMasks(null)).toEqual([]);
+    // Curve handles flip with their points; plain points stay bare.
+    const curved = nativeScreenMasks([{ points: [
+      { x: 0.1, y: 0.6, cpOut: { x: 0.3, y: 0.1 } }, { x: 0.9, y: 0.6, cpIn: { x: 0.7, y: 0.2 } }, { x: 0.5, y: 0.9 },
+    ] }]);
+    expect(curved[0].points).toEqual([
+      { x: 0.1, y: 0.4, cpOut: { x: 0.3, y: 0.9 } }, { x: 0.9, y: 0.4, cpIn: { x: 0.7, y: 0.8 } }, { x: 0.5, y: 0.09999999999999998 },
+    ]);
+  });
+
+  it('keeps identity warps identity and puts the top handles on the top edge', () => {
+    const identity = {
+      topLeft: { x: 0, y: 0 },
+      topRight: { x: 1, y: 0 },
+      bottomLeft: { x: 0, y: 1 },
+      bottomRight: { x: 1, y: 1 },
+    };
+    expect(nativeWarpCorners(identity)).toEqual(identity);
+    const topPulledIn = {
+      topLeft: { x: 0.25, y: 0 },
+      topRight: { x: 0.75, y: 0 },
+      bottomLeft: { x: 0, y: 1 },
+      bottomRight: { x: 1, y: 1 },
+    };
+    const sent = nativeWarpCorners(topPulledIn);
+    // Core corners are y-up, so the narrowed pair must end on y = 1.
+    expect([sent?.bottomLeft, sent?.bottomRight]).toEqual([{ x: 0.25, y: 1 }, { x: 0.75, y: 1 }]);
+    expect([sent?.topLeft, sent?.topRight]).toEqual([{ x: 0, y: 0 }, { x: 1, y: 0 }]);
+    expect(nativeWarpCorners(null)).toBeNull();
+  });
+
+  it('flips a mesh into the core row order', () => {
+    const identity = {
+      rows: 2,
+      cols: 2,
+      points: [
+        [{ x: 0, y: 0 }, { x: 1, y: 0 }],
+        [{ x: 0, y: 1 }, { x: 1, y: 1 }],
+      ],
+    };
+    expect(nativeWarpMeshGrid(identity)).toEqual(identity);
+    const topBent = {
+      rows: 2,
+      cols: 2,
+      points: [
+        [{ x: 0.2, y: 0.1 }, { x: 0.8, y: 0.1 }],
+        [{ x: 0, y: 1 }, { x: 1, y: 1 }],
+      ],
+    };
+    expect(nativeWarpMeshGrid(topBent)?.points[1]).toEqual([{ x: 0.2, y: 0.9 }, { x: 0.8, y: 0.9 }]);
+    expect(nativeWarpMeshGrid(null)).toBeNull();
+  });
+
+  it('flips Bezier tangents with their points and sends straight meshes bare', () => {
+    const points = [
+      [{ x: 0, y: 0 }, { x: 0.5, y: 0 }, { x: 1, y: 0 }],
+      [{ x: 0, y: 1 }, { x: 0.5, y: 1 }, { x: 1, y: 1 }],
+    ];
+    const tangents = [
+      [null, { right: { x: 0.1, y: -0.2 }, down: { x: 0.05, y: 0.3 } }, null],
+      [{ up: { x: 0, y: -0.25 } }, null, null],
+    ];
+    const sent = nativeWarpMeshGrid({ rows: 2, cols: 3, points, bezier: true, tangents });
+    expect(sent?.bezier).toBe(true);
+    // Editor row 0 (top) is core row 1; its "down" handle points at the
+    // core's row 0, which is "up" in core order, with y negated.
+    expect(sent?.tangents?.[1][1]).toEqual({ right: { x: 0.1, y: 0.2 }, up: { x: 0.05, y: -0.3 } });
+    expect(sent?.tangents?.[0][0]).toEqual({ down: { x: 0, y: 0.25 } });
+    expect(sent?.tangents?.[0][1]).toBeNull();
+    // Bezier off, or on with nothing stored: the payload is the bare grid.
+    expect(nativeWarpMeshGrid({ rows: 2, cols: 3, points, bezier: false, tangents })).toEqual({
+      rows: 2, cols: 3, points: [...points].reverse().map((row) => row.map((p) => ({ x: p.x, y: 1 - p.y }))),
+    });
+    expect(Object.keys(nativeWarpMeshGrid({ rows: 2, cols: 3, points, bezier: true })!)).toEqual(['rows', 'cols', 'points']);
+  });
+});
+
+describe('native renderer sync lifecycle ownership', () => {
+  it('can dispose a Canvas-scoped sync without clearing the app-level native core', async () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.running = true;
+    sync.startupReady = true;
+    sync.clearRuntimeCaches = vi.fn();
+
+    await sync.stop({ stopCore: false });
+
+    expect(sync.running).toBe(false);
+    expect(sync.startupReady).toBe(false);
+    expect(sync.clearRuntimeCaches).not.toHaveBeenCalled();
+  });
+});
+
+describe('native renderer sync content fit routing', () => {
+  it('uses cached native media dimensions for stretch, fill, and contain UV modes', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const source = {
+      id: 'wide-video',
+      src: 'file:///tmp/wide-video.mp4',
+      type: 'video',
+    };
+    const nativeSource = {
+      id: source.id,
+      uri: source.src,
+      sourceType: 'video',
+      source,
+      shouldPrefetch: true,
+      shouldPreview: true,
+    };
+    const sourceKey = sync.sourceCacheKey(source.id, source.src);
+    sync.nativeVideoDecodeDimensionCache.set(sourceKey, {
+      width: 1920,
+      height: 1080,
+      metadata: true,
+    });
+    const baseLayer = {
+      contentFit: 'stretch',
+      corners: {
+        topLeft: { x: 0, y: 0 },
+        topRight: { x: 1, y: 0 },
+        bottomRight: { x: 1, y: 1 },
+        bottomLeft: { x: 0, y: 1 },
+      },
+      flipH: false,
+      flipV: false,
+      cropRegion: null,
+    };
+
+    const stretch = sync.nativeLayerUvState(baseLayer, nativeSource, 1000, 1000);
+    const fill = sync.nativeLayerUvState(
+      { ...baseLayer, contentFit: 'fill' },
+      nativeSource,
+      1000,
+      1000,
+    );
+    const contain = sync.nativeLayerUvState(
+      { ...baseLayer, contentFit: 'crop' },
+      nativeSource,
+      1000,
+      1000,
+    );
+
+    expect(stretch.uvFlags).toEqual([0, 1.77778, 0, 0]);
+    expect(fill.uvFlags).toEqual([1, 1.77778, 0, 0]);
+    expect(contain.uvFlags).toEqual([2, 1.77778, 0, 0]);
+  });
+});
+
+describe('native renderer sync shared-texture source frames', () => {
+  it('uses the dedicated GPU shared-texture command shape', () => {
+    const command = buildNativeSharedTextureSourceFrameCommand({
+      sourceId: 'source-a',
+      width: 1920,
+      height: 1080,
+      info: {
+        available: true,
+        platform: 'syphon',
+        label: 'Syphon',
+        senderName: 'Main Sender',
+        format: 'bgra8unorm',
+        frame: 42,
+        handle: '1234',
+        handleEncoding: 'integer',
+        handleByteLength: 4,
+      },
+      seq: 7,
+    });
+
+    expect(command).toMatchObject({
+      type: 'upload_source_gpu_shared_texture',
+      source_id: 'source-a',
+      width: 1920,
+      height: 1080,
+      shared_handle: '1234',
+      platform: 'syphon',
+      format: 'bgra8unorm',
+      handle_encoding: 'integer',
+      handle_byte_length: 4,
+      frame: 42,
+      sender_name: 'Main Sender',
+      seq: 7,
+    });
+    expect((command as any).shared_texture_platform).toBeUndefined();
+  });
+
+  it('routes each live source through its explicit native transport', () => {
+    const webcam = nativeLayerSourceFromMediaSource({
+      id: 'camera-layer',
+      type: 'video',
+      src: 'live://webcam/camera-session',
+      liveSourceType: 'webcam',
+      liveSourceSessionId: 'camera-session',
+    } as any);
+    const ndi = nativeLayerSourceFromMediaSource({
+      id: 'ndi-layer',
+      type: 'spout',
+      src: 'live://ndi/ndi-session',
+      liveSourceType: 'ndi',
+      ndiSource: { senderName: 'Studio NDI' },
+    } as any);
+    const syphon = nativeLayerSourceFromMediaSource({
+      id: 'syphon-layer',
+      type: 'spout',
+      src: 'live://spout/syphon-session',
+      liveSourceType: 'syphon',
+      spoutSource: { senderName: 'Resolume Output' },
+    } as any);
+
+    expect(webcam).toMatchObject({
+      sourceType: 'live:webcam',
+      uri: 'native-live://webcam/camera-session',
+      shouldPrefetch: false,
+      shouldPreview: true,
+    });
+    expect(ndi).toMatchObject({
+      sourceType: 'live:ndi',
+      uri: 'native-live://ndi/Studio%20NDI',
+    });
+    expect(syphon).toMatchObject({
+      sourceType: 'live:syphon',
+      uri: 'native-live://syphon/Resolume%20Output',
+    });
+  });
+
+  it('schedules live shared textures at frame cadence instead of thumbnail cadence', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeFeatureFlags = { shared_texture_source_frame_upload: true };
+    const source = {
+      id: 'camera-layer',
+      type: 'video',
+      src: 'live://webcam/camera-session',
+      liveSourceType: 'webcam',
+      liveSourceSessionId: 'camera-session',
+    };
+    const infoKey = sync.sharedTextureInfoKey(source, 'live:webcam');
+    sync.sharedTextureInfoCache.set(infoKey, {
+      info: {
+        available: true,
+        platform: 'iosurface',
+        width: 1920,
+        height: 1080,
+        format: 80,
+        frame: 1,
+        handle: '42',
+        handleEncoding: 'integer',
+        handleByteLength: 4,
+      },
+      updatedAt: 1000,
+    });
+
+    const commands: any[] = [];
+    expect(sync.appendSharedTextureSourceFrameCommand(
+      commands,
+      source,
+      'live:webcam',
+      1000,
+      false,
+      null,
+    )).toBe(true);
+
+    expect(commands).toHaveLength(1);
+    expect(commands[0].type).toBe('upload_source_gpu_shared_texture');
+    expect(sync.sourcePreviewNextAt.get(sync.sourceCacheKey(source.id, source.src))).toBe(1016);
+  });
+});
+
+describe('native renderer sync graph effect routing', () => {
+  it('records native graph route failures after warning suppression kicks in', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const routeState = {
+      inFlight: false,
+      seq: 0,
+      warnings: 0,
+      state: null,
+      bufferPrefixes: [],
+    };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      for (let i = 0; i < 4; i += 1) {
+        sync.recordNativeGraphRouteFailure(
+          { kind: 'particle-field', key: 'particle-route' },
+          'layer-a',
+          new Error(`boom-${i}`),
+          routeState,
+        );
+      }
+
+      expect(warnSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    expect(routeState.warnings).toBe(4);
+    expect(sync.nativeGraphRouteFailures).toBe(4);
+    expect(sync.nativeGraphRouteSuppressedFailures).toBe(1);
+    expect(sync.nativeGraphRouteLastFailure).toBe('particle-field:layer-a:boom-3');
+
+    sync.resetNativeGraphRouteTelemetry();
+    expect(sync.nativeGraphRouteFailures).toBe(0);
+    expect(sync.nativeGraphRouteSuppressedFailures).toBe(0);
+    expect(sync.nativeGraphRouteLastFailure).toBeNull();
+  });
+
+  it('only attaches native effect-pass chains to GPU graph routes when descriptors are advertised', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeComputeGraphSourceFrames = true;
+    sync.nativeWgslStdlibWarmed = true;
+    sync.nativeGraphReadyKinds = new Set(['planet']);
+    sync.nativeFeatureFlags = {
+      compute_graph_texture_sampling: true,
+      compute_graph_source_frame_target: true,
+      native_planet_graph: true,
+    };
+    sync.nativeEffectPassDescriptorIds = new Set(['invert']);
+
+    const layer = {
+      id: 'gpu-layer-a',
+      type: 'gpu',
+      visible: true,
+      opacity: 1,
+      blendMode: 'normal',
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'planet',
+        params: {},
+      },
+      effects: [
+        {
+          id: 'fx-invert',
+          type: 'invert',
+          enabled: true,
+          params: {},
+        },
+      ],
+    };
+
+    const withoutManifest = sync.nativeGraphRouteForLayer(layer);
+    expect(withoutManifest?.kind).toBe('planet');
+    expect(withoutManifest?.source.id).toBe('gpu:gpu-layer-a:planet');
+    expect(withoutManifest?.baseSource).toBeUndefined();
+    expect(withoutManifest?.effectPasses).toBeUndefined();
+
+    sync.nativeFeatureFlags.native_effect_pass_manifest = true;
+    const withManifest = sync.nativeGraphRouteForLayer(layer);
+    expect(withManifest?.kind).toBe('planet');
+    expect(withManifest?.baseSource?.id).toBe('gpu:gpu-layer-a:planet');
+    expect(withManifest?.source.id).toBe('effect-pass:gpu-layer-a');
+    expect(withManifest?.effectPasses?.map((entry: any) => entry.effect)).toEqual(['invert']);
+    expect(nativeGraphInstrumentSourceId(withManifest)).toBe('gpu:gpu-layer-a:planet');
+    expect(nativeGraphCompositeSourceId(withManifest)).toBe('effect-pass:gpu-layer-a');
+
+    sync.nativeEffectPassDescriptorIds = new Set(['blur']);
+    const withoutDescriptor = sync.nativeGraphRouteForLayer(layer);
+    expect(withoutDescriptor?.source.id).toBe('gpu:gpu-layer-a:planet');
+    expect(withoutDescriptor?.effectPasses).toBeUndefined();
+    expect(nativeGraphInstrumentSourceId(withoutDescriptor)).toBe('gpu:gpu-layer-a:planet');
+    expect(nativeGraphCompositeSourceId(withoutDescriptor)).toBe('gpu:gpu-layer-a:planet');
+  });
+
+  it('recovers a failed GPU effect route when its effect changes or retry time elapses', async () => {
+    const { createLayer } = await import('../types');
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeComputeGraphSourceFrames = true;
+    sync.nativeWgslStdlibWarmed = true;
+    sync.nativeGraphReadyKinds = new Set(['planet']);
+    sync.nativeFeatureFlags = {
+      native_effect_pass_manifest: true,
+      compute_graph_texture_sampling: true,
+      compute_graph_source_frame_target: true,
+    };
+    sync.nativeEffectPassDescriptorIds = new Set(['invert', 'blur']);
+    const layer = createLayer('recover-planet', 'Planet', 'gpu');
+    layer.gpuLayerContent = { shaderId: 'planet', params: {} } as any;
+    layer.effects = [{ id: 'fx', type: 'invert', enabled: true, params: {} }] as any;
+    const route = sync.nativeGraphRouteForLayer(layer);
+    expect(route).not.toBeNull();
+    const state: any = { inFlight: false, seq: 0, warnings: 0, state: null, bufferPrefixes: [] };
+    sync.nativeGraphRoutes.set(route.key, state);
+    sync.nativeGraphRouteForLayer(layer);
+    state.warnings = 3;
+    state.lastFailureAtMs = Date.now();
+    expect(sync.nativeGraphRouteForLayer(layer)).toBeNull();
+    layer.effects = [{ id: 'fx', type: 'blur', enabled: true, params: { blurRadius: 5 } }] as any;
+    expect(sync.nativeGraphRouteForLayer(layer)).not.toBeNull();
+    state.warnings = 3;
+    state.lastFailureAtMs = Date.now() - 3100;
+    expect(sync.nativeGraphRouteForLayer(layer)).not.toBeNull();
+  });
+
+  it('keeps long effect chains active and warns only about enabled overflow', () => {
+    const effects = Array.from({ length: 17 }, (_, index) => ({
+      id: `invert-${index}`, type: 'invert', enabled: true, params: {},
+    }));
+    for (const length of [12, 16]) {
+      const chain = effects.slice(0, length);
+      expect(nativeEffectPassesForLayer({ effects: chain })).toHaveLength(length);
+      expect(nativeEffectChainWarning(chain)).toBeNull();
+    }
+    expect(nativeEffectPassesForLayer({ effects })).toHaveLength(16);
+    expect(nativeEffectChainWarning(effects)).toContain('1 extra effect is bypassed');
+    effects[0].enabled = false;
+    expect(nativeEffectPassesForLayer({ effects })).toHaveLength(16);
+    expect(nativeEffectChainWarning(effects)).toBeNull();
+  });
+
+  it('does not let an unsupported overflow effect blank a supported chain', () => {
+    const effects = [
+      ...Array.from({ length: 16 }, () => ({ type: 'invert', enabled: true, params: {} })),
+      { type: 'unknown-plugin', enabled: true, params: {} },
+    ];
+    expect(nativeUnsupportedEffectTypes({ effects })).toEqual([]);
+    expect(nativeEffectPassesForLayer({ effects })).toHaveLength(16);
+    effects[0].enabled = false;
+    expect(nativeUnsupportedEffectTypes({ effects })).toEqual(['unknown-plugin']);
+  });
+
+  it('keeps core-owned graph effects out of the UI-driven graph queue', async () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeComputeGraphSourceFrames = true;
+    sync.nativeWgslStdlibWarmed = true;
+    sync.nativeGraphReadyKinds = new Set(['planet']);
+    sync.nativeFeatureFlags = {
+      compute_graph_texture_sampling: true,
+      compute_graph_source_frame_target: true,
+      native_planet_graph: true,
+      native_effect_pass_manifest: true,
+    };
+    sync.nativeEffectPassDescriptorIds = new Set(['invert']);
+
+    const layer = {
+      id: 'gpu-live-effect',
+      type: 'gpu',
+      visible: true,
+      opacity: 1,
+      blendMode: 'normal',
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'planet',
+        params: {},
+      },
+      effects: [{ id: 'fx-invert', type: 'invert', enabled: true, params: {} }],
+    };
+    const commands = await sync.renderNativeGraphSources(
+      [layer],
+      160,
+      90,
+      { type: 'set_render_clock', mode: 'live', time: 1, time_delta: 1 / 30, frame_index: 30 },
+      {
+        isActive: false,
+        bass: 0,
+        bassFast: 0,
+        treble: 0,
+      },
+    );
+
+    expect(commands).toEqual([]);
+  });
+
+  it('installs plugin graphs once instead of resubmitting them on render ticks', async () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeComputeGraphSourceFrames = true;
+    sync.nativeWgslStdlibWarmed = true;
+    sync.nativeGraphReadyKinds = new Set(['ghostfx', 'handfx']);
+
+    const pluginLayer = (effectType: 'ghostfx' | 'handfx') => ({
+      id: `plugin-${effectType}`,
+      type: 'media',
+      visible: true,
+      opacity: 1,
+      blendMode: 'normal',
+      source: {
+        id: `plugin-${effectType}-source`,
+        type: 'effect',
+        src: `plugin://${effectType}`,
+        name: effectType,
+        effectSource: {
+          effectType,
+          ...(effectType === 'ghostfx'
+            ? { ghostfxScenePreset: 'drift' }
+            : { handfxMode: 'trails', handfxCameraOn: false }),
+        },
+      },
+    });
+    const clock = {
+      type: 'set_render_clock',
+      mode: 'live',
+      time: 1,
+      time_delta: 1 / 60,
+      frame_index: 60,
+    };
+    const visual = {
+      isActive: false,
+      bass: 0,
+      bassFast: 0,
+      mid: 0,
+      treble: 0,
+      energy: 0,
+      beatPhase: 0,
+      beat: 0,
+      level: 0,
+    };
+
+    const ghostCommands = await sync.renderNativeGraphSources(
+      [pluginLayer('ghostfx')],
+      160,
+      90,
+      clock,
+      visual,
+    );
+    expect(ghostCommands).toEqual([]);
+
+    const handCommands = await sync.renderNativeGraphSources(
+      [pluginLayer('handfx')],
+      160,
+      90,
+      clock,
+      visual,
+    );
+    expect(handCommands.every((command: any) => command.type === 'update_native_graph_buffer')).toBe(true);
+    expect(handCommands.some((command: any) => command.type === 'queue_compute_graph')).toBe(false);
+  });
+
+  it('does not treat browser preview elements as native effect-pass input frames', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeFeatureFlags = {
+      native_effect_pass_manifest: true,
+      compute_graph_texture_sampling: true,
+      compute_graph_source_frame_target: true,
+    };
+    sync.nativeEffectPassDescriptorIds = new Set(['invert']);
+
+    const layer = {
+      id: 'browser-preview-video',
+      type: 'media',
+      visible: true,
+      opacity: 1,
+      blendMode: 'normal',
+      source: {
+        id: 'browser-video-source',
+        type: 'video',
+        name: 'Browser Video',
+        src: 'blob://browser-video-preview',
+        videoElement: {
+          readyState: 2,
+          width: 64,
+          height: 64,
+          videoWidth: 64,
+          videoHeight: 64,
+        },
+      },
+      effects: [
+        {
+          id: 'fx-invert',
+          type: 'invert',
+          enabled: true,
+          params: {},
+        },
+      ],
+    };
+
+    expect(sync.nativeEffectPassRouteForLayer(layer)).toBeNull();
+  });
+
+  // Selecting a source-driven shader used to produce a black frame: with no
+  // source bound the route refused to build at all. It now falls back to the
+  // built-in demo image so the shader has pixels the moment it is picked.
+  function sourceDrivenSync(kind: string) {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeComputeGraphSourceFrames = true;
+    sync.nativeWgslStdlibWarmed = true;
+    sync.nativeGraphReadyKinds = new Set([kind]);
+    return sync;
+  }
+
+  function gpuLayer(shaderId: string, params: Record<string, unknown>) {
+    return {
+      id: `gpu-${shaderId}`,
+      type: 'gpu',
+      visible: true,
+      opacity: 1,
+      blendMode: 'normal',
+      source: null,
+      gpuLayerContent: { shaderId, params },
+    };
+  }
+
+  // particle-field is deliberately absent: `media` is not in its mode dropdown
+  // (galaxy/atomic/swarm/lattice/field/gravity), so nobody can select their way
+  // into the black screen this fallback exists to prevent. See the companion
+  // test below, which pins that exclusion.
+  it.each([
+    ['pixel-particles', 'pixel-particles', {}],
+    ['flythrough', 'flythrough', {}],
+  ])('falls back to the built-in demo source for %s with nothing bound', (kind, shaderId, extraParams) => {
+    const sync = sourceDrivenSync(kind);
+
+    const unbound = sync.nativeGraphRouteForLayer(gpuLayer(shaderId, { ...extraParams, source: null }));
+    expect(unbound?.kind).toBe(kind);
+    expect(unbound?.inputSource?.id).toBe(DEFAULT_GPU_SOURCE_ID);
+
+    // Never bound at all (param absent) behaves the same as explicitly cleared.
+    const missing = sync.nativeGraphRouteForLayer(gpuLayer(shaderId, { ...extraParams }));
+    expect(missing?.inputSource?.id).toBe(DEFAULT_GPU_SOURCE_ID);
+  });
+
+  it('drops the demo fallback the moment a real source is bound, and picks it back up when cleared', () => {
+    const sync = sourceDrivenSync('pixel-particles');
+    const boundSource = {
+      type: 'file',
+      name: 'clip.png',
+      url: 'file:///tmp/clip.png',
+      mime: 'image/png',
+    };
+
+    const bound = sync.nativeGraphRouteForLayer(gpuLayer('pixel-particles', { source: boundSource }));
+    expect(bound?.kind).toBe('pixel-particles');
+    expect(bound?.inputSource?.id).not.toBe(DEFAULT_GPU_SOURCE_ID);
+    expect(bound?.inputSource?.uri).toContain('clip.png');
+
+    const cleared = sync.nativeGraphRouteForLayer(gpuLayer('pixel-particles', { source: null }));
+    expect(cleared?.inputSource?.id).toBe(DEFAULT_GPU_SOURCE_ID);
+  });
+
+  it('leaves particle-field (any mode) and Point Cloud FX without a fallback', () => {
+    const particleField = sourceDrivenSync('particle-field');
+    // media mode is unreachable from the UI and only exists in legacy projects,
+    // which carry their own bound source — so an unbound media-mode layer keeps
+    // the pre-existing no-route behaviour rather than gaining a demo image it
+    // would render as a thin sliver.
+    expect(
+      particleField.nativeGraphRouteForLayer(gpuLayer('particle-field', { mode: 'media', source: null })),
+    ).toBeNull();
+    // Non-media modes are procedural — they never wanted an input source.
+    const galaxy = particleField.nativeGraphRouteForLayer(gpuLayer('particle-field', { mode: 'galaxy' }));
+    expect(galaxy?.kind).toBe('particle-field');
+    expect(galaxy?.inputSource).toBeNull();
+
+    // Point Cloud FX consumes .ply/.splat geometry; an image means nothing to
+    // it, so an empty picker still refuses the route.
+    const pointCloud = sourceDrivenSync('point-cloud-fx');
+    expect(pointCloud.nativeGraphRouteForLayer(gpuLayer('point-cloud-fx', { source: null }))).toBeNull();
+  });
+
+  it('uploads the demo source frame exactly once per core session', () => {
+    const sync = sourceDrivenSync('pixel-particles');
+    sync.nativeFeatureFlags = { source_frame_upload: true };
+
+    const commands: any[] = [];
+    sync.appendDefaultGpuSourceUpload(commands);
+    sync.appendDefaultGpuSourceUpload(commands);
+    sync.appendDefaultGpuSourceUpload(commands);
+
+    expect(commands).toHaveLength(1);
+    expect(commands[0].type).toBe('upload_source_frame');
+    expect(commands[0].source_id).toBe(DEFAULT_GPU_SOURCE_ID);
+    expect(commands[0].width).toBe(commands[0].height);
+    expect(String(commands[0].rgba_b64).length).toBeGreaterThan(1000);
+  });
+
+  it('exposes Point Cloud FX once its buffers and animation are core-owned', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeComputeGraphSourceFrames = true;
+    sync.nativeWgslStdlibWarmed = true;
+    sync.nativeGraphReadyKinds = new Set(['point-cloud-fx']);
+
+    const layer = {
+      id: 'gpu-point-cloud',
+      type: 'gpu',
+      visible: true,
+      opacity: 1,
+      blendMode: 'normal',
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'point-cloud-fx',
+        params: {
+          source: {
+            type: 'file',
+            name: 'cloud-a.ply',
+            url: '/tmp/cloud-a.ply',
+            mime: 'application/octet-stream',
+          },
+        },
+      },
+    };
+
+    const route = sync.nativeGraphRouteForLayer(layer);
+    expect(route?.kind).toBe('point-cloud-fx');
+    expect(route?.inputSource?.sourceType).toBe('point-cloud');
+  });
+
+  it('packs active edge styling into the native compositor contract', () => {
+    const state = nativeLayerEdgeEffectsState({
+      id: 'edge-layer',
+      layerShape: null,
+      warpMode: 'corners',
+      meshGrid: null,
+      corners: { topLeft: { x: 0.1, y: 0.9 }, topRight: { x: 0.9, y: 0.9 }, bottomLeft: { x: 0.1, y: 0.1 }, bottomRight: { x: 0.9, y: 0.1 } },
+      edgeEffects: {
+        enabled: true,
+        effects: [{
+          id: 'edge-a',
+          enabled: true,
+          opacity: 0.75,
+          blendMode: 'add',
+          stroke: {
+            type: 'snake',
+            color: [0.1, 0.8, 1, 1],
+            width: 6,
+            length: 0.35,
+            speed: 1.5,
+            tailFade: true,
+            headGlow: true,
+            bidirectional: false,
+            snakeCount: 3,
+          },
+          fill: { type: 'solid', color: [1, 0.2, 0.4, 0.5] },
+          animation: { type: 'breathe', speed: 2, minScale: 0.8, maxScale: 1.2, easing: 'sine' },
+        }],
+      },
+    } as any, 1000, 500);
+
+    expect(state.packed).toHaveLength(1);
+    expect(state.packed[0]).toHaveLength(22);
+    expect(state.packed[0][0]).toEqual([1, 0.75, 1, 4]);
+    expect(state.packed[0][1]).toEqual([0.1, 0.8, 1, 1]);
+    expect(state.packed[0][2][0]).toBe(6);
+    expect(state.packed[0][3].slice(0, 3)).toEqual([0.35, 1.5, 3]);
+    expect(state.packed[0][5][1]).toBe(1);
+    expect(state.packed[0][6]).toEqual([1, 0.2, 0.4, 0.5]);
+    expect(state.packed[0][9][0]).toBe(3);
+    expect(state.packed[0][9][3]).toBe(2);
+    expect(state.packed[0][10].slice(0, 2)).toEqual([0.8, 1.2]);
+    // The centerline: the pinned rectangle in output px, 5 px inside.
+    expect(state.outline).toHaveLength(4);
+    const xs = state.outline.map((p) => p[0]).sort((a, b) => a - b);
+    expect(xs[0]).toBeCloseTo(105, 3);
+    expect(xs[3]).toBeCloseTo(895, 3);
+    expect(state.geometry[2]).toBeCloseTo(2 * (790 + 390), 2);
+    expect(state.corners).toHaveLength(4);
+    expect(state.bounds[0]).toBeLessThan(0.1);
+    expect(state.signature).not.toBe('none');
+  });
+
+  it('gives child shapes their group\'s edge effects, as the editor does', async () => {
+    const { createLayer } = await import('../types');
+    const groupEdges = { enabled: true, effects: [{ id: 'g1', enabled: true, opacity: 1, blendMode: 'normal', stroke: { type: 'glow', color: [0, 1, 0, 1], width: 3 }, fill: { type: 'none' }, animation: { type: 'none' } }] };
+    const group = { ...createLayer('grp', 'Group', 'group'), type: 'group', visible: true, edgeEffects: groupEdges, groupConfig: { shaderMode: 'individual', overrideStyles: false, shaderSource: null } } as any;
+    const own = { enabled: true, effects: [{ ...groupEdges.effects[0], id: 'own', stroke: { type: 'solid', color: [1, 1, 1, 1], width: 2 } }] };
+    const child = { ...createLayer('kid', 'Child', 'media'), parentGroupId: 'grp', visible: true, edgeEffects: own } as any;
+    const loose = { ...createLayer('solo', 'Solo', 'media'), visible: true, edgeEffects: own } as any;
+    const sync = new NativeRendererSyncCtor() as any;
+    const out = sync.resolveNativeGroupLayers([group, child, loose]);
+    expect(out.find((l: any) => l.id === 'kid').edgeEffects).toBe(groupEdges);
+    expect(out.find((l: any) => l.id === 'solo').edgeEffects).toBe(own);
+    // A group whose edge effects are off leaves the child's own stack alone.
+    const quiet = sync.resolveNativeGroupLayers([{ ...group, edgeEffects: { ...groupEdges, enabled: false } }, child]);
+    expect(quiet.find((l: any) => l.id === 'kid').edgeEffects).toBe(own);
+  });
+
+  it('applies edge effect keyframes, nested parameters included, to native output', async () => {
+    const { keyframeTimeline } = await import('../stores/keyframeTimeline');
+    const layer = {
+      id: 'kf-edge', visible: true, opacity: 1,
+      edgeEffects: {
+        enabled: true,
+        effects: [{ id: 'e1', enabled: true, opacity: 1, blendMode: 'normal', stroke: { type: 'solid', color: [1, 1, 1, 1], width: 3 }, fill: { type: 'none' }, animation: { type: 'none' } }],
+      },
+    } as any;
+    keyframeTimeline.addKeyframe('kf-edge', 'edge:e1:stroke.width', 0, 2);
+    keyframeTimeline.addKeyframe('kf-edge', 'edge:e1:stroke.width', 2, 10);
+    keyframeTimeline.addKeyframe('kf-edge', 'edge:e1:opacity', 0, 0.5);
+    keyframeTimeline.setOpen(true);
+    keyframeTimeline.seek(1);
+    try {
+      const sync = new NativeRendererSyncCtor() as any;
+      const [overridden] = sync.applyTimelineOverrides([layer]);
+      expect(overridden.edgeEffects.effects[0].stroke.width).toBe(6);
+      expect(overridden.edgeEffects.effects[0].opacity).toBe(0.5);
+      expect(overridden.edgeEffects.effects[0].stroke.color).toEqual([1, 1, 1, 1]);
+      // The store's layer is never mutated.
+      expect(layer.edgeEffects.effects[0].stroke.width).toBe(3);
+    } finally {
+      keyframeTimeline.setOpen(false);
+      keyframeTimeline.clearAll();
+    }
+  });
+});
+
+describe('native renderer sync native video pump routing', () => {
+  it('hands off three column sources once each at their prepared anchor in one batch', async () => {
+    const api = await import('../api/native-renderer');
+    const { createLayer } = await import('../types');
+    const submit = vi.spyOn(api, 'submitNativeRendererCommands').mockResolvedValue({ applied: 1, dropped: 0, errors: [] } as any);
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.running = true;
+    sync.startupReady = true;
+    const sources = [0, 1, 2].map(row => ({ id: `clip-${row}`, type: 'video' as const, src: `C:/show/${row}.mp4`,
+      durationSeconds: 12, videoWidth: 640, videoHeight: 360, isPlaying: true,
+      _nativePlaybackTimeSeconds: row, _nativePlaybackUpdatedAtMs: performance.now() - 500,
+      _nativePlaybackSeekSeq: 2 }));
+    const layers = [...sources, sources[0]].map((source, index) => ({ ...createLayer(`row-${index}`, 'Video', 'media'), visible: true, source }));
+    try {
+      // Also exercise the path where a scene sync has already recorded the
+      // transport: its urgent repeat must still use the exact prepared time.
+      sync.nativeVideoPlaybackCommandIfChanged(sources[0], 'video', Date.now(), { time: 0 });
+      await sync.syncUrgentVideoSources(640, 360, layers, sources.map(source => source.id));
+      expect(submit).toHaveBeenCalledOnce();
+      const commands = submit.mock.calls[0][0];
+      const playback = commands.filter(command => command.type === 'set_media_source_playback') as any[];
+      expect(playback.map(command => [command.source_id, command.time_seconds])).toEqual([['clip-0', 0], ['clip-1', 1], ['clip-2', 2]]);
+      expect(new Set(playback.map(command => command.clock_time_seconds)).size).toBe(1);
+      expect(commands.filter(command => command.type === 'bind_media_source')).toHaveLength(4);
+      expect(commands.at(-1)?.type).toBe('present');
+    } finally { submit.mockRestore(); }
+  });
+
+  it('uses the monotonic clock for playback and the exact anchor for preroll', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(2500);
+    try {
+      const source = { id: 'clip', src: '/clip.mp4', type: 'video', durationSeconds: 12,
+        _nativePlaybackTimeSeconds: 3, _nativePlaybackUpdatedAtMs: 2000,
+        _nativePlaybackSeekSeq: 7, playbackRate: 2 };
+      expect(sync.nativeVideoPlaybackTimeSeconds(source, Date.now())).toBe(4);
+      expect(sync.nativeVideoPrefetchOptions(source, Date.now())).toMatchObject({
+        timeSeconds: 3, seekGeneration: 7,
+      });
+    } finally { clock.mockRestore(); }
+  });
+
+  it('starts a newly placed mapping video at trim-in, independent of its library preview', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const source = { id: 'mapping', src: '/clip.mp4', type: 'video', durationSeconds: 12,
+      trimStart: 0.25, videoElement: { currentTime: 8, videoWidth: 960, videoHeight: 540,
+        addEventListener() {} } };
+    expect(sync.nativeVideoPrefetchOptions(source, Date.now()).timeSeconds).toBe(3);
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source, 'video', Date.now(), { time: 0 }))
+      .toMatchObject({ time_seconds: 3 });
+  });
+
+  it('arms library videos at their exact trim-in with the initial trigger generation', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.desiredWidth = 1920;
+    sync.desiredHeight = 1080;
+    const options = sync.libraryVideoPrefetchOptions({
+      id: 'library-video',
+      src: '/tmp/library-video.mp4',
+      type: 'video',
+      videoElement: {
+        currentTime: 7.5,
+        duration: 12,
+        videoWidth: 1920,
+        videoHeight: 1080,
+        addEventListener: () => {},
+      },
+      playbackRate: 1.5,
+      playbackMode: 'loop',
+      trimStart: 0.25,
+      trimEnd: 0.9,
+    });
+
+    expect(options).toMatchObject({
+      timeSeconds: 3,
+      seekGeneration: 1,
+      seq: 3000,
+      playbackRate: 1.5,
+      loopEnabled: true,
+      durationSeconds: 12,
+      trimStart: 0.25,
+      trimEnd: 0.9,
+    });
+  });
+
+  it('keeps CPU and synthetic decode fallbacks disabled even when requested', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const sync = new NativeRendererSyncCtor() as any;
+
+      await sync.setDecodeCpuBackupPolicy(true);
+      await sync.setDecodeSyntheticFallbackPolicy(true);
+
+      expect(sync.decodeStoreCpuBackupFrames).toBe(false);
+      expect(sync.decodeAllowSyntheticFallback).toBe(false);
+      expect(warn).toHaveBeenCalledWith(
+        '[NativeRendererSync] CPU decode backup frames are disabled in native-engine-only mode',
+      );
+      expect(warn).toHaveBeenCalledWith(
+        '[NativeRendererSync] Synthetic decode fallback is disabled in native-engine-only mode',
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('marks native-pump video frames ready and leaves the source unavailable on decode failure', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeFeatureFlags = {
+      native_media_decode: true,
+      media_prefetch: true,
+      native_video_decode_pump: true,
+      native_video_decode_pump_window: true,
+      native_video_frame_decode: true,
+      native_video_frame_prefetch: true,
+      native_media_source_playback_state: true,
+    };
+    const source = {
+      id: 'video-a',
+      src: '/tmp/video-a.mp4',
+      type: 'video',
+    };
+    const nativeSource = {
+      id: 'video-a',
+      uri: '/tmp/video-a.mp4',
+      sourceType: 'video',
+      source,
+      shouldPrefetch: true,
+      shouldPreview: true,
+    };
+
+    expect(sync.canUseNativeVideoDecodePump(nativeSource, 'video')).toBe(true);
+    expect(sync.markNativeVideoDecodePumpFrameReady(source)).toBe(true);
+    const sourceKey = sync.sourceCacheKey(source.id, source.src);
+    expect(sync.sourcePreviewSig.get(sourceKey)).toBe('native-video-pump:/tmp/video-a.mp4');
+    expect(sync.sourcePreviewSeq.get(sourceKey)).toBe(1);
+
+    sync.reconcileNativeVideoDecodes({
+      native_video_frame_decode_failures: 1,
+      native_video_frame_decodes: 0,
+      native_video_frame_decode_last_error: 'decode failed',
+    });
+
+    expect(sync.sourcePreviewSig.has(sourceKey)).toBe(false);
+    expect(sync.sourcePreviewSeq.has(sourceKey)).toBe(false);
+    expect(sync.canUseNativeVideoDecodePump(nativeSource, 'video')).toBe(false);
+  });
+
+  it('hydrates mapping HAP metadata from the decoder before switching direction', async () => {
+    const { project } = await import('../stores/layers');
+    const { get } = await import('svelte/store');
+    const { createLayer } = await import('../types');
+    const { nativeVideoTransportSnapshot } = await import('../media/nativeTransport');
+    const original = get(project);
+    const sync = new NativeRendererSyncCtor() as any;
+    const layer = createLayer('hap-map', 'HAP', 'media');
+    layer.source = {id:'hap-map-source',name:'HAP',type:'video',src:'/clip.mov',isPlaying:true,
+      playbackRate:-1,_nativePlaybackSeekSeq:2,_nativePlaybackTimeSeconds:450,_nativePlaybackUpdatedAtMs:0};
+    try {
+      project.update(state => ({...state,layers:[layer]}));
+      sync.reconcileNativeVideoDecodes({native_video_sessions:[{source_id:'hap-map-source',
+        source_duration_seconds:8,source_time_seconds:3,seek_generation:2,frames_presented:10,playback_rate:-1}]});
+      const source = get(project).layers[0].source!;
+      expect(source.durationSeconds).toBe(8);
+      expect(source._nativePlaybackTimeSeconds).toBe(3);
+      const forward = {...source, playbackRate:1,_nativePlaybackSeekSeq:3,
+        _nativePlaybackTimeSeconds:nativeVideoTransportSnapshot(source).timeSeconds};
+      const command = sync.nativeVideoPlaybackCommandIfChanged(forward,'video',1000,{time:1});
+      expect(command).toMatchObject({playback_rate:1,paused:false,duration_seconds:8,seek_generation:3});
+      expect(command.time_seconds).toBeGreaterThan(2.5);
+      expect(command.time_seconds).toBeLessThanOrEqual(3);
+    } finally { project.set(original); }
+  });
+
+  it('carries bounce mode and anchor direction through prepared and active playback', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const source = { id:'bounce', src:'/bounce.mp4', type:'video', durationSeconds:10,
+      playbackMode:'bounce', playbackRate:2, _nativePlaybackDirection:-1,
+      _nativePlaybackTimeSeconds:5, _nativePlaybackUpdatedAtMs:1000, _nativePlaybackSeekSeq:3,
+      trimStart:.2, trimEnd:.8, isPlaying:false };
+    expect(sync.nativeVideoPrefetchOptions(source, 1000)).toMatchObject({bounceEnabled:true, playbackRate:-2, timeSeconds:5});
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source,'video',1000,{time:1})).toMatchObject({bounce_enabled:true, playback_rate:-2, time_seconds:5,paused:true});
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source,'video',1016,{time:1.016})).toBeNull();
+    source.isPlaying = true;
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source,'video',1032,{time:1.032})).toMatchObject({bounce_enabled:true,playback_rate:-2,paused:false});
+    expect(sync.libraryVideoPrefetchOptions(source)).toMatchObject({bounceEnabled:true,playbackRate:2,timeSeconds:2});
+    expect(sync.libraryVideoPrefetchOptions({...source,playbackRate:-1})).toMatchObject({bounceEnabled:true,playbackRate:-1,timeSeconds:8});
+  });
+
+  it('sends video playback controls once and leaves frame advancement to the core', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const source = {
+      id: 'video-native-clock',
+      src: '/tmp/video-native-clock.mp4',
+      type: 'video',
+      isPlaying: true,
+      playbackRate: 1.5,
+      playbackMode: 'loop',
+      trimStart: 0.2,
+      trimEnd: 0.8,
+    };
+    const clock = { type: 'set_render_clock', mode: 'live', time: 10, time_delta: 1 / 60, frame_index: 600 };
+    const first = sync.nativeVideoPlaybackCommandIfChanged(source, 'video', 1000, clock);
+    expect(first).toMatchObject({
+      type: 'set_media_source_playback',
+      playback_rate: 1.5,
+      paused: false,
+      loop_enabled: true,
+      trim_start: 0.2,
+      trim_end: 0.8,
+    });
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source, 'video', 1016, clock)).toBeNull();
+
+    source.isPlaying = false;
+    const paused = sync.nativeVideoPlaybackCommandIfChanged(source, 'video', 1032, {
+      ...clock,
+      time: 11,
+      frame_index: 660,
+    });
+    expect(paused?.paused).toBe(true);
+    expect(paused?.time_seconds).toBeCloseTo(1.5, 5);
+  });
+
+  it('emits explicit native seek commands without requiring a browser video element', () => {
+    const sync = new NativeRendererSyncCtor() as any;
+    const source = {
+      id: 'video-native-seek',
+      src: '/tmp/video-native-seek.mp4',
+      type: 'video',
+      isPlaying: false,
+      playbackRate: 1,
+      playbackMode: 'loop',
+      durationSeconds: 12,
+      _nativePlaybackTimeSeconds: 2.25,
+      _nativePlaybackUpdatedAtMs: 1000,
+      _nativePlaybackSeekSeq: 1,
+    };
+    const clock = { type: 'set_render_clock', mode: 'live', time: 1, time_delta: 1 / 60, frame_index: 60 };
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source, 'video', 1000, clock)?.time_seconds).toBe(2.25);
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source, 'video', 1016, clock)).toBeNull();
+
+    source._nativePlaybackTimeSeconds = 8.5;
+    source._nativePlaybackSeekSeq += 1;
+    expect(sync.nativeVideoPlaybackCommandIfChanged(source, 'video', 1032, clock)?.time_seconds).toBe(8.5);
+  });
+});
+
+describe('native renderer sync effect-pass descriptors', () => {
+  it('identifies enabled non-native effects so native-only output cannot silently drop them', () => {
+    expect(nativeUnsupportedEffectTypes({
+      effects: [
+        { type: 'invert', enabled: true, params: {} },
+        { type: 'phaseLab', enabled: true, params: {} },
+        { type: 'gpuFluidSim', enabled: true, params: {} },
+      ],
+    })).toEqual(['gpuFluidSim']);
+
+    expect(nativeUnsupportedEffectTypes({
+      effects: [
+        { type: 'invert', enabled: true, params: {} },
+        { type: 'rgbShift', enabled: true, params: { amount: 0.25 } },
+      ],
+    })).toEqual([]);
+  });
+
+  it('identifies unsupported layer sources so native-only output cannot use browser preview stand-ins', () => {
+    expect(nativeUnsupportedSourceReason({
+      id: 'gpu-custom',
+      type: 'gpu',
+      visible: true,
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'custom-shader',
+        params: {},
+      },
+    })).toBe('gpu-shader:custom-shader:not-native');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'gpu-planet',
+      type: 'gpu',
+      visible: true,
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'planet',
+        params: {},
+      },
+    })).toBe('gpu-shader:planet:route-unavailable');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'gpu-planet',
+      type: 'gpu',
+      visible: true,
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'planet',
+        params: {},
+      },
+    }, true)).toBeNull();
+
+    const nativePluginLayer = {
+      id: 'plugin-ghostfx',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'plugin-ghostfx-source',
+        type: 'effect',
+        src: 'plugin://ghostfx',
+        name: 'GhostFX',
+        effectSource: {
+          effectType: 'ghostfx',
+          ghostfxScenePreset: 'drift',
+        },
+      },
+    };
+    expect(nativeUnsupportedSourceReason(nativePluginLayer, true)).toBeNull();
+    expect(nativeUnsupportedSourceReason(nativePluginLayer, false)).toBe('effect:native-ingest-pending');
+    expect(nativeUnsupportedSourceReason({
+      ...nativePluginLayer,
+      source: {
+        ...nativePluginLayer.source,
+        effectSource: {
+          effectType: 'ghostfx',
+          ghostfxScenePreset: 'liquid',
+        },
+      },
+    }, false)).toBe('effect:native-ingest-pending');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'gpu-pixel-particles',
+      type: 'gpu',
+      visible: true,
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'pixel-particles',
+        params: {},
+      },
+    })).toBe('gpu-shader:pixel-particles:source-required');
+
+    // Camera is a supported SOURCE for the two instruments whose ingest is
+    // wired, so it is no longer what blocks them -- this fixture has no native
+    // graph route, which is what the reason now names.
+    expect(nativeUnsupportedSourceReason({
+      id: 'gpu-pixel-particles-camera',
+      type: 'gpu',
+      visible: true,
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'pixel-particles',
+        params: {
+          source: { type: 'camera', deviceId: 'cam-a' },
+        },
+      },
+    })).toBe('gpu-shader:pixel-particles:route-unavailable');
+
+    // Every other instrument still reports the source as the blocker rather
+    // than rendering black on a camera it cannot read.
+    expect(nativeUnsupportedSourceReason({
+      id: 'gpu-particle-field-camera',
+      type: 'gpu',
+      visible: true,
+      source: null,
+      gpuLayerContent: {
+        shaderId: 'particle-field',
+        params: {
+          mode: 'media',
+          source: { type: 'camera', deviceId: 'cam-a' },
+        },
+      },
+    })).toBe('gpu-source:camera:native-ingest-pending');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-image',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'image-a',
+        type: 'image',
+        src: '/tmp/image-a.png',
+        name: 'Image A',
+      },
+    })).toBeNull();
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-isf',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'shader-a',
+        type: 'shader',
+        src: './ISF/shader-a.fs',
+        name: 'Shader A',
+        shaderCode: '/*{"ISFVSN":"2","INPUTS":[]}*/ void main(){ gl_FragColor=vec4(1.0); }',
+      },
+    })).toBeNull();
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-isf-empty',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'shader-empty',
+        type: 'shader',
+        src: './ISF/shader-empty.fs',
+        name: 'Shader Empty',
+        shaderCode: '',
+      },
+    })).toBe('shader:source-required');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-js-shader',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'js-shader-a',
+        type: 'threejs',
+        src: 'js-animation',
+        name: 'Shader-backed JS',
+        jsAnimation: {
+          animationType: 'threejs',
+          htmlCode: '<script>const fs = `void main(){ gl_FragColor = vec4(1.0); }`;</script>',
+        },
+      },
+    })).toBeNull();
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-js-scene',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'js-scene-a',
+        type: 'p5js',
+        src: 'js-animation',
+        name: 'Canvas JS',
+        jsAnimation: {
+          animationType: 'p5js',
+          htmlCode: '<script>function draw(){ circle(20, 20, 10); }</script>',
+        },
+      },
+    })).toBeNull();
+
+    // Canvas pages run in an offscreen host; only a source with no page is unrenderable.
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-js-empty',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'js-empty-a',
+        type: 'p5js',
+        src: 'js-animation',
+        name: 'Empty JS',
+        jsAnimation: {
+          animationType: 'p5js',
+          htmlCode: '',
+        },
+      },
+    })).toBe('p5js:native-scene-graph-required');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-mesh',
+      type: 'media',
+      visible: true,
+      warpMode: 'mesh',
+      source: {
+        id: 'image-a',
+        type: 'image',
+        src: '/tmp/image-a.png',
+        name: 'Image A',
+      },
+    })).toBe('warp:mesh:invalid-grid');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-mesh-native',
+      type: 'media',
+      visible: true,
+      warpMode: 'mesh',
+      meshGrid: {
+        rows: 2,
+        cols: 2,
+        points: [
+          [{ x: 0, y: 1 }, { x: 1, y: 1 }],
+          [{ x: 0, y: 0 }, { x: 1, y: 0 }],
+        ],
+      },
+      source: {
+        id: 'image-a',
+        type: 'image',
+        src: '/tmp/image-a.png',
+        name: 'Image A',
+      },
+    })).toBeNull();
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-mask',
+      type: 'media',
+      visible: true,
+      mask: {
+        enabled: true,
+        inverted: false,
+        feather: 0,
+        shapes: [],
+      },
+      source: {
+        id: 'image-a',
+        type: 'image',
+        src: '/tmp/image-a.png',
+        name: 'Image A',
+      },
+    })).toBeNull();
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-star',
+      type: 'media',
+      visible: true,
+      layerShape: {
+        enabled: true,
+        type: 'star',
+        params: {},
+      },
+      source: {
+        id: 'image-a',
+        type: 'image',
+        src: '/tmp/image-a.png',
+        name: 'Image A',
+      },
+    })).toBeNull();
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-polyline',
+      type: 'media',
+      visible: true,
+      layerShape: {
+        enabled: true,
+        type: 'polyline',
+        params: {},
+      },
+      source: {
+        id: 'image-a',
+        type: 'image',
+        src: '/tmp/image-a.png',
+        name: 'Image A',
+      },
+    })).toBe('layer-shape:polyline:not-native');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-inverted-shape',
+      type: 'media',
+      visible: true,
+      layerShape: {
+        enabled: true,
+        type: 'circle',
+        params: { invert: true },
+      },
+      source: {
+        id: 'image-a',
+        type: 'image',
+        src: '/tmp/image-a.png',
+        name: 'Image A',
+      },
+    })).toBeNull();
+
+    const localVideoLayer = {
+      id: 'media-video',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'video-a',
+        type: 'video',
+        src: '/tmp/video-a.mp4',
+        name: 'Video A',
+      },
+    };
+    expect(nativeUnsupportedSourceReason(localVideoLayer)).toBe('video:native-decode-pump-required');
+    expect(nativeUnsupportedSourceReason(localVideoLayer, false, {
+      nativeVideoDecodePumpReady: true,
+    })).toBeNull();
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-blob',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'image-blob',
+        type: 'image',
+        src: 'blob:http://localhost/image-blob',
+        name: 'Blob Image',
+      },
+    })).toBe('image:native-readable-uri-required');
+
+    expect(nativeUnsupportedSourceReason({
+      id: 'media-assetref',
+      type: 'media',
+      visible: true,
+      source: {
+        id: 'image-assetref',
+        type: 'image',
+        src: 'blob:http://localhost/image-assetref',
+        name: 'AssetRef Image',
+        _assetRef: {
+          kind: 'local-file',
+          originalPath: '/tmp/assetref-image.png',
+          name: 'assetref-image.png',
+        },
+      },
+    })).toBeNull();
+
+    class FakeCanvas {
+      width = 64;
+      height = 64;
+    }
+    Object.defineProperty(globalThis, 'HTMLCanvasElement', {
+      configurable: true,
+      value: FakeCanvas,
+    });
+    // Text layers are now native-ready via the text graph route; without a
+    // route (core feature missing) the generated preview canvas still may
+    // not stand in for a native source frame.
+    expect(nativeUnsupportedSourceReason({
+      id: 'text-layer',
+      type: 'text',
+      visible: true,
+      source: null,
+      _textTexture: {
+        canvas: new FakeCanvas(),
+      },
+    })).toBe('generated-layer:text:not-native-source');
+  });
+
+  it('packs closed bezier mask shapes for the native compositor', () => {
+    const state = nativeLayerMaskState({
+      mask: {
+        enabled: true,
+        inverted: true,
+        feather: 0.08,
+        shapes: [
+          {
+            closed: true,
+            points: [
+              { x: 0.1, y: 0.1, cpOut: { x: 0.25, y: 0.02 } },
+              { x: 0.9, y: 0.1, cpIn: { x: 0.75, y: 0.02 } },
+              { x: 0.5, y: 0.9 },
+            ],
+          },
+          {
+            closed: true,
+            points: [
+              { x: 0.2, y: 0.2 },
+              { x: 0.35, y: 0.2 },
+              { x: 0.25, y: 0.35 },
+            ],
+          },
+        ],
+      },
+    } as any);
+
+    expect(state.info[0]).toBe(1);
+    expect(state.info[1]).toBe(1);
+    expect(state.info[2]).toBeCloseTo(0.08);
+    expect(state.points.length).toBeGreaterThan(6);
+    expect(state.points.length).toBeLessThanOrEqual(64);
+    expect(new Set(state.points.map((point) => point[3]))).toEqual(new Set([0, 1]));
+    for (const point of state.points) {
+      expect(point[2]).toBeGreaterThanOrEqual(0);
+      expect(point[2]).toBeLessThan(state.points.length);
+    }
+  });
+
+  it('converts editor mask y-up coordinates to compositor y-down UVs', () => {
+    const state = nativeLayerMaskState({
+      mask: {
+        enabled: true,
+        inverted: false,
+        feather: 0,
+        shapes: [{
+          closed: true,
+          points: [
+            { x: 0.1, y: 0.8 },
+            { x: 0.9, y: 0.8 },
+            { x: 0.5, y: 0.2 },
+          ],
+        }],
+      },
+    } as any);
+
+    expect(state.points.map((point) => point.slice(0, 2))).toEqual([
+      [0.1, 0.2],
+      [0.9, 0.2],
+      [0.5, 0.8],
+    ]);
+  });
+
+  it('reads advertised native effect-pass descriptors from capabilities', () => {
+    expect(nativeEffectPassDescriptorIds({
+      native_effect_pass_descriptors: [
+        { id: 'invert', code: 1 },
+        { id: 'colorama', code: 40 },
+        { id: 'Colorama', code: 40 },
+      ],
+    })).toEqual(['invert', 'colorama']);
+  });
+
+  it('maps color correction UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'exposure',
+      params: {
+        exposureAmount: 1.25,
+        exposureRollOff: 0.4,
+        exposureHighlightProtect: 0.6,
+      },
+    })).toBe('exposure:1.2500:0.4000:0.6000');
+
+    expect(effectToNativeDescriptor({
+      type: 'vibrance',
+      params: {
+        vibranceAmount: 0.8,
+        vibranceSkinProtect: 0.25,
+        vibranceHighlightProtect: 0.45,
+        vibranceCeiling: 1.2,
+      },
+    })).toBe('vibrance:0.8000:0.2500:0.4500:1.2000');
+
+    expect(effectToNativeDescriptor({
+      type: 'temperatureTint',
+      params: {
+        temperatureAmount: -0.35,
+        tintAmount: 0.2,
+        temperatureShadow: -0.25,
+        temperatureHighlight: 0.4,
+        temperatureSplitTone: 0.7,
+        temperatureAutoCycle: 0.9,
+      },
+    })).toBe('temperature-tint:-0.3500:0.2000:-0.2500:0.4000:0.7000:0.9000');
+
+    expect(effectToNativeDescriptor({
+      type: 'colorama',
+      params: {
+        coloramaMix: 0.85,
+        coloramaPalette: 8,
+        coloramaOffset: 0.15,
+        coloramaSpeed: 0.05,
+        coloramaContrast: 1.2,
+        coloramaBands: 4,
+        coloramaAudioReact: 0.35,
+        coloramaHueShift: 0.2,
+        audio: 0.4,
+      },
+    })).toBe('colorama:0.8500:8:0.1500:0.0500:1.2000:4.0000:0.3500:0.2000:0.4000');
+
+    expect(effectToNativeDescriptor({
+      type: 'colorBalance',
+      params: {
+        cbMix: 0.9,
+        cbShadowR: -0.18,
+        cbShadowG: 0.02,
+        cbShadowB: 0.24,
+        cbPreserveLuma: 0.7,
+        cbMidR: 0.08,
+        cbMidG: 0,
+        cbMidB: -0.05,
+        cbHighR: 0.28,
+        cbHighG: 0.12,
+        cbHighB: -0.08,
+      },
+    })).toBe('color-balance:0.9000:-0.1800:0.0200:0.2400:0.7000:0.0800:0.0000:-0.0500:0:0.2800:0.1200:-0.0800:0');
+
+    expect(effectToNativeDescriptor({
+      type: 'liftGammaGain',
+      params: {
+        lggMix: 0.85,
+        lggLiftR: -0.04,
+        lggLiftG: 0.02,
+        lggLiftB: 0.12,
+        lggLumaOnly: 0,
+        lggGammaR: 1.08,
+        lggGammaG: 1,
+        lggGammaB: 0.94,
+        lggGainR: 1.18,
+        lggGainG: 1.04,
+        lggGainB: 0.9,
+      },
+    })).toBe('lift-gamma-gain:0.8500:-0.0400:0.0200:0.1200:0.0000:1.0800:1.0000:0.9400:0:1.1800:1.0400:0.9000:0');
+  });
+
+  it('rebuilds native effect-pass runtime params from color correction descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('exposure:1.2500:0.4000:0.6000')).toMatchObject({
+      effect: 'exposure',
+      amount: 1.25,
+      params: {
+        rollOff: 0.4,
+        highlightProtect: 0.6,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('vibrance:0.8000:0.2500:0.4500:1.2000')).toMatchObject({
+      effect: 'vibrance',
+      amount: 0.8,
+      params: {
+        skinProtect: 0.25,
+        highlightProtect: 0.45,
+        ceiling: 1.2,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('temperature-tint:-0.3500:0.2000:-0.2500:0.4000:0.7000:0.9000')).toMatchObject({
+      effect: 'temperature-tint',
+      amount: -0.35,
+      params: {
+        tint: 0.2,
+        shadowTemp: -0.25,
+        highlightTemp: 0.4,
+        splitTone: 0.7,
+        autoCycle: 0.9,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('colorama:0.8500:8:0.1500:0.0500:1.2000:4.0000:0.3500:0.2000:0.4000')).toMatchObject({
+      effect: 'colorama',
+      amount: 0.85,
+      params: {
+        coloramaPalette: 8,
+        coloramaOffset: 0.15,
+        coloramaSpeed: 0.05,
+        coloramaContrast: 1.2,
+        coloramaBands: 4,
+        coloramaAudioReact: 0.35,
+        coloramaHueShift: 0.2,
+        audio: 0.4,
+      },
+    });
+  });
+
+  it('maps blur and symmetry UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'directionalBlur',
+      params: {
+        dirBlurAmount: 0.65,
+        dirBlurAngle: 45,
+        dirBlurSamples: 20,
+        dirBlurFalloff: 0.4,
+        dirBlurCenterBias: 0.15,
+        dirBlurMix: 0.8,
+      },
+    })).toBe('directional-blur:0.6500:45.0000:20.0000:0.4000:0.1500:0.8000');
+
+    expect(effectToNativeDescriptor({
+      type: 'zoomBlur',
+      params: {
+        amount: 0.7,
+        amount2: 0.35,
+        centerX: 0.42,
+        centerY: 0.58,
+        zoomBlurChromatic: 0.25,
+      },
+    })).toBe('zoom-blur:0.7000:0.4200:0.5800:16.0000:0.3500:0.2500:1.0000');
+
+    expect(effectToNativeDescriptor({
+      type: 'kaleidoscope',
+      params: {
+        kaleidoscopeSegments: 7,
+        kaleidoscopeRotation: 90,
+        kaleidoscopeZoom: 1.4,
+        kaleidoscopeSpiral: 0.6,
+        kaleidoscopeMix: 0.75,
+      },
+    })).toBe('kaleidoscope:0.7500:7:90.0000:0.5000:0.5000:1.4000:0:0.6000:0.0000');
+
+    expect(effectToNativeDescriptor({
+      type: 'mirror',
+      params: {
+        mirrorHorizontal: 1,
+        mirrorVertical: 1,
+        mirrorPosition: 0.45,
+        mirrorOffset: 0.5,
+        mirrorMix: 1,
+      },
+    })).toBe('mirror:1.0000:2:0.4500:0.5000:0');
+  });
+
+  it('rebuilds native effect-pass runtime params from blur and symmetry descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('directional-blur:0.6500:45.0000:20.0000:0.4000:0.1500:0.8000')).toMatchObject({
+      effect: 'directional-blur',
+      amount: 0.65,
+      params: {
+        angle: 45,
+        samples: 20,
+        falloff: 0.4,
+        centerBias: 0.15,
+        outputMix: 0.8,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('radial-blur:0.5000:0.4500:0.5500:18.0000:0.2000:0.1000:0.8500:0.9000')).toMatchObject({
+      effect: 'radial-blur',
+      amount: 0.5,
+      params: {
+        centerX: 0.45,
+        centerY: 0.55,
+        samples: 18,
+        falloff: 0.2,
+        radiusInner: 0.1,
+        radiusOuter: 0.85,
+        outputMix: 0.9,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('mirror:1.0000:2:0.4500:0.5000:0')).toMatchObject({
+      effect: 'mirror',
+      amount: 1,
+      params: {
+        mode: 2,
+        position: 0.45,
+        offset: 0.5,
+        flipSide: 0,
+      },
+    });
+  });
+
+  it('maps distortion UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'wave',
+      params: {
+        waveType: 2,
+        waveWaveform: 1,
+        waveAmplitude: 18,
+        waveFrequency: 12,
+        waveSpeed: 1.4,
+        wavePhase: 90,
+        waveSecondary: 0.4,
+        waveChromaSplit: 0.7,
+      },
+    })).toBe('wave:18.0000:2:1:12.0000:1.4000:90.0000:0.4000:0.7000');
+
+    expect(effectToNativeDescriptor({
+      type: 'fisheye',
+      params: {
+        fisheyeMode: 1,
+        fisheyeStrength: 0.65,
+        fisheyeRadius: 0.85,
+        fisheyeCenterX: 0.62,
+        fisheyeCenterY: 0.38,
+        fisheyeZoom: 1.1,
+        fisheyeChromaEdge: 0.45,
+      },
+    })).toBe('fisheye:0.6500:0.8500:0.6200:0.3800:1.1000:1:0.4500');
+
+    expect(effectToNativeDescriptor({
+      type: 'lensDistortion',
+      params: {
+        lensDistMode: 3,
+        lensDistAmount: 0.7,
+        lensDistCenterX: 0.45,
+        lensDistCenterY: 0.55,
+        lensDistCubic: -0.2,
+        lensDistAnamorphicX: 1.7,
+        lensDistEdgeFade: 0.8,
+        lensDistChromaFringe: 0.3,
+      },
+    })).toBe('lens-distortion:0.7000:3:0.4500:0.5500:-0.2000:1.7000:0.8000:0.3000');
+
+    expect(effectToNativeDescriptor({
+      type: 'twirl',
+      params: {
+        twirlAngle: 2.5,
+        twirlRadius: 0.75,
+        twirlCenterX: 0.48,
+        twirlCenterY: 0.52,
+        twirlFalloff: 1.2,
+        twirlAnimSpeed: 0.3,
+        twirlMix: 0.9,
+      },
+    })).toBe('twirl:2.5000:0.7500:0.4800:0.5200:1.2000:0.3000:0.9000');
+
+    expect(effectToNativeDescriptor({
+      type: 'pinchBulge',
+      params: {
+        pinchAmount: -0.55,
+        pinchRadius: 0.5,
+        pinchCenterX: 0.6,
+        pinchCenterY: 0.4,
+        pinchFalloff: 1.5,
+        pinchChromatic: 0.25,
+        pinchMix: 0.8,
+      },
+    })).toBe('pinch-bulge:-0.5500:0.5000:0.6000:0.4000:1.5000:0.2500:0.8000');
+  });
+
+  it('rebuilds native effect-pass runtime params from distortion descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('wave:18.0000:2:1:12.0000:1.4000:90.0000:0.4000:0.7000')).toMatchObject({
+      effect: 'wave',
+      amount: 18,
+      params: {
+        mode: 2,
+        waveform: 1,
+        frequency: 12,
+        speed: 1.4,
+        phase: 90,
+        secondary: 0.4,
+        chromaSplit: 0.7,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('fisheye:0.6500:0.8500:0.6200:0.3800:1.1000:1:0.4500')).toMatchObject({
+      effect: 'fisheye',
+      amount: 0.65,
+      params: {
+        radius: 0.85,
+        centerX: 0.62,
+        centerY: 0.38,
+        zoom: 1.1,
+        mode: 1,
+        edgeFalloff: 0.45,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('lens-distortion:0.7000:3:0.4500:0.5500:-0.2000:1.7000:0.8000:0.3000')).toMatchObject({
+      effect: 'lens-distortion',
+      amount: 0.7,
+      params: {
+        mode: 3,
+        centerX: 0.45,
+        centerY: 0.55,
+        cubic: -0.2,
+        anamorphicX: 1.7,
+        edgeFade: 0.8,
+        chromatic: 0.3,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('twirl:2.5000:0.7500:0.4800:0.5200:1.2000:0.3000:0.9000')).toMatchObject({
+      effect: 'twirl',
+      amount: 2.5,
+      params: {
+        radius: 0.75,
+        centerX: 0.48,
+        centerY: 0.52,
+        falloff: 1.2,
+        animSpeed: 0.3,
+        outputMix: 0.9,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('pinch-bulge:-0.5500:0.5000:0.6000:0.4000:1.5000:0.2500:0.8000')).toMatchObject({
+      effect: 'pinch-bulge',
+      amount: -0.55,
+      params: {
+        radius: 0.5,
+        centerX: 0.6,
+        centerY: 0.4,
+        falloff: 1.5,
+        chromatic: 0.25,
+        outputMix: 0.8,
+      },
+    });
+  });
+
+  it('maps keying UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'chromaKey',
+      params: {
+        chromaKeyR: 0,
+        chromaKeyG: 0.9,
+        chromaKeyB: 0.1,
+        chromaKeyTolerance: 0.22,
+        chromaKeySoftness: 0.12,
+        chromaKeySpill: 0.7,
+        chromaKeyMatte: 1,
+        chromaKeyMode: 2,
+      },
+    })).toBe('chroma-key:0.2200:0.0000:0.9000:0.1000:0.1200:0.7000:1:2');
+
+    expect(effectToNativeDescriptor({
+      type: 'lumaKey',
+      params: {
+        lumaKeyLowCut: 0.35,
+        lumaKeyHighCut: 0.8,
+        lumaKeyInvert: 1,
+        lumaKeyGamma: 0.7,
+        lumaKeyMatte: 0,
+        lumaKeyPremultiply: 1,
+      },
+    })).toBe('luma-key:0.3500:0.8000:1:0.7000:0:1');
+
+    expect(effectToNativeDescriptor({
+      type: 'differenceKey',
+      params: {
+        diffKeyR: 0.2,
+        diffKeyG: 0.3,
+        diffKeyB: 0.4,
+        diffKeyTolerance: 0.18,
+        diffKeySoftness: 0.09,
+        diffKeyInvert: 0,
+        diffKeyMatte: 1,
+        diffKeyMode: 1,
+      },
+    })).toBe('difference-key:0.1800:0.2000:0.3000:0.4000:0.0900:0:1:1');
+
+    expect(effectToNativeDescriptor({
+      type: 'erode',
+      params: {
+        erodeRadius: 4,
+        erodeShape: 2,
+        erodeChannel: 4,
+        erodeMix: 0.65,
+      },
+    })).toBe('erode:4.0000:2:4:0.6500');
+  });
+
+  it('rebuilds native effect-pass runtime params from keying descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('chroma-key:0.2200:0.0000:0.9000:0.1000:0.1200:0.7000:1:2')).toMatchObject({
+      effect: 'chroma-key',
+      amount: 0.22,
+      params: {
+        keyR: 0,
+        keyG: 0.9,
+        keyB: 0.1,
+        softness: 0.12,
+        spill: 0.7,
+        matte: 1,
+        mode: 2,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('luma-key:0.3500:0.8000:1:0.7000:0:1')).toMatchObject({
+      effect: 'luma-key',
+      amount: 0.35,
+      params: {
+        highCut: 0.8,
+        invert: 1,
+        gamma: 0.7,
+        matte: 0,
+        premultiply: 1,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('dilate:5.0000:1:0:0.7500')).toMatchObject({
+      effect: 'dilate',
+      amount: 5,
+      params: {
+        shape: 1,
+        channel: 0,
+        outputMix: 0.75,
+      },
+    });
+  });
+
+  it('maps edge detection UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'edgeDetect',
+      params: {
+        edgeThreshold: 0.18,
+        edgeThickness: 2.5,
+        edgeMode: 1,
+        edgeInvert: 1,
+        edgeTintR: 0.1,
+        edgeTintG: 0.8,
+        edgeTintB: 1,
+        edgeTintEdges: 1,
+        edgeGlow: 0.6,
+        edgeOnlyAlpha: 1,
+      },
+    })).toBe('edge-detect:0.1800:2.5000:1:3:0.1000:0.8000:1.0000:1.0000:0.6000');
+  });
+
+  it('rebuilds native effect-pass runtime params from edge detection descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('edge-detect:0.1800:2.5000:1:3:0.1000:0.8000:1.0000:1.0000:0.6000')).toMatchObject({
+      effect: 'edge-detect',
+      amount: 0.18,
+      params: {
+        thickness: 2.5,
+        mode: 1,
+        invert: 1,
+        edgeOnlyAlpha: 1,
+        edgeTintR: 0.1,
+        edgeTintG: 0.8,
+        edgeTintB: 1,
+        tintEdges: 1,
+        edgeGlow: 0.6,
+      },
+    });
+  });
+
+  it('maps film grain UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'filmGrain',
+      params: {
+        grainAmount: 0.45,
+        grainSize: 1.25,
+        grainShadow: 0.8,
+        grainMid: 1.1,
+        grainHigh: 0.6,
+        grainMono: 0,
+        grainStock: 2,
+        grainColorJitter: 0.35,
+        grainAnimSpeed: 1.5,
+      },
+    })).toBe('film-grain:0.4500:1.2500:0.8000:1.1000:0.6000:0:2:0.3500:1.5000');
+  });
+
+  it('rebuilds native effect-pass runtime params from film grain descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('film-grain:0.4500:1.2500:0.8000:1.1000:0.6000:0:2:0.3500:1.5000')).toMatchObject({
+      effect: 'film-grain',
+      amount: 0.45,
+      params: {
+        grainSize: 1.25,
+        grainShadow: 0.8,
+        grainMid: 1.1,
+        grainHigh: 0.6,
+        grainMono: 0,
+        grainStock: 2,
+        grainColorJitter: 0.35,
+        grainAnimSpeed: 1.5,
+      },
+    });
+  });
+
+  it('maps filmic tonemap UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'filmicTonemap',
+      params: {
+        tonemapMix: 0.8,
+        tonemapCurve: 4,
+        tonemapExposure: 1.35,
+        tonemapContrast: 0.45,
+      },
+    })).toBe('filmic-tonemap:0.8000:4:1.3500:0.4500');
+  });
+
+  it('rebuilds native effect-pass runtime params from filmic tonemap descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('filmic-tonemap:0.8000:4:1.3500:0.4500')).toMatchObject({
+      effect: 'filmic-tonemap',
+      amount: 0.8,
+      params: {
+        tonemapCurve: 4,
+        tonemapExposure: 1.35,
+        tonemapContrast: 0.45,
+      },
+    });
+  });
+
+  it('maps bloom UI params to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'bloom',
+      params: {
+        amount: 0.7,
+        bloomIntensity: 1.3,
+        threshold: 0.55,
+        bloomKnee: 0.45,
+        bloomRadius: 0.8,
+        bloomAnamorphic: 0.25,
+        red: 1,
+        green: 0.7,
+        blue: 0.4,
+      },
+    })).toBe('bloom:0.7000:1.3000:0.5500:0.4500:0.8000:0.2500:1.0000:0.7000:0.4000');
+  });
+
+  it('rebuilds native effect-pass runtime params from bloom descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('bloom:0.7000:1.3000:0.5500:0.4500:0.8000:0.2500:1.0000:0.7000:0.4000')).toMatchObject({
+      effect: 'bloom',
+      amount: 0.7,
+      params: {
+        bloomIntensity: 1.3,
+        threshold: 0.55,
+        bloomKnee: 0.45,
+        bloomRadius: 0.8,
+        bloomAnamorphic: 0.25,
+        red: 1,
+        green: 0.7,
+        blue: 0.4,
+      },
+    });
+  });
+
+  it('maps hero UI effects to native effect-pass descriptors', () => {
+    expect(effectToNativeDescriptor({
+      type: 'edgeFeather',
+      params: {
+        featherTop: 0.1,
+        featherBottom: 0.2,
+        featherLeft: 0.3,
+        featherRight: 0.4,
+        featherSoftness: 0.6,
+        featherGamma: 1.2,
+        featherMattePreview: 1,
+      },
+    })).toBe('edge-feather:1.0000:0.1000:0.2000:0.3000:0.4000:0.6000:1.2000:1');
+
+    expect(effectToNativeDescriptor({
+      type: 'outline',
+      params: {
+        outlineThickness: 4,
+        outlineColor: [0.1, 0.8, 1],
+        outlineOnly: 1,
+        outlineGlow: 0.7,
+        outlinePosition: 2,
+        outlineCrawl: 0.5,
+        outlineAlphaAware: 1,
+      },
+    })).toBe('outline:4.0000:0.1000:0.8000:1.0000:1:0.7000:2:0.5000:1:1.0000');
+
+    expect(effectToNativeDescriptor({
+      type: 'nightVision',
+      params: {
+        nightVisionIntensity: 1.7,
+        nightVisionNoise: 0.25,
+        nightVisionVignette: 0.6,
+        nightVisionPhosphor: 2,
+        nightVisionBloom: 1.1,
+        nightVisionScopeMask: 2,
+        nightVisionRollingNoise: 0.4,
+      },
+    })).toBe('night-vision:1.7000:0.2500:0.6000:2:1.1000:2:0.4000');
+
+    expect(effectToNativeDescriptor({
+      type: 'tiltShift',
+      params: {
+        tiltShiftMode: 2,
+        tiltShiftFocusY: 0.45,
+        tiltShiftFocusX: 0.55,
+        tiltShiftFocusBand: 0.18,
+        tiltShiftFalloff: 0.32,
+        tiltShiftMaxBlur: 0.7,
+        tiltShiftAngle: 25,
+        tiltShiftSaturation: 1.35,
+      },
+    })).toBe('tilt-shift:1.0000:2:0.4500:0.5500:0.1800:0.3200:0.7000:25.0000:1.3500');
+
+    expect(effectToNativeDescriptor({
+      type: 'halation',
+      params: {
+        halationAmount: 1.1,
+        halationRadius: 18,
+        halationThreshold: 0.52,
+        halationTintR: 0.95,
+        halationTintG: 0.5,
+        halationTintB: 0.25,
+        halationMode: 1,
+        halationMix: 0.8,
+      },
+    })).toBe('halation:1.1000:18.0000:0.5200:0.9500:0.5000:0.2500:1:0.8000');
+
+    expect(effectToNativeDescriptor({
+      type: 'anamorphicStreak',
+      params: {
+        anaIntensity: 0.9,
+        anaLength: 0.42,
+        anaThreshold: 0.68,
+        anaTintR: 0.65,
+        anaTintG: 0.78,
+        anaTintB: 1.1,
+        anaAngle: 8,
+        anaSamples: 40,
+        anaMix: 0.75,
+      },
+    })).toBe('anamorphic-streak:0.9000:0.4200:0.6800:0.6500:0.7800:1.1000:8.0000:40.0000:0.7500');
+
+    expect(effectToNativeDescriptor({
+      type: 'heatHaze',
+      params: {
+        hazeAmount: 0.44,
+        hazeScale: 9,
+        hazeSpeed: 1.2,
+        hazeDirectionY: 0.35,
+        hazeTurbulence: 0.55,
+        hazeMode: 1,
+        hazeFocusY: 0.48,
+        hazeFocusBand: 0.37,
+      },
+    })).toBe('heat-haze:0.4400:9.0000:1.2000:0.3500:0.5500:1:0.4800:0.3700');
+
+    expect(effectToNativeDescriptor({
+      type: 'curves',
+      params: {
+        curvesMix: 0.9,
+        curvesContrast: 0.7,
+        curvesToe: 0.25,
+        curvesShoulder: 0.35,
+        curvesBlackCrush: 0.15,
+      },
+    })).toBe('curves:0.9000:0.7000:0.2500:0.3500:0.1500');
+
+    expect(effectToNativeDescriptor({
+      type: 'selectiveColor',
+      params: {
+        selColorTargetHue: 0.08,
+        selColorRange: 0.16,
+        selColorFeather: 0.07,
+        selColorMode: 1,
+        selColorReplaceHue: 0.58,
+        selColorSatBoost: 0.4,
+      },
+    })).toBe('selective-color:1.0000:0.0800:0.1600:0.0700:1:0.5800:0.4000');
+
+    expect(effectToNativeDescriptor({
+      type: 'falseColor',
+      params: {
+        falseColorMode: 2,
+        falseColorMix: 0.85,
+        falseColorShowOriginal: 0.75,
+        falseColorMidpoint: 0.52,
+        falseColorRange: 0.1,
+      },
+    })).toBe('false-color:0.8500:2:0.7500:0.5200:0.1000');
+
+    expect(effectToNativeDescriptor({
+      type: 'shadowRecovery',
+      params: {
+        shadowAmount: 0.6,
+        shadowThreshold: 0.42,
+        shadowSoftness: 0.33,
+        shadowColorRecovery: 0.42,
+        shadowHighlightProtect: 0.62,
+        shadowMix: 0.9,
+      },
+    })).toBe('shadow-recovery:0.6000:0.4200:0.3300:0.4200:0.6200:0.9000');
+
+    expect(effectToNativeDescriptor({
+      type: 'highlightRolloff',
+      params: {
+        highRolloffAmount: 0.6,
+        highRolloffThreshold: 0.72,
+        highRolloffSoftness: 0.21,
+        highRolloffPreserveHue: 0.8,
+        highRolloffMaxValue: 1.05,
+        highRolloffMix: 0.85,
+      },
+    })).toBe('highlight-rolloff:0.6000:0.7200:0.2100:0.8000:1.0500:0.8500');
+
+    expect(effectToNativeDescriptor({
+      type: 'strobeFlash',
+      params: {
+        strobeIntensity: 0.88,
+        strobeRate: 4,
+        strobeDuty: 0.52,
+        strobeMode: 2,
+        strobeTintR: 0.18,
+        strobeTintG: 0.85,
+        strobeTintB: 1,
+      },
+    })).toBe('strobe-flash:0.8800:4.0000:0.5200:2:0.1800:0.8500:1.0000');
+
+    expect(effectToNativeDescriptor({
+      type: 'fmScanlines',
+      params: {
+        fmLinesMode: 2,
+        fmLinesCount: 180,
+        fmLinesWidth: 0.4,
+        fmLinesFreq: 0.2,
+        fmLinesFmDepth: 0.7,
+        fmLinesAmp: 0.8,
+        fmLinesSpeed: 1.1,
+        fmLinesColorMix: 0.35,
+        fmLinesInvert: 1,
+      },
+    })).toBe('fm-scanlines:1.0000:2:180.0000:0.4000:0.2000:0.7000:0.8000:1.1000:0.3500:1');
+
+    expect(effectToNativeDescriptor({
+      type: 'vhs',
+      params: {
+        vhsTracking: 0.45,
+        vhsNoise: 0.2,
+        vhsDistortion: 0.3,
+        vhsColorBleed: 0.55,
+        vhsScanlines: 0.35,
+        vhsHeadSwitch: 0.4,
+        vhsTapeWobble: 0.25,
+        vhsDropout: 0.1,
+        vhsChromaDelay: 0.45,
+        vhsTrackingJump: 0.1,
+        vhsSaturation: 0.7,
+      },
+    })).toBe('vhs:1.0000:0.4500:0.2000:0.3000:0.5500:0.3500:0.4000:0.2500:0.1000:0.4500:0.1000:0.7000');
+
+    expect(effectToNativeDescriptor({
+      type: 'plasma',
+      params: {
+        plasmaMix: 0.9,
+        plasmaScale: 4.5,
+        plasmaSpeed: 0.8,
+        plasmaPalette: 8,
+        plasmaSourceMix: 0.35,
+      },
+    })).toBe('plasma:0.9000:4.5000:0.8000:8:0.3500:3:0:0:0.4000:0.0000');
+
+    expect(effectToNativeDescriptor({
+      type: 'halftone',
+      params: {
+        halftoneMix: 1,
+        halftoneScale: 9,
+        halftoneAngle: 24,
+        halftoneDotGain: 1.1,
+        halftoneColorMode: 0,
+      },
+    })).toBe('halftone:1.0000:9.0000:24.0000:1.1000:0.0000:0:0:15.0000:75.0000:0.0000:45.0000:0.0000');
+
+    expect(effectToNativeDescriptor({
+      type: 'toon',
+      params: {
+        toonMix: 0.95,
+        toonLevels: 3,
+        toonEdgeStrength: 1.2,
+        toonSaturation: 1.2,
+        toonEdgeThreshold: 0.02,
+      },
+    })).toBe('toon:0.9500:3:1.2000:1.2000:0.0200:0.0000:0.0000');
+
+    expect(effectToNativeDescriptor({
+      type: 'kuwahara',
+      params: {
+        kuwaharaMix: 0.88,
+        kuwaharaRadius: 4,
+        kuwaharaEdgeSharpness: 0.42,
+        kuwaharaColorPunch: 0.35,
+      },
+    })).toBe('kuwahara:0.8800:4.0000:0.4200:0.3500');
+
+    expect(effectToNativeDescriptor({
+      type: 'defocusBokeh',
+      params: {
+        bokehRadius: 14,
+        bokehSamples: 32,
+        bokehBrightWeight: 1.1,
+        bokehThreshold: 0.62,
+        bokehChromaFringe: 0.25,
+        bokehShape: 1,
+        bokehRotation: 35,
+        bokehMix: 0.75,
+      },
+    })).toBe('defocus-bokeh:14.0000:32.0000:1.1000:0.6200:0.2500:1:35.0000:0.7500');
+
+    expect(effectToNativeDescriptor({
+      type: 'godRays',
+      params: {
+        godRaysIntensity: 0.85,
+        godRaysDecay: 0.97,
+        godRaysExposure: 0.45,
+        godRaysDensity: 0.88,
+        godRaysThreshold: 0.55,
+        godRaysCenterX: 0.42,
+        godRaysCenterY: 0.12,
+        godRaysSamples: 96,
+        godRaysTintR: 1,
+        godRaysTintG: 0.84,
+        godRaysTintB: 0.62,
+        godRaysMix: 0.9,
+      },
+    })).toBe('god-rays:0.8500:0.9700:0.4500:0.8800:0.5500:0.4200:0.1200:96.0000:1.0000:0.8400:0.6200:0.9000');
+
+    expect(effectToNativeDescriptor({
+      type: 'displacement',
+      params: {
+        dispAmount: 0.45,
+        dispScale: 7.5,
+        dispSpeed: 1.25,
+        dispMode: 3,
+        dispTurbulence: 0.66,
+        dispChromatic: 0.4,
+      },
+    })).toBe('displacement:0.4500:7.5000:1.2500:3:0.6600:0.4000');
+
+    expect(effectToNativeDescriptor({
+      type: 'polarTransform',
+      params: {
+        polarMix: 0.82,
+        polarMode: 2,
+        polarRotation: 41,
+        polarZoom: 1.35,
+        polarCenterX: 0.62,
+        polarCenterY: 0.47,
+      },
+    })).toBe('polar-transform:0.8200:2:41.0000:1.3500:0.6200:0.4700');
+  });
+
+  it('rebuilds native effect-pass runtime params from hero effect descriptors', () => {
+    expect(nativeEffectPassFromDescriptor('dither:0.7500:3:2.0000:4.0000:2:1')).toMatchObject({
+      effect: 'dither',
+      amount: 0.75,
+      params: {
+        ditherType: 3,
+        ditherScale: 2,
+        ditherColorDepth: 4,
+        ditherPalette: 2,
+        ditherPixelLock: 1,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('emboss:1.2000:135.0000:0.8000:1.0000:0.9000:0.7000:0.1000:0.2000:0.3000')).toMatchObject({
+      effect: 'emboss',
+      amount: 1.2,
+      params: {
+        embossAngle: 135,
+        embossHeight: 0.8,
+        embossHighlightR: 1,
+        embossHighlightG: 0.9,
+        embossHighlightB: 0.7,
+        embossShadowR: 0.1,
+        embossShadowG: 0.2,
+        embossShadowB: 0.3,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('crt:0.6000:720.0000:0.8000:2:0.4000:0.5000:0.7000:0.2000:0.3500')).toMatchObject({
+      effect: 'crt',
+      amount: 0.6,
+      params: {
+        crtScanCount: 720,
+        crtMask: 0.8,
+        crtMaskType: 2,
+        crtCurvature: 0.4,
+        crtVignette: 0.5,
+        crtGlow: 0.7,
+        crtRollingBar: 0.2,
+        crtChromatic: 0.35,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('fm-scanlines:1.0000:2:180.0000:0.4000:0.2000:0.7000:0.8000:1.1000:0.3500:1')).toMatchObject({
+      effect: 'fm-scanlines',
+      amount: 1,
+      params: {
+        mode: 2,
+        count: 180,
+        width: 0.4,
+        freq: 0.2,
+        fmDepth: 0.7,
+        amp: 0.8,
+        speed: 1.1,
+        colorMix: 0.35,
+        invert: 1,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('vhs:1.0000:0.4500:0.2000:0.3000:0.5500:0.3500:0.4000:0.2500:0.1000:0.4500:0.1000:0.7000')).toMatchObject({
+      effect: 'vhs',
+      amount: 1,
+      params: {
+        tracking: 0.45,
+        noise: 0.2,
+        distortion: 0.3,
+        colorBleed: 0.55,
+        scanlines: 0.35,
+        headSwitch: 0.4,
+        tapeWobble: 0.25,
+        dropout: 0.1,
+        chromaDelay: 0.45,
+        trackingJump: 0.1,
+        saturation: 0.7,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('plasma:0.9000:4.5000:0.8000:8:0.3500')).toMatchObject({
+      effect: 'plasma',
+      amount: 0.9,
+      params: {
+        plasmaScale: 4.5,
+        plasmaSpeed: 0.8,
+        plasmaPalette: 8,
+        plasmaSourceMix: 0.35,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('halftone:1.0000:9.0000:24.0000:1.1000:0.0000')).toMatchObject({
+      effect: 'halftone',
+      amount: 1,
+      params: {
+        halftoneScale: 9,
+        halftoneAngle: 24,
+        halftoneDotGain: 1.1,
+        halftoneColorMode: 0,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('toon:0.9500:3:1.2000:1.2000:0.0200')).toMatchObject({
+      effect: 'toon',
+      amount: 0.95,
+      params: {
+        toonLevels: 3,
+        toonEdgeStrength: 1.2,
+        toonSaturation: 1.2,
+        toonEdgeThreshold: 0.02,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('kuwahara:0.8800:4.0000:0.4200:0.3500')).toMatchObject({
+      effect: 'kuwahara',
+      amount: 0.88,
+      params: {
+        kuwaharaRadius: 4,
+        kuwaharaEdgeSharpness: 0.42,
+        kuwaharaColorPunch: 0.35,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('defocus-bokeh:14.0000:32.0000:1.1000:0.6200:0.2500:1:35.0000:0.7500')).toMatchObject({
+      effect: 'defocus-bokeh',
+      amount: 14,
+      params: {
+        bokehSamples: 32,
+        bokehBrightWeight: 1.1,
+        bokehThreshold: 0.62,
+        bokehChromaFringe: 0.25,
+        bokehShape: 1,
+        bokehRotation: 35,
+        bokehMix: 0.75,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('god-rays:0.8500:0.9700:0.4500:0.8800:0.5500:0.4200:0.1200:96.0000:1.0000:0.8400:0.6200:0.9000')).toMatchObject({
+      effect: 'god-rays',
+      amount: 0.85,
+      params: {
+        godRaysDecay: 0.97,
+        godRaysExposure: 0.45,
+        godRaysDensity: 0.88,
+        godRaysThreshold: 0.55,
+        godRaysCenterX: 0.42,
+        godRaysCenterY: 0.12,
+        godRaysSamples: 96,
+        godRaysTintR: 1,
+        godRaysTintG: 0.84,
+        godRaysTintB: 0.62,
+        godRaysMix: 0.9,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('displacement:0.4500:7.5000:1.2500:3:0.6600:0.4000')).toMatchObject({
+      effect: 'displacement',
+      amount: 0.45,
+      params: {
+        dispScale: 7.5,
+        dispSpeed: 1.25,
+        dispMode: 3,
+        dispTurbulence: 0.66,
+        dispChromatic: 0.4,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('polar-transform:0.8200:2:41.0000:1.3500:0.6200:0.4700')).toMatchObject({
+      effect: 'polar-transform',
+      amount: 0.82,
+      params: {
+        polarMode: 2,
+        polarRotation: 41,
+        polarZoom: 1.35,
+        polarCenterX: 0.62,
+        polarCenterY: 0.47,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('thermal:1.4000:3:0.5000:0.2500')).toMatchObject({
+      effect: 'thermal',
+      amount: 1.4,
+      params: {
+        thermalPalette: 3,
+        thermalShimmer: 0.5,
+        thermalSensorNoise: 0.25,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('tilt-shift:1.0000:2:0.4500:0.5500:0.1800:0.3200:0.7000:25.0000:1.3500')).toMatchObject({
+      effect: 'tilt-shift',
+      amount: 1,
+      params: {
+        tiltShiftMode: 2,
+        tiltShiftFocusY: 0.45,
+        tiltShiftFocusX: 0.55,
+        tiltShiftFocusBand: 0.18,
+        tiltShiftFalloff: 0.32,
+        tiltShiftMaxBlur: 0.7,
+        tiltShiftAngle: 25,
+        tiltShiftSaturation: 1.35,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('halation:1.1000:18.0000:0.5200:0.9500:0.5000:0.2500:1:0.8000')).toMatchObject({
+      effect: 'halation',
+      amount: 1.1,
+      params: {
+        halationRadius: 18,
+        halationThreshold: 0.52,
+        halationTintR: 0.95,
+        halationTintG: 0.5,
+        halationTintB: 0.25,
+        halationMode: 1,
+        halationMix: 0.8,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('anamorphic-streak:0.9000:0.4200:0.6800:0.6500:0.7800:1.1000:8.0000:40.0000:0.7500')).toMatchObject({
+      effect: 'anamorphic-streak',
+      amount: 0.9,
+      params: {
+        anaLength: 0.42,
+        anaThreshold: 0.68,
+        anaTintR: 0.65,
+        anaTintG: 0.78,
+        anaTintB: 1.1,
+        anaAngle: 8,
+        anaSamples: 40,
+        anaMix: 0.75,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('heat-haze:0.4400:9.0000:1.2000:0.3500:0.5500:1:0.4800:0.3700')).toMatchObject({
+      effect: 'heat-haze',
+      amount: 0.44,
+      params: {
+        hazeScale: 9,
+        hazeSpeed: 1.2,
+        hazeDirectionY: 0.35,
+        hazeTurbulence: 0.55,
+        hazeMode: 1,
+        hazeFocusY: 0.48,
+        hazeFocusBand: 0.37,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('curves:0.9000:0.7000:0.2500:0.3500:0.1500')).toMatchObject({
+      effect: 'curves',
+      amount: 0.9,
+      params: {
+        curvesContrast: 0.7,
+        curvesToe: 0.25,
+        curvesShoulder: 0.35,
+        curvesBlackCrush: 0.15,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('selective-color:1.0000:0.0800:0.1600:0.0700:1:0.5800:0.4000')).toMatchObject({
+      effect: 'selective-color',
+      amount: 1,
+      params: {
+        selColorTargetHue: 0.08,
+        selColorRange: 0.16,
+        selColorFeather: 0.07,
+        selColorMode: 1,
+        selColorReplaceHue: 0.58,
+        selColorSatBoost: 0.4,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('false-color:0.8500:2:0.7500:0.5200:0.1000')).toMatchObject({
+      effect: 'false-color',
+      amount: 0.85,
+      params: {
+        falseColorMode: 2,
+        falseColorShowOriginal: 0.75,
+        falseColorMidpoint: 0.52,
+        falseColorRange: 0.1,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('shadow-recovery:0.6000:0.4200:0.3300:0.4200:0.6200:0.9000')).toMatchObject({
+      effect: 'shadow-recovery',
+      amount: 0.6,
+      params: {
+        shadowThreshold: 0.42,
+        shadowSoftness: 0.33,
+        shadowColorRecovery: 0.42,
+        shadowHighlightProtect: 0.62,
+        shadowMix: 0.9,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('highlight-rolloff:0.6000:0.7200:0.2100:0.8000:1.0500:0.8500')).toMatchObject({
+      effect: 'highlight-rolloff',
+      amount: 0.6,
+      params: {
+        highRolloffThreshold: 0.72,
+        highRolloffSoftness: 0.21,
+        highRolloffPreserveHue: 0.8,
+        highRolloffMaxValue: 1.05,
+        highRolloffMix: 0.85,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('color-balance:0.9000:-0.1800:0.0200:0.2400:0.7000:0.0800:0.0000:-0.0500:0:0.2800:0.1200:-0.0800:0')).toMatchObject({
+      effect: 'color-balance',
+      amount: 0.9,
+      params: {
+        cbShadowR: -0.18,
+        cbShadowG: 0.02,
+        cbShadowB: 0.24,
+        cbPreserveLuma: 0.7,
+        cbMidR: 0.08,
+        cbMidG: 0,
+        cbMidB: -0.05,
+        cbHighR: 0.28,
+        cbHighG: 0.12,
+        cbHighB: -0.08,
+      },
+    });
+
+    expect(nativeEffectPassFromDescriptor('lift-gamma-gain:0.8500:-0.0400:0.0200:0.1200:0.0000:1.0800:1.0000:0.9400:0:1.1800:1.0400:0.9000:0')).toMatchObject({
+      effect: 'lift-gamma-gain',
+      amount: 0.85,
+      params: {
+        lggLiftR: -0.04,
+        lggLiftG: 0.02,
+        lggLiftB: 0.12,
+        lggLumaOnly: 0,
+        lggGammaR: 1.08,
+        lggGammaG: 1,
+        lggGammaB: 0.94,
+        lggGainR: 1.18,
+        lggGainG: 1.04,
+        lggGainB: 0.9,
+      },
+    });
+    expect(nativeEffectPassFromDescriptor('strobe-flash:0.8800:4.0000:0.5200:2:0.1800:0.8500:1.0000')).toMatchObject({
+      effect: 'strobe-flash',
+      amount: 0.88,
+      params: {
+        strobeRate: 4,
+        strobeDuty: 0.52,
+        strobeMode: 2,
+        strobeTintR: 0.18,
+        strobeTintG: 0.85,
+        strobeTintB: 1,
+      },
+    });
+  });
+});
+
+describe('generic passthru effect routing', () => {
+  it('routes manifest-covered effects without explicit descriptor branches', () => {
+    const cases = [
+      { type: 'dotMatrix', enabled: true, params: { dotMatrixCellSize: 8 } },
+      { type: 'explode3D', enabled: true, params: { amount: 0.5, amount2: 0.2 } },
+      { type: 'oilPaint', enabled: true, params: {} },
+      { type: 'phaseLab', enabled: true, params: { phaseLabMode: 1, phaseLabIntensity: 2 } },
+      { type: 'wormhole', enabled: true, params: { wormholePullStrength: 0.8 } },
+      { type: 'motionTrails', enabled: true, params: { motionTrailsLength: 0.6 } },
+    ];
+    for (const c of cases) {
+      const d = effectToNativeDescriptor(c);
+      expect(d, c.type).toBeTruthy();
+      expect(d, c.type).toContain('passthru:');
+      const rt = nativeEffectPassFromDescriptor(d);
+      expect(rt, c.type).toBeTruthy();
+    }
+    const rt = nativeEffectPassFromDescriptor(effectToNativeDescriptor(cases[3]));
+    expect(rt?.effect).toBe('phase-lab');
+    expect((rt?.params as any)?.phaseLabIntensity).toBe(2);
+    expect((rt?.params as any)?.phaseLabMode).toBe(1);
+  });
+
+  it('keeps explicit branches for legacy effects and rejects stateful ones', () => {
+    expect(effectToNativeDescriptor({ type: 'invert', enabled: true, params: {} }))
+      .toBe('invert:1.0000:0:0.5000:4.0000');
+    expect(effectToNativeDescriptor({ type: 'gpuFluidSim', enabled: true, params: {} })).toBeNull();
+    expect(nativeUnsupportedEffectTypes({ effects: [
+      { type: 'dotMatrix', enabled: true, params: {} },
+      { type: 'gpuFluidSim', enabled: true, params: {} },
+    ] })).toEqual(['gpuFluidSim']);
+  });
+});
+
+describe('native image load ownership', () => {
+  it('releases an unfinished image on stop and ignores its late completion', async () => {
+    const originalImage = globalThis.Image;
+    class PendingImage {
+      src = '';
+      crossOrigin = '';
+      complete = false;
+      naturalWidth = 64;
+      naturalHeight = 64;
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+    }
+    Object.defineProperty(globalThis, 'Image', { configurable: true, writable: true, value: PendingImage });
+    try {
+      const sync = new NativeRendererSyncCtor() as any;
+      sync.running = true;
+      sync.clearRuntimeCaches = vi.fn();
+      sync.resolvePreviewElement({ id: 'pending-image', src: 'fixture.png' }, 'image');
+      const image = [...sync.previewImageElements.values()][0] as PendingImage;
+      expect(image).toBeDefined();
+      const lateCompletion = image.onload!;
+      await sync.stop({ stopCore: false });
+      expect(image.src).toBe('');
+      expect(image.onload).toBeNull();
+      expect(sync.previewImageElements.size).toBe(0);
+      lateCompletion();
+      expect(sync.previewImageElements.size).toBe(0);
+    } finally {
+      Object.defineProperty(globalThis, 'Image', { configurable: true, writable: true, value: originalImage });
+    }
+  });
+});
+
+describe('screen mask payload', () => {
+  it('sends an open screen\'s masks with its slice output', async () => {
+    const api = await import('../api/native-renderer');
+    const { settings, createDefaultSlice } = await import('../stores/settings');
+    const { get } = await import('svelte/store');
+    const submit = vi.spyOn(api, 'submitNativeRendererCommands').mockResolvedValue({ applied: 1, dropped: 0, errors: [] } as any);
+    const original = get(settings).output.slices;
+    const sync = new NativeRendererSyncCtor() as any;
+    try {
+      settings.update(s => ({ ...s, output: { ...s.output, slices: [{
+        ...createDefaultSlice('masked', 'Masked', 'Masked'),
+        projectorCalibration: { enabled: true, corners: [{x:0,y:0},{x:1,y:0},{x:1,y:1},{x:0,y:1}] },
+        overlapBand: {enabled:true,side:'right',startTop:.45,startBottom:.4,endTop:.55,endBottom:.6},
+        masks: [{ id: 'm', name: 'Hole', enabled: true, invert: true, feather: 0.25,
+          points: [{ x: 0.2, y: 0.25 }, { x: 0.8, y: 0.25 }, { x: 0.5, y: 0.75 }] }],
+      }] } }));
+      sync.openSliceWindowIds = ['masked'];
+      sync.pushSliceOutputs();
+      const command = submit.mock.calls.at(-1)?.[0]?.[0] as any;
+      expect(command.type).toBe('set_slice_outputs');
+      expect(command.slices[0].projectorCalibration[2][3]).toBe(1);
+      expect(command.slices[0].projectorCalibration[3]).toEqual([.45,.4,.55,.6]);
+      expect(command.slices[0].projectorCalibration[4]).toEqual([1,1,0,0]);
+      expect(command.slices[0].masks).toEqual([
+        { invert: true, feather: 0.25, points: [{ x: 0.2, y: 0.75 }, { x: 0.8, y: 0.75 }, { x: 0.5, y: 0.25 }] },
+      ]);
+    } finally {
+      submit.mockRestore();
+      settings.update(s => ({ ...s, output: { ...s.output, slices: original } }));
+    }
+  });
+});
+
+describe('screen output rejection feedback', () => {
+  it('shows rejected changes and clears the message after an accepted update', async () => {
+    const api = await import('../api/native-renderer');
+    const { screenOutputError } = await import('../stores/screenOutputStatus');
+    const { get } = await import('svelte/store');
+    const submit = vi.spyOn(api, 'submitNativeRendererCommands');
+    const sync = new NativeRendererSyncCtor() as any;
+    try {
+      submit.mockResolvedValue({ applied: 0, dropped: 1, errors: [{ type: 'set_slice_outputs', message: 'Screen budget exceeded' }] } as any);
+      sync.pushSliceOutputs();
+      await Promise.resolve();
+      expect(get(screenOutputError)).toBe('Screen budget exceeded');
+      submit.mockResolvedValue({ applied: 1, dropped: 0, errors: [] } as any);
+      sync.lastSliceOutputsSig = '';
+      sync.pushSliceOutputs();
+      await Promise.resolve();
+      expect(get(screenOutputError)).toBeNull();
+    } finally {
+      submit.mockRestore();
+      screenOutputError.set(null);
+    }
+  });
+});
+
+
+it('routes an embedded LUT without putting table data in live descriptors', async () => {
+  const { parseCubeLut } = await import('../color/cubeLut');
+  const lut = parseCubeLut('LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1');
+  const effect = { type: 'cubeLut', enabled: true, params: { cubeLut: lut, lutStrength: .3 } };
+  const descriptor = effectToNativeDescriptor(effect)!;
+  expect(descriptor.length).toBeLessThan(100);
+  const pass = nativeEffectPassFromDescriptor(descriptor)!;
+  expect(pass.effect).toBe('cube-lut');
+  expect(pass.params!.amount).toBe(.3);
+  expect(effectToNativeDescriptor(effect)).toBe(descriptor);
+  expect(nativeEffectPassFromDescriptor(effectToNativeDescriptor({ type: 'cubeLut', params: {} }))!.params!.lutHandle).toBe(0);
+});
+
+describe('global macro post-composite rendering', () => {
+  it('runs spatial macro effects without Mapping enabled, scales mix, and clears when closed', async () => {
+    const { project } = await import('../stores/layers');
+    const { macros } = await import('../stores/macros');
+    const { get } = await import('svelte/store');
+    const originalProject = get(project);
+    const originalMacros = get(macros);
+    const sync = new NativeRendererSyncCtor() as any;
+    sync.nativeFeatureFlags = {
+      native_post_composite_graph: true,
+      native_effect_pass_manifest: true,
+      compute_graph_texture_sampling: true,
+      compute_graph_source_frame_target: true,
+    };
+    sync.nativeEffectPassDescriptorIds = new Set(['blur', 'invert']);
+    try {
+      project.setMappingCompositionEnabled(false);
+      project.update(p => ({ ...p, mappingComposition: { ...p.mappingComposition!, enabled: false, effects: [] } }));
+      macros.set({ macros: [{ id: 'test', name: 'Test', color: '#123456', value: 0.5,
+        effects: [{ id: 'blur', type: 'blur', enabled: true, opacity: 0.4, blendMode: 'normal', params: { blurRadius: 5 } }] }] });
+      const graph = sync.compositeEffectGraphCommand(320, 180);
+      expect(graph.render_passes.map((pass: any) => pass.name)).toEqual(['composite-fx-blur-0']);
+      expect(graph.buffers[0].initial_f32[6]).toBeCloseTo(0.2);
+      expect(sync.compositeFxResident).toBe(true);
+
+      project.update(p => ({ ...p, mappingComposition: { ...p.mappingComposition!, enabled: true,
+        effects: [{ id: 'invert', type: 'invert', enabled: true, opacity: 1, blendMode: 'normal', params: {} }] } }));
+      expect(sync.compositeEffectGraphCommand(320, 180).render_passes.map((pass: any) => pass.name))
+        .toEqual(['composite-fx-invert-0', 'composite-fx-blur-1']);
+      macros.setMacroValue('test', 0);
+      expect(sync.compositeEffectGraphCommand(320, 180).render_passes).toHaveLength(1);
+      project.setMappingCompositionEnabled(false);
+      expect(sync.compositeEffectGraphCommand(320, 180)).toBeNull();
+      expect(sync.compositeFxResident).toBe(false);
+    } finally {
+      project.set(originalProject);
+      macros.set(originalMacros);
+    }
+  });
+});
+
+it('routes mapped slices to a shared group texture and blanks unavailable groups', async () => {
+  const { vjClipLauncher } = await import('../stores/vjClipLauncher');
+  const { get } = await import('svelte/store');
+  const { createLayer } = await import('../types');
+  const original = get(vjClipLauncher);
+  try {
+    vjClipLauncher.set({ ...original, groups: [{ id: 'g1', name: 'Group', first: 0, last: 1, opacity: 0.4, blendMode: 'add', effects: [] }] });
+    const mix = createLayer('__vj-mix__', 'Mix', 'media');
+    mix.source = { id: 'mix-source', type: 'effect', src: 'plugin://vj-mix', effectSource: { effectType: 'vj-mix', vjmixRows: [{ groupId: 'g1', layerId: 'vj-layer-0' }] } } as any;
+    const slice = createLayer('slice', 'Slice', 'screen');
+    slice.vjGroupId = 'g1';
+    const sync = new NativeRendererSyncCtor() as any;
+    const resolved = sync.resolveNativeGroupLayers([mix, createLayer('vj-layer-0', 'Row', 'media'), slice]);
+    const result = resolved.find((layer: any) => layer.id === 'slice');
+    expect(result.source.effectSource.vjmixRows).toEqual([{ frameId: 'plugin:__vj-mix__:vj-mix:group:g1', opacity: 0.4, blendMode: 'normal' }]);
+    expect(result.corners).toEqual(slice.corners);
+    expect(resolved).toHaveLength(3);
+    vjClipLauncher.set({ ...original, groups: [] });
+    expect(sync.resolveNativeGroupLayers([mix, createLayer('vj-layer-0', 'Row', 'media'), slice]).find((layer: any) => layer.id === 'slice').visible).toBe(false);
+  } finally { vjClipLauncher.set(original); }
+});
+
+it('shares processed VJ frames with slices without replacing cleared or unrelated sources', async () => {
+  const { createLayer } = await import('../types');
+  const { vjClipLauncher } = await import('../stores/vjClipLauncher');
+  const { get } = await import('svelte/store');
+  const originalVj = get(vjClipLauncher);
+  vjClipLauncher.set({ ...originalVj, isLive: true });
+  try {
+  const sync = new NativeRendererSyncCtor() as any;
+  const row = createLayer('vj-layer-0', 'Row', 'media');
+  row.source = { id: 'row-source', type: 'image', src: '/row.png' } as any;
+  row.effects = [{ id: 'invert', type: 'invert', enabled: true, params: {} }] as any;
+  const mix = { ...row, id: '__vj-mix__', name: 'Mix' };
+  const screen = createLayer('screen', 'Screen', 'screen');
+  screen.vjLayerIndex = -1;
+  const cleared = createLayer('cleared', 'Cleared', 'media');
+  (cleared as any).vjLayerIndex = null;
+  cleared.source = { id: 'original', type: 'image', src: '/own.png' } as any;
+  const resolve = (input: any[]) => sync.resolveNativeGroupLayers(input);
+  const result = resolve([row, mix, screen, cleared]);
+  expect(result.find((l: any) => l.id === 'screen').source.effectSource.vjmixRows)
+    .toEqual([{ layerId: '__vj-mix__', opacity: 1, blendMode: 'normal' }]);
+  expect(result.find((l: any) => l.id === 'cleared').source).toEqual(cleared.source);
+  screen.vjLayerIndex = 0;
+  expect(resolve([row, screen])[1].source.effectSource.vjmixRows[0].layerId).toBe('vj-layer-0');
+  expect(resolve([screen])[0].visible).toBe(false);
+  screen.vjLayerIndex = 9;
+  expect(resolve([row, screen])[1].visible).toBe(false);
+  const group = createLayer('container', 'Container', 'group');
+  (group as any).vjLayerIndex = null;
+  const child = { ...cleared, id: 'child', parentGroupId: group.id };
+  expect(resolve([row, group, child]).find((l: any) => l.id === 'child').source).toEqual(cleared.source);
+  vjClipLauncher.set({ ...originalVj, isLive: false });
+  screen.source = { id: 'reference', type: 'shader', src: 'builtin:grid' } as any;
+  const mappingScreen = resolve([screen])[0];
+  expect(mappingScreen.visible).toBe(true);
+  expect(mappingScreen.source).toEqual(screen.source);
+  } finally { vjClipLauncher.set(originalVj); }
+});
+
+it('isolates Mapping, VJ Mix, VJ Maps and Stage composition effect ownership', async () => {
+  const { project } = await import('../stores/layers');
+  const { macros } = await import('../stores/macros');
+  const { vjClipLauncher } = await import('../stores/vjClipLauncher');
+  const { get } = await import('svelte/store');
+  const original = { project: get(project), macros: get(macros), vj: get(vjClipLauncher) };
+  const sync = new NativeRendererSyncCtor() as any;
+  sync.nativeFeatureFlags = { native_post_composite_graph: true, native_effect_pass_manifest: true, compute_graph_texture_sampling: true, compute_graph_source_frame_target: true };
+  sync.nativeEffectPassDescriptorIds = new Set(['blur', 'invert']);
+  try {
+    macros.set({ macros: [] });
+    project.update(p => ({ ...p, mappingComposition: { ...p.mappingComposition!, enabled: true,
+      effects: [{ id: 'map', type: 'invert', enabled: true, opacity: 1, blendMode: 'normal', params: {} }] } }));
+    const mode = (isLive: boolean, mapMode: boolean, stageMode: boolean) => {
+      vjClipLauncher.set({ ...original.vj, isLive, mapMode, stageMode,
+        compositionEffects: [{ id: 'vj', type: 'blur', enabled: true, opacity: 1, blendMode: 'normal', params: { blurRadius: 5 } }] });
+      return sync.compositeEffectGraphCommand(32, 32)?.render_passes.map((p: any) => p.name) ?? [];
+    };
+    expect(mode(false, false, false)).toEqual(['composite-fx-invert-0']);
+    expect(mode(true, false, false)).toEqual([]);
+    expect(mode(true, true, false)).toEqual(['composite-fx-blur-0']);
+    expect(mode(true, false, true)).toEqual(['composite-fx-invert-0']);
+  } finally { project.set(original.project); macros.set(original.macros); vjClipLauncher.set(original.vj); }
+});
+
+it('preserves per-effect wet/dry mix, including a true zero, on native layer chains', () => {
+  for (const mix of [0, 0.25, 1]) {
+    const passes = nativeEffectPassesForLayer({ effects: [{ id: 'fx', type: 'invert', enabled: true, opacity: mix, params: {} }] });
+    expect(passes?.[0].mix).toBe(mix);
+    expect(passes?.[0].effect).toBe('invert');
+  }
+  expect(nativeEffectPassesForLayer({ effects: [{ type: 'invert', enabled: true, params: {} }] })?.[0].mix).toBe(1);
+});
+
+
+it('uses the group shader over saved child VJ routes and restores group VJ routing when selected', async () => {
+  const { createLayer } = await import('../types');
+  const { vjClipLauncher } = await import('../stores/vjClipLauncher');
+  const { get } = await import('svelte/store');
+  const original = get(vjClipLauncher);
+  vjClipLauncher.set({ ...original, isLive: true });
+  try {
+    const sync = new NativeRendererSyncCtor() as any;
+    const shader = { id: 'test-bars', type: 'shader', src: 'builtin:testpattern', shaderCode: 'void main() {}' };
+    const group = { ...createLayer('group-test', 'Group', 'group'),
+      groupConfig: { shaderMode: 'unified', overrideStyles: false, shaderSource: shader } } as any;
+    const child = { ...createLayer('slice-test', 'Slice', 'screen'), parentGroupId: group.id,
+      vjLayerIndex: 0, vjGroupId: 'old-vj-group' };
+    const row = { ...createLayer('vj-layer-0', 'Live row', 'media'),
+      source: { id: 'live', type: 'image', src: '/live.png' } };
+    for (const selection of [undefined, null]) {
+      group.vjLayerIndex = selection;
+      for (const feeds of [[], [row]]) {
+        const result = sync.resolveNativeGroupLayers([group, child, ...feeds]).find((l: any) => l.id === child.id);
+        expect(result.source).toEqual(shader);
+        expect(result.visible).toBe(true);
+        expect(result.vjLayerIndex).toBeUndefined();
+        expect(result.vjGroupId).toBeUndefined();
+      }
+    }
+    group.vjLayerIndex = 0;
+    const live = sync.resolveNativeGroupLayers([group, child, row])[0];
+    expect(live.source.effectSource.vjmixRows[0].layerId).toBe(row.id);
+    expect(child.vjLayerIndex).toBe(0);
+    expect(child.vjGroupId).toBe('old-vj-group');
+  } finally { vjClipLauncher.set(original); }
+});
+
+it('invalidates the regular display binding after an urgent video retrigger', async () => {
+  const api = await import('../api/native-renderer');
+  const { createLayer } = await import('../types');
+  const submit = vi.spyOn(api, 'submitNativeRendererCommands').mockResolvedValue({ applied: 3, dropped: 0 } as any);
+  const sync = new NativeRendererSyncCtor() as any;
+  sync.running = true;
+  sync.startupReady = true;
+  const layer = createLayer('video-fx', 'Video with effects', 'media');
+  layer.source = { id: 'video', type: 'video', src: '/tmp/video.mov', isPlaying: true } as any;
+  layer.effects = [{ id: 'invert', type: 'invert', enabled: true, params: {} }] as any;
+  sync.lastLayers.set(layer.id, { sourceSig: 'effect-pass:video-fx' });
+  try {
+    await sync.syncUrgentVideoSources(64, 64, [layer], ['video']);
+    expect(submit).toHaveBeenCalled();
+    expect(submit.mock.calls[0][0]).toContainEqual(expect.objectContaining({ type: 'bind_media_source', source_id: 'video' }));
+    // The next regular diff must rebind the processed output even though
+    // the user's source and effect settings did not change on retrigger.
+    expect(sync.lastLayers.has(layer.id)).toBe(false);
+  } finally { submit.mockRestore(); }
+});

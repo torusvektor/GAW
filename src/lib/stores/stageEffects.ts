@@ -23,6 +23,7 @@ import { writable, get, derived } from 'svelte/store';
 import type { Layer, StageEffect, StageEffectType, Surface } from '../types';
 import { generateUUID } from '../utils/uuid';
 import { audioStore } from './audio';
+import { launchClockPosition, launchClockFollowsLink } from './launchClock';
 import { getVisualAudioSnapshot } from '../audio/visualAudio';
 
 // ─── Per-effect-type catalog (UI + default params) ──────────────────
@@ -31,6 +32,7 @@ export interface StageEffectDef {
   type: StageEffectType;
   label: string;
   icon: string;
+  description?: string;
   defaultParams: Record<string, number>;
   paramSpecs: { key: string; label: string; min: number; max: number; step?: number; }[];
 }
@@ -168,6 +170,7 @@ export const STAGE_EFFECT_CATALOG: StageEffectDef[] = [
   {
     type: 'beat-pulse',
     label: 'Beat Pulse',
+    description: 'Flashes to typed, tapped, MIDI or Link tempo when selected; otherwise reacts to detected audio beats. With audio off, uses the shared BPM clock.',
     icon: '♪',
     // Audio-onset reactive — every tick where RMS spikes above the
     // recent average triggers a global flash that decays over `decay`
@@ -217,6 +220,7 @@ export const STAGE_EFFECT_CATALOG: StageEffectDef[] = [
   {
     type: 'random-hits',
     label: 'Random Hits',
+    description: 'Random flashes across the slices. Rate is the total hits per second across the stage; no audio input is needed.',
     icon: '!',
     // Per-slice random one-shot strobes — a slice randomly fires,
     // brightens to peak, decays over `duration`. rate = average
@@ -304,6 +308,79 @@ export function createDefaultStageEffect(type: StageEffectType): StageEffect {
   };
 }
 
+// ─── Colour chases and custom chase order ──────────────────────────
+
+export type StageTint = [number, number, number];
+
+export const DEFAULT_CHASE_COLOR = '#ff2bd6';
+export const DEFAULT_CHASE_COLOR2 = '#00e5ff';
+
+function hexToRgb(value: string | undefined, fallback: string): StageTint {
+  const raw = /^#?[0-9a-f]{6}$/i.test(value ?? '') ? value! : fallback;
+  const n = parseInt(raw.replace('#', ''), 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+
+function hsvToRgb(h: number, s: number, v: number): StageTint {
+  const f = (n: number) => {
+    const k = (n + h * 6) % 6;
+    return v - v * s * Math.max(0, Math.min(k, 4 - k, 1));
+  };
+  return [f(5), f(3), f(1)];
+}
+
+/**
+ * Chase position of each screen: screens in `order` (the user's clicks)
+ * come first in that order, the rest follow in their usual order. Entries
+ * can name a screen by either of its ids (slice id or bound layer id).
+ */
+export function chaseOrderIndices(screens: ReadonlyArray<ReadonlyArray<string | null | undefined>>, order?: readonly string[]): number[] {
+  if (!order?.length) return screens.map((_, i) => i);
+  const rank = new Map(order.map((id, i) => [id, i] as const));
+  const keyed = screens.map((ids, i) => {
+    let best = Infinity;
+    for (const id of ids) if (id && rank.has(id)) best = Math.min(best, rank.get(id)!);
+    return { i, best };
+  });
+  const sorted = [...keyed].sort((a, b) => a.best - b.best || a.i - b.i);
+  const out = new Array<number>(screens.length);
+  sorted.forEach((entry, position) => { out[entry.i] = position; });
+  return out;
+}
+
+/** `order` with `id` appended once; picking a screen twice keeps its first place. */
+export function appendChaseOrder(order: readonly string[], id: string | null | undefined): string[] {
+  if (!id || order.includes(id)) return [...order];
+  return [...order, id];
+}
+
+/** The effect's output for one screen: brightness multiplier and, for
+ *  colour chases, the tint. `value` is the generator's raw 0..1. Effects
+ *  without `output` (every project saved before colour chases) return the
+ *  brightness they always did and no tint. */
+export function stageEffectScreenOutput(
+  eff: Pick<StageEffect, 'output' | 'color' | 'color2' | 'colorStyle' | 'opacity'>,
+  value: number,
+  index: number,
+  count: number,
+  tSec: number,
+): { brightness: number; tint: StageTint | null } {
+  const wet = Math.max(0, Math.min(1, eff.opacity ?? 1));
+  const v = Math.max(0, Math.min(1, value));
+  const output = eff.output ?? 'brightness';
+  const brightness = output === 'color' ? 1 : Math.max(0, Math.min(1, v * wet + (1 - wet)));
+  if (output === 'brightness') return { brightness, tint: null };
+  const rest = hexToRgb(eff.color2, DEFAULT_CHASE_COLOR2);
+  const lit = eff.colorStyle === 'rainbow'
+    ? hsvToRgb((((index / Math.max(1, count)) + tSec * 0.1) % 1 + 1) % 1, 1, 1)
+    : hexToRgb(eff.color, DEFAULT_CHASE_COLOR);
+  const tint = [0, 1, 2].map((c) => {
+    const chosen = rest[c] + (lit[c] - rest[c]) * v;
+    return 1 + (chosen - 1) * wet;
+  }) as StageTint;
+  return { brightness, tint };
+}
+
 // ─── Per-slice output store ─────────────────────────────────────────
 
 export interface StageEffectsRuntime {
@@ -315,6 +392,9 @@ export interface StageEffectsRuntime {
    *  visualize it and so the wiring is in place when the engine hook
    *  lands. */
   sliceColors: Map<string, string | null>;
+  /** sliceId → colour chase tint (r, g, b 0..1) for effects whose output
+   *  is colour; absent for brightness-only effects. */
+  sliceTints: Map<string, StageTint>;
   /** layerId → sliceId, populated from Surface.slices[].sourceBinding.
    *  Built lazily when surfaces change. Canvas reads this to find the
    *  current brightness for an opacity modulation. */
@@ -328,6 +408,7 @@ export interface StageEffectsRuntime {
 const initialRuntime: StageEffectsRuntime = {
   sliceOutputs: new Map(),
   sliceColors: new Map(),
+  sliceTints: new Map(),
   layerToSlice: new Map(),
   state: new Map(),
 };
@@ -365,8 +446,10 @@ function rectFromLayer(layer: Pick<Layer, 'corners'>): Rect01 | null {
   const ys = [c.topLeft.y, c.topRight.y, c.bottomLeft.y, c.bottomRight.y];
   const minX = Math.max(0, Math.min(...xs));
   const maxX = Math.min(1, Math.max(...xs));
-  const minY = Math.max(0, Math.min(...ys));
-  const maxY = Math.min(1, Math.max(...ys));
+  // Layer corners are canvas Y-up; slice rects below are surface Y-down, so
+  // the two only overlap after this conversion.
+  const minY = Math.max(0, 1 - Math.max(...ys));
+  const maxY = Math.min(1, 1 - Math.min(...ys));
   if (maxX - minX <= 0.0001 || maxY - minY <= 0.0001) return null;
   return { minX, minY, maxX, maxY };
 }
@@ -610,12 +693,18 @@ function evalSineWave(eff: StageEffect, cx: number, _cy: number, tSec: number, _
   return 1 - (1 - v) * depth;
 }
 
-function evalBeatPulse(eff: StageEffect, _cx: number, _cy: number, _tSec: number, state: any): number {
+function evalBeatPulse(eff: StageEffect, _cx: number, _cy: number, tSec: number, state: any): number {
   const sensitivity = eff.params.sensitivity ?? 1.4;
   const decay = Math.max(0.01, eff.params.decay ?? 0.25);
   const threshold = eff.params.threshold ?? 0.08;
   const audio = get(audioStore);
-  const raw = audio?.isActive ? (audio.rms ?? 0) : 0;
+  if (!audio?.isActive || (audio.manualBPM ?? 0) > 0 || launchClockFollowsLink()) {
+    const { beat, beatMs } = launchClockPosition();
+    const phase = ((beat % 1) + 1) % 1;
+    return Math.max(0, 1 - (phase * beatMs / 1000) / decay);
+  }
+  const raw = audio.rms ?? 0;
+  if (state._lastBeatTime > tSec) state._lastBeatTime = undefined;
   // Primary trigger: the analyzer's tuned kick/beat onset detection —
   // event-driven, per the Milkdrop model, instead of amplitude-tracking.
   // `threshold` still gates out quiet-room noise. The legacy RMS spike
@@ -628,9 +717,9 @@ function evalBeatPulse(eff: StageEffect, _cx: number, _cy: number, _tSec: number
   const hostOnset = !!(audio?.isActive && (audio.kickSnare?.isKick || audio.beat?.isBeat));
   const spikeOnset = raw > baseline * sensitivity;
   if (raw > threshold && (hostOnset || spikeOnset)) {
-    state._lastBeatTime = performance.now() / 1000;
+    state._lastBeatTime = tSec;
   }
-  const since = (performance.now() / 1000) - (state._lastBeatTime ?? -10);
+  const since = tSec - (state._lastBeatTime ?? -10);
   if (since > decay) return 0;
   return 1 - (since / decay);
 }
@@ -674,20 +763,21 @@ function evalCascade(eff: StageEffect, _cx: number, cy: number, tSec: number, _s
   return 1 - Math.abs(local - 0.5) * 2;
 }
 
-function evalRandomHits(eff: StageEffect, cx: number, cy: number, _tSec: number, state: any): number {
+function evalRandomHits(eff: StageEffect, cx: number, cy: number, tSec: number, state: any): number {
   const rate = eff.params.rate ?? 3;
   const duration = Math.max(0.01, eff.params.duration ?? 0.18);
   const peak = eff.params.peak ?? 1;
   const totalSlices = state._sliceCount ?? 1;
-  const nowSec = performance.now() / 1000;
-  // Per-slice last-hit time stored in state, keyed by slice index.
-  // Probability of firing this frame ≈ rate * dt / totalSlices.
-  const lastFire = state._lastFireTime ?? nowSec;
-  const dt = Math.max(0, Math.min(0.1, nowSec - lastFire));
-  state._lastFireTime = nowSec;
-  // Compute slice-local hit time map (lazy init).
-  if (!state._hitTimes) state._hitTimes = new Map<number, number>();
+  const nowSec = tSec;
   const idx = state._sliceIndex ?? 0;
+  // Surface slices share effect state. Each slice needs its own elapsed
+  // time; otherwise the first slice consumes the entire frame interval.
+  if (!state._lastFireTimes) state._lastFireTimes = new Map<number, number>();
+  if (!state._hitTimes) state._hitTimes = new Map<number, number>();
+  const previous = state._lastFireTimes.get(idx) ?? nowSec;
+  if (nowSec < previous) state._hitTimes.delete(idx);
+  const dt = Math.max(0, Math.min(0.1, nowSec - previous));
+  state._lastFireTimes.set(idx, nowSec);
   // Stochastic test — chance proportional to dt × per-slice rate.
   const perSliceRate = rate / Math.max(1, totalSlices);
   if (Math.random() < perSliceRate * dt) {
@@ -821,15 +911,16 @@ function tick(nowMs: number) {
   advanceAutomation(nowMs);
   const newOutputs = new Map<string, number>();
   const newColors = new Map<string, string | null>();
+  const newTints = new Map<string, StageTint>();
   for (const surface of surfacesCache) {
     const live = pickLiveEffect(surface);
     if (!live) continue;
-    // Build slice index map for index-aware effects.
-    const surfaceSliceIds: string[] = [];
-    for (const meta of sliceMetaCache) {
-      if (meta.surfaceId === surface.id) surfaceSliceIds.push(meta.sliceId);
-    }
+    // Build slice index map for index-aware effects, honouring the
+    // effect's custom chase order.
+    const surfaceMetas = sliceMetaCache.filter((meta) => meta.surfaceId === surface.id);
+    const surfaceSliceIds = surfaceMetas.map((meta) => meta.sliceId);
     const sliceCount = surfaceSliceIds.length;
+    const chaseIndex = chaseOrderIndices(surfaceMetas.map((meta) => [meta.sliceId, meta.layerId]), live.order);
     const state = (() => {
       const rt = get({ subscribe });
       let s = rt.state.get(live.id);
@@ -838,19 +929,20 @@ function tick(nowMs: number) {
     })();
     for (const meta of sliceMetaCache) {
       if (meta.surfaceId !== surface.id) continue;
-      state._sliceIndex = surfaceSliceIds.indexOf(meta.sliceId);
+      const sliceIndex = chaseIndex[surfaceSliceIds.indexOf(meta.sliceId)];
+      state._sliceIndex = sliceIndex;
       state._sliceCount = sliceCount;
       const v = evaluate(live, meta.cx, meta.cy, tSec, state);
-      const wet = live.opacity ?? 1;
-      const eff01 = v * wet + 1 * (1 - wet);
-      newOutputs.set(meta.sliceId, Math.max(0, Math.min(1, eff01)));
+      const out = stageEffectScreenOutput(live, v, sliceIndex, sliceCount, tSec);
+      newOutputs.set(meta.sliceId, out.brightness);
+      if (out.tint) newTints.set(meta.sliceId, out.tint);
       // Publish per-slice color tint when the effect carries one. The
       // tint is independent of brightness — engine integration will
       // multiply the slice's content by tint × brightness when wired.
       newColors.set(meta.sliceId, live.color ?? null);
     }
   }
-  update(rt => ({ ...rt, sliceOutputs: newOutputs, sliceColors: newColors }));
+  update(rt => ({ ...rt, sliceOutputs: newOutputs, sliceColors: newColors, sliceTints: newTints }));
   if (!anyLiveEffect()) {
     stopIfIdle();
     return;
@@ -893,7 +985,7 @@ function stopIfIdle() {
     cancelAnimationFrame(rafId);
     rafId = null;
     // Clear outputs so layers go back to their natural opacity.
-    update(rt => ({ ...rt, sliceOutputs: new Map(), sliceColors: new Map() }));
+    update(rt => ({ ...rt, sliceOutputs: new Map(), sliceColors: new Map(), sliceTints: new Map() }));
   }
 }
 
@@ -1002,6 +1094,8 @@ export interface StageEffectLayerOutput {
   sliceId: string | null;
   brightness: number;
   color: string | null;
+  /** Colour chase tint, or null when the live effect drives brightness only. */
+  tint: StageTint | null;
 }
 
 /** Resolve the current stage-effect output for a rendered layer.
@@ -1015,11 +1109,12 @@ export function resolveStageEffectForLayer(
   rt: StageEffectsRuntime = get({ subscribe }),
 ): StageEffectLayerOutput {
   const sliceId = rt.layerToSlice.get(layer.id) ?? findSliceByLayerGeometry(layer);
-  if (!sliceId) return { sliceId: null, brightness: 1, color: null };
+  if (!sliceId) return { sliceId: null, brightness: 1, color: null, tint: null };
   return {
     sliceId,
     brightness: rt.sliceOutputs.get(sliceId) ?? 1,
     color: rt.sliceColors.get(sliceId) ?? null,
+    tint: rt.sliceTints?.get(sliceId) ?? null,
   };
 }
 
@@ -1075,6 +1170,31 @@ export function evaluateStageEffectForScreen(
   } catch (err) {
     console.warn('[stageEffects] screen evaluate failed', err);
     return 1;
+  }
+}
+
+/** Full per-screen output of a live effect (brightness and colour chase
+ *  tint), sharing evaluateStageEffectForScreen's per-screen state. */
+export function evaluateStageEffectOutputForScreen(
+  screenId: string,
+  effect: StageEffect,
+  cx: number,
+  cy: number,
+  tSec: number,
+  options: { sliceIndex?: number; sliceCount?: number } = {},
+): { brightness: number; tint: StageTint | null } {
+  const key = _screenStateKey(`${screenId}:${effect.id}`, effect.type);
+  let state = _screenStageState.get(key);
+  if (!state) { state = {}; _screenStageState.set(key, state); }
+  const sliceIndex = options.sliceIndex ?? 0;
+  const sliceCount = Math.max(1, options.sliceCount ?? 1);
+  state._sliceIndex = sliceIndex;
+  state._sliceCount = sliceCount;
+  try {
+    return stageEffectScreenOutput(effect, evaluate(effect, cx, cy, tSec, state), sliceIndex, sliceCount, tSec);
+  } catch (err) {
+    console.warn('[stageEffects] screen evaluate failed', err);
+    return { brightness: 1, tint: null };
   }
 }
 

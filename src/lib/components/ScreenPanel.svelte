@@ -8,9 +8,12 @@
    * separate lower scroll area.
    */
   import { onMount } from 'svelte';
+  import { screenOutputError } from '../stores/screenOutputStatus';
   import { screens, selectedScreenId, selectedScreen, screenActions } from '../stores/screens';
   import { settings, identityOutputMesh, masterWarpIsActive, type OutputSettings, type OutputSlice } from '../stores/settings';
   import { maxOutputSlices } from '../stores/license';
+  import { screenSetups } from '../stores/screenSetups';
+  import { recordDiscreteAction, scheduleHistorySnapshot } from '../stores/historyHooks';
   import { isDesktopApp, getTextureShareLabel, invoke } from '$lib/bridge';
   import OutputCanvasPreview from './OutputCanvasPreview.svelte';
   import ScreenInspector from './ScreenInspector.svelte';
@@ -41,7 +44,13 @@
       openWindowIds = Array.isArray(ids) ? ids : [];
     } catch { openWindowIds = []; }
   }
-  onMount(() => { refreshOpenWindows(); });
+  onMount(() => {
+    refreshOpenWindows();
+    // A screen window can also close on its own (Esc in the window, or the
+    // display going away), so keep the Open / Close button honest.
+    const poll = setInterval(() => { void refreshOpenWindows(); }, 2000);
+    return () => clearInterval(poll);
+  });
 
   // Auto-close any windows whose backing screen got removed/disabled/retargeted.
   $: if (isDesktopApp && openWindowIds.length > 0) {
@@ -55,69 +64,25 @@
     }
   }
 
-  // Track slice windows opened via window.open (zero-copy path) so we
-  // can close them locally without the editor losing the reference.
-  const _zeroCopySliceWindows = new Map<string, Window>();
-
   async function openOnDisplay(s: OutputSlice) {
     if (!isDesktopApp || s.displayId == null) return;
-    // Zero-copy path: open the slice window via window.open so it lives
-    // in the SAME renderer process as the editor. SliceOutputApp can
-    // then read the editor's already-warped presentCanvas via
-    // window.opener.document and crop its region from that — no local
-    // re-render, no fragile hidden-canvas → texture upload. Master warp
-    // applies on the slice display automatically because the source is
-    // the editor's WGSL-warped canvas.
-    const zeroCopy = !!$settings.experimental?.outputZeroCopy;
-    if (zeroCopy) {
-      try {
-        await invoke('configure_next_output_window', {
-          displayId: s.displayId,
-          fullscreen: true,
-        });
-        const url = new URL(window.location.href);
-        url.search = `?mode=slice-display&sliceId=${encodeURIComponent(s.id)}&webgpu-disable=1`;
-        const newWin = window.open(url.toString(), `ga-slice-${s.id}`, 'popup=true');
-        if (!newWin) {
-          alert('Slice display window failed to open. Check popup-blocker behaviour.');
-          return;
-        }
-        _zeroCopySliceWindows.set(s.id, newWin);
-        // Attach this slice window as an additional output target. The
-        // editor's pump fan-outs each VideoFrame to all attached ports —
-        // Fullscreen and slices can coexist. The slice window receives the
-        // same warped frame and crops its own region from it.
-        const { attachOutputWindow } = await import('$lib/sync/outputSharedTexturePresenter');
-        attachOutputWindow(newWin, `slice:${s.id}`);
-        console.log(`[ScreenPanel] slice ${s.id} opened on display ${s.displayId} [zero-copy]`);
-        refreshOpenWindows();
-        return;
-      } catch (err) {
-        console.error('[ScreenPanel] zero-copy open failed, falling back to IPC path:', err);
-        // fall through to legacy IPC
-      }
+    // Always use the native Screen texture. The legacy VideoFrame window
+    // bypasses destination calibration, source warp and screen masks.
+    try {
+      const result = await invoke<{ ok: boolean; error?: string }>('output_open_slice_window', {
+        sliceId: s.id, displayId: s.displayId,
+      });
+      if (!result?.ok) throw new Error(result?.error || 'Screen output could not open.');
+      screenOutputError.set(null);
+    } catch (error) {
+      screenOutputError.set(error instanceof Error ? error.message : String(error));
     }
-    await invoke('output_open_slice_window', { sliceId: s.id, displayId: s.displayId }).catch(() => {});
-    refreshOpenWindows();
+    await refreshOpenWindows();
   }
   async function closeOnDisplay(s: OutputSlice) {
     if (!isDesktopApp) return;
-    // Close the zero-copy window proxy locally first if we opened it
-    // via window.open. Electron's did-create-window listener also tracks
-    // it in `sliceWindows`, so the editor's `output_close_slice_window`
-    // IPC also closes it as a belt-and-suspenders. Either path works.
-    const zc = _zeroCopySliceWindows.get(s.id);
-    if (zc && !zc.closed) {
-      try { zc.close(); } catch { /* */ }
-      _zeroCopySliceWindows.delete(s.id);
-    }
-    // Detach from the presenter so the pump stops fan-out to a dead port.
-    try {
-      const { detachOutputWindow } = await import('$lib/sync/outputSharedTexturePresenter');
-      detachOutputWindow(`slice:${s.id}`);
-    } catch { /* */ }
     await invoke('output_close_slice_window', { sliceId: s.id }).catch(() => {});
-    refreshOpenWindows();
+    await refreshOpenWindows();
   }
 
   // ─── Master-canvas helpers ──────────────────────────────────────────
@@ -170,6 +135,15 @@
   // not merely enabled — so "on but untouched" reads as inert.
   $: masterWarpActive = masterWarpIsActive(masterWarp);
 
+  // A selected screen's handles sit above the Master Warp handles and
+  // coincide with them (a full-canvas screen's corners and mesh points
+  // are the master's), and nothing else clears the selection. Working the
+  // Master Warp controls hands the canvas to the master handles; clicking
+  // a screen row brings its handles back.
+  function focusMasterWarp() {
+    selectedScreenId.set(null);
+  }
+
   function toggleMasterWarp(enabled: boolean) {
     // No geometry seeded on enable — an enabled-but-identity warp is a
     // passthrough no-op. Corner points are created only when the operator
@@ -183,9 +157,11 @@
     // quad from a misclick), output would render all-black on enable.
     if (enabled) {
       settings.setMasterWarp({ enabled: true, corners: undefined, meshGrid: undefined });
+      focusMasterWarp();
     } else {
       settings.setMasterWarp({ enabled: false });
     }
+    recordDiscreteAction();
   }
   function setMasterMode(mode: 'corners' | 'mesh') {
     // Mesh needs a control lattice to show handles, so seed an identity
@@ -196,13 +172,27 @@
     } else {
       settings.setMasterWarp({ mode });
     }
+    focusMasterWarp();
+    recordDiscreteAction();
   }
   function resetMasterWarp() {
     // Back to identity. Corners: clear so nothing is stored (handles
     // derive identity); Mesh: reset to a flat lattice so its handles
-    // remain visible.
-    if (masterMode === 'mesh') settings.setMasterWarp({ meshGrid: identityOutputMesh() });
-    else settings.setMasterWarp({ corners: undefined });
+    // remain visible, still in Bezier mode if it was.
+    if (masterMode === 'mesh') {
+      const bezier = masterWarp.meshGrid?.bezier ? { bezier: true } : {};
+      settings.setMasterWarp({ meshGrid: { ...identityOutputMesh(), ...bezier } });
+    } else settings.setMasterWarp({ corners: undefined });
+    focusMasterWarp();
+    recordDiscreteAction();
+  }
+  /** Bezier mesh: curved cell edges shaped by tangent handles on the
+   *  selected point. Off keeps the tangents but renders straight. */
+  function setMasterBezier(bezier: boolean) {
+    if (!masterWarp.meshGrid) return;
+    settings.setMasterWarp({ meshGrid: { ...masterWarp.meshGrid, bezier } });
+    focusMasterWarp();
+    recordDiscreteAction();
   }
 
   // ─── Dome projection ────────────────────────────────────────────────
@@ -265,6 +255,33 @@
     }));
   }
 
+  // ─── Saved screen setups ────────────────────────────────────────────
+  // New Project clears the output stage so a project cannot inherit the last
+  // one's screens or a latched dome. That is right for a laptop moving
+  // between gigs and wrong for a permanent install, where the rig belongs to
+  // the room. A saved default is what New Project restores instead.
+  let newSetupName = '';
+  let setupFeedback = '';
+  let feedbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function flashFeedback(message: string) {
+    setupFeedback = message;
+    if (feedbackTimer) clearTimeout(feedbackTimer);
+    feedbackTimer = setTimeout(() => { setupFeedback = ''; }, 2600);
+  }
+
+  function saveCurrentSetup() {
+    const entry = screenSetups.save(newSetupName || `Setup ${$screenSetups.saved.length + 1}`);
+    newSetupName = '';
+    flashFeedback(`Saved "${entry.name}"`);
+  }
+
+  function makeCurrentDefault() {
+    const entry = screenSetups.setCurrentAsDefault(newSetupName || 'Default screen setup');
+    newSetupName = '';
+    flashFeedback(`New projects will start from "${entry.name}"`);
+  }
+
   // ─── Drag-reorder for the screen list ───────────────────────────────
   let dragFromIdx = -1;
   function onDragStart(i: number) { dragFromIdx = i; }
@@ -285,7 +302,14 @@
   }
 </script>
 
-<div class="screen-panel">
+<div data-help-page="masks-slices" class="screen-panel">
+  {#if $screenOutputError}
+    <div class="screen-output-error" role="alert">
+      <strong>Output change not applied</strong>
+      <span>{$screenOutputError}</span>
+      <span>Previously active outputs are preserved.</span>
+    </div>
+  {/if}
   <div class="screens-section">
     <div class="section-head">
       <span class="section-title">Screens</span>
@@ -300,7 +324,7 @@
         masterHeight={$settings.output.masterCanvasHeight}
         selectedId={$selectedScreenId}
         onSelect={(id) => selectedScreenId.set(id)}
-        onChange={(id, partial) => screenActions.update(id, partial)}
+        onChange={(id, partial) => { screenActions.update(id, partial); scheduleHistorySnapshot(); }}
       />
     </div>
 
@@ -341,7 +365,7 @@
             class="row-enable"
             checked={s.enabled}
             onclick={(e) => e.stopPropagation()}
-            onchange={(e) => screenActions.update(s.id, { enabled: (e.target as HTMLInputElement).checked })}
+            onchange={(e) => { screenActions.update(s.id, { enabled: (e.target as HTMLInputElement).checked }); recordDiscreteAction(); }}
           />
           <span class="row-name">{s.name}</span>
           <span class="row-target">
@@ -415,8 +439,20 @@
             Mesh
           </button>
         </div>
+        {#if masterMode === 'mesh' && masterWarp.meshGrid}
+          <label class="mw-enable">
+            <input
+              type="checkbox"
+              checked={masterWarp.meshGrid.bezier ?? false}
+              onchange={(e) => setMasterBezier((e.target as HTMLInputElement).checked)}
+            />
+            <span>Bezier curves</span>
+          </label>
+        {/if}
         <div class="mw-hint">
-          Drag the orange handles on the canvas to warp the whole output.
+          {masterMode === 'mesh' && masterWarp.meshGrid?.bezier
+            ? 'Drag the orange handles on the canvas. Click a point to show its curve handles: drag one to bend, Alt-drag to move it on its own, double-click to straighten.'
+            : 'Drag the orange handles on the canvas to warp the whole output.'}
         </div>
         <div class="master-row">
           <button class="mini-btn" onclick={resetMasterWarp}>Reset to identity</button>
@@ -516,6 +552,68 @@
       {/if}
     </details>
 
+    <!-- Saved setups. Sits after the rig controls because it acts on all of
+         them at once: what is saved is the whole output stage, not one screen. -->
+    <details class="master-details" open={$screenSetups.defaultSetup !== null}>
+      <summary>
+        Screen setups
+        {#if $screenSetups.defaultSetup}<span class="mw-active-dot" title="A default setup is set"></span>{/if}
+      </summary>
+
+      <p class="setup-hint">
+        New projects start from a clean output stage. Save this rig as the default
+        and they will start from it instead. Useful for an installed dome or
+        projector wall that does not change between shows.
+      </p>
+
+      <div class="master-row">
+        <input
+          type="text"
+          class="setup-name"
+          placeholder="Name this setup"
+          bind:value={newSetupName}
+        />
+      </div>
+      <div class="master-row">
+        <button class="mini-btn" onclick={makeCurrentDefault}>Make default</button>
+        <button class="mini-btn" onclick={saveCurrentSetup}>Save setup</button>
+      </div>
+
+      {#if $screenSetups.defaultSetup}
+        <div class="setup-default-row">
+          <span class="setup-default-label">
+            New projects use <strong>{$screenSetups.defaultSetup.name}</strong>
+            <span class="setup-summary">{$screenSetups.defaultSetup.summary}</span>
+          </span>
+          <button class="row-act" title="Back to factory defaults" onclick={() => { screenSetups.clearDefault(); flashFeedback('New projects will start clean'); }}>Clear</button>
+        </div>
+      {/if}
+
+      {#if $screenSetups.saved.length > 0}
+        <div class="setup-list">
+          {#each $screenSetups.saved as entry (entry.id)}
+            <div class="setup-row">
+              <span class="setup-row-name" title={entry.summary}>
+                {entry.name}
+                <span class="setup-summary">{entry.summary}</span>
+              </span>
+              <button class="mini-btn" onclick={() => { screenSetups.load(entry.id); recordDiscreteAction(); flashFeedback(`Loaded "${entry.name}"`); }}>Load</button>
+              <button
+                class="mini-btn"
+                title="Start new projects from this setup"
+                onclick={() => { screenSetups.setDefaultFromSaved(entry.id); flashFeedback(`New projects will start from "${entry.name}"`); }}
+              >Default</button>
+              <button class="row-act danger" title="Delete" onclick={() => screenSetups.remove(entry.id)}>×</button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      {#if setupFeedback}
+        <div class="setup-feedback">{setupFeedback}</div>
+      {/if}
+    </details>
+
     <div class="inspector-section">
       {#if $selectedScreen}
         <ScreenInspector
@@ -536,6 +634,9 @@
 </div>
 
 <style>
+  .screen-output-error { display: grid; gap: 5px; margin: 8px; padding: 10px; border: 1px solid #9c7139; border-radius: 6px; background: #241e16; color: #e8d5b5; font-size: 12px; line-height: 1.4; }
+  .screen-output-error strong { font-weight: 600; }
+
   .screen-panel {
     width: 280px;
     background: var(--bg-secondary, #111114);
@@ -563,7 +664,7 @@
   }
   .section-count {
     color: #555;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .preview-host {
     margin-bottom: 8px;
@@ -631,7 +732,7 @@
   .row-target {
     font-size: 11px;
     color: var(--text-muted, #888);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     background: rgba(255, 255, 255, 0.04);
     padding: 1px 4px;
     border-radius: 2px;
@@ -663,6 +764,72 @@
   .add-btn:hover:not(:disabled) { background: rgba(187, 134, 252, 0.15); }
   .add-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+  .setup-hint {
+    margin: 6px 0 8px;
+    font-size: 10px;
+    line-height: 1.45;
+    color: #6b7280;
+  }
+  .setup-name {
+    flex: 1;
+    min-width: 0;
+    background: #111827;
+    border: 1px solid #374151;
+    border-radius: 3px;
+    color: #d1d5db;
+    font-size: 11px;
+    padding: 3px 6px;
+  }
+  .setup-default-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    padding: 5px 6px;
+    border: 1px solid rgba(163, 230, 53, 0.35);
+    border-radius: 3px;
+    background: rgba(163, 230, 53, 0.07);
+  }
+  .setup-default-label {
+    flex: 1;
+    min-width: 0;
+    font-size: 10px;
+    color: #9ca3af;
+  }
+  .setup-default-label strong { color: #d1d5db; }
+  .setup-summary {
+    display: block;
+    font-size: 9px;
+    color: #6b7280;
+  }
+  .setup-list {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .setup-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px;
+    border: 1px solid #1f2937;
+    border-radius: 3px;
+  }
+  .setup-row-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 10px;
+    color: #d1d5db;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .setup-feedback {
+    margin-top: 8px;
+    font-size: 10px;
+    color: #a3e635;
+  }
+
   .master-details {
     margin-top: 12px;
     padding: 8px;
@@ -691,10 +858,10 @@
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 3px;
     color: var(--text-primary, #ddd);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 12px;
   }
-  .dim-x { color: #666; font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace); }
+  .dim-x { color: #666; font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace); }
   .mini-btn {
     flex: 1;
     padding: 3px 8px;
@@ -839,7 +1006,7 @@
   }
   .dome-row em {
     color: #8f8998;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 11px;
     font-style: normal;
     text-align: right;

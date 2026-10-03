@@ -48,14 +48,33 @@ import ffmpegCoreUrl from '@ffmpeg/core?url';
 import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
 import { setISFManualTime } from '../isf/renderer';
 import { setStageEffectsManualTime } from '../stores/stageEffects';
+import { pumpVisualAudio, setVisualAudioManualTime } from '../audio/visualAudio';
+import { audioStore } from '../stores/audio';
+import { audioAnalyzer } from '../audio/analyzer';
+import {
+  offlineFileAudioTime,
+  prepareOfflineFileAudio,
+  type OfflineFileAudioSession,
+} from '../audio/offlineFileAudio';
+import { getActiveNativeRendererSync } from '../sync/nativeRendererSync';
+import { prepareShowOfflineAudio } from '../audio/showAudio';
 import { keyframeTimeline } from '../stores/keyframeTimeline';
 import { layerSequencer } from '../stores/layerSequencer';
 import { vjLayerSequencer } from '../stores/vjLayerSequencer';
+import { showTimeline } from '../stores/showTimeline';
 import { mediaLibrary } from '../stores/media';
 import { generateUUID } from '../utils/uuid';
-import { createAssetRefFromGeneratedBlob } from '../storage/assetRegistry';
+import { createAssetRefFromGeneratedBlob, pathToFileUrl, type AssetRef } from '../storage/assetRegistry';
 import type { RenderEngine } from '../renderer/engine';
 import { invoke, isElectron } from '../bridge';
+import { recordingCodecOption, type RecordingCodecId } from './recordingSources';
+import {
+  exportNativeRendererFrameSnapshot,
+  getNativeRendererCapabilities,
+  getNativeRendererStatus,
+  submitNativeRendererCommands,
+  type NativeRendererFrameSnapshotExportResult,
+} from '../api/native-renderer';
 
 // ─── Settings + state ───────────────────────────────────────
 
@@ -66,13 +85,22 @@ export interface OfflineRenderSettings {
   height: number;
   /** Output filename WITHOUT extension. ".mp4" appended automatically. */
   filename: string;
-  /** MP4 encodes in-app via ffmpeg.wasm. Frame sequence writes JPEGs
+  /** MP4 encodes with native desktop FFmpeg in Electron and falls back
+   *  to ffmpeg.wasm in browser builds. Frame sequence writes JPEGs
    *  directly to a folder so 4K jobs avoid the slow wasm encode step. */
   outputMode: 'mp4' | 'frames';
   /** Render quality tier. 'high' = libx264 yuv420p crf 18 (visually
    *  lossless), 'web' = crf 23 (smaller file), 'archive' = crf 14
    *  (close to lossless, big file). */
   quality: 'high' | 'web' | 'archive';
+  /** Frame source. The desktop-only native option captures the native
+   *  renderer output directly; desktop MP4 packaging streams raw frames
+   *  through native FFmpeg while browser builds keep the wasm fallback. */
+  captureBackend?: 'webgl' | 'native';
+  /** Desktop native encode only: H.264 MP4 (default), ProRes 422 HQ or HAP
+   *  (MOV). Offline frames are the opaque program output, so the alpha
+   *  codecs are not offered here. */
+  codec?: RecordingCodecId;
 }
 
 export const DEFAULT_OFFLINE_SETTINGS: OfflineRenderSettings = {
@@ -83,6 +111,7 @@ export const DEFAULT_OFFLINE_SETTINGS: OfflineRenderSettings = {
   filename: 'render',
   outputMode: 'mp4',
   quality: 'high',
+  captureBackend: 'webgl',
 };
 
 const MAX_SEGMENT_FRAMES = 180;
@@ -125,7 +154,14 @@ export interface OfflineRenderState {
   lastOutputUrl: string | null;
   lastOutputName: string | null;
   lastOutputKind: 'video' | 'frames' | null;
+  /** Where the file actually lives — the app-managed generated-video
+   *  folder for MP4, or the chosen folder for a frame sequence. Always
+   *  set for desktop renders so a user who dismissed the save dialog can
+   *  still find (and reveal) the output. */
   lastOutputPath: string | null;
+  /** The copy the user chose in the save dialog, if they picked one.
+   *  Null means "kept where it was rendered" — never an error. */
+  lastOutputSavedPath: string | null;
 }
 
 const INITIAL_STATE: OfflineRenderState = {
@@ -139,6 +175,7 @@ const INITIAL_STATE: OfflineRenderState = {
   lastOutputName: null,
   lastOutputKind: null,
   lastOutputPath: null,
+  lastOutputSavedPath: null,
 };
 
 export interface FrameSequenceTarget {
@@ -152,6 +189,63 @@ export interface NativeJpegSequenceSession {
   jobId: string;
   baseName: string;
   target: FrameSequenceTarget;
+  width: number;
+  height: number;
+  fps: number;
+  totalFrames: number;
+  pixelFormat: 'rgba' | 'bgra';
+}
+
+export interface NativeJpegFrameEncoderSession {
+  jobId: string;
+  tempDir: string;
+  width: number;
+  height: number;
+  fps: number;
+  totalFrames: number;
+  pixelFormat: 'rgba' | 'bgra';
+}
+
+export interface NativeMp4FrameEncoderSession {
+  jobId: string;
+  tempDir: string;
+  outputPath: string;
+  width: number;
+  height: number;
+  fps: number;
+  /** 0 means open-ended/live recording; positive values are validated
+   *  exactly by the native FFmpeg job on finish. */
+  totalFrames: number;
+  pixelFormat: 'rgba' | 'bgra';
+  quality: OfflineRenderSettings['quality'];
+  /** Container of the encoded file: mp4 for H.264, mov for ProRes / HAP. */
+  extension: string;
+  mime: string;
+}
+
+function rawPixelFormatForNativeTextureFormat(format: string): 'rgba' | 'bgra' {
+  const normalized = String(format || '').trim().toLowerCase();
+  if (normalized.includes('bgra')) return 'bgra';
+  if (normalized.includes('rgba')) return 'rgba';
+  throw new Error(`Native renderer output format is not supported for native frame capture: ${format || 'unknown'}`);
+}
+
+function coerceUint8Array(bytes: unknown): Uint8Array {
+  if (bytes instanceof Uint8Array) return bytes;
+  if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+  if (ArrayBuffer.isView(bytes)) {
+    return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+  if (Array.isArray(bytes)) return new Uint8Array(bytes);
+  if (bytes && typeof bytes === 'object' && Array.isArray((bytes as { data?: unknown }).data)) {
+    return new Uint8Array((bytes as { data: number[] }).data);
+  }
+  throw new Error('Native JPEG encoder returned an invalid byte payload');
+}
+
+function joinNativeTempPath(dir: string, filename: string): string {
+  const separator = dir.includes('\\') ? '\\' : '/';
+  return `${dir.replace(/[\\/]+$/, '')}${separator}${filename}`;
 }
 
 function sanitizeFilenamePart(input: string, fallback = 'render'): string {
@@ -161,6 +255,51 @@ function sanitizeFilenamePart(input: string, fallback = 'render'): string {
     .replace(/[^a-zA-Z0-9._-]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 80) || fallback;
+}
+
+function describeNativeFrameHealth(snapshot: NativeRendererFrameSnapshotExportResult): string {
+  const luma = Number(snapshot.average_luma ?? 0);
+  const maxLuma = Number(snapshot.max_luma ?? 0);
+  const nonzero = Number(snapshot.nonzero_pixels ?? 0);
+  const bright = Number(snapshot.bright_pixels ?? 0);
+  const byteLength = Number(snapshot.byte_length ?? 0);
+  const bytesWritten = Number(snapshot.bytes_written ?? 0);
+  return [
+    `checksum=${snapshot.checksum || 'missing'}`,
+    `luma=${luma.toFixed(4)}`,
+    `max=${maxLuma.toFixed(4)}`,
+    `nonzero=${nonzero}`,
+    `bright=${bright}`,
+    `bytes=${bytesWritten}/${byteLength}`,
+    `format=${snapshot.format || 'unknown'}`,
+  ].join(' ');
+}
+
+function assertNativeRendererFrameExport(
+  snapshot: NativeRendererFrameSnapshotExportResult,
+  frameIndex: number,
+  expected: { width: number; height: number; pixelFormat: 'rgba' | 'bgra' },
+): void {
+  if (snapshot.width !== expected.width || snapshot.height !== expected.height) {
+    throw new Error(
+      `Native renderer frame ${frameIndex} size mismatch: got ${snapshot.width}x${snapshot.height}, expected ${expected.width}x${expected.height} (${describeNativeFrameHealth(snapshot)})`,
+    );
+  }
+  const expectedBytes = expected.width * expected.height * 4;
+  if (Number(snapshot.byte_length ?? 0) !== expectedBytes || Number(snapshot.bytes_written ?? 0) !== expectedBytes) {
+    throw new Error(
+      `Native renderer frame ${frameIndex} byte count mismatch: expected ${expectedBytes} raw bytes (${describeNativeFrameHealth(snapshot)})`,
+    );
+  }
+  if (snapshot.dark_frame || snapshot.nonzero_pixels <= 0) {
+    throw new Error(`Native renderer exported a blank frame at ${frameIndex} (${describeNativeFrameHealth(snapshot)})`);
+  }
+  const snapshotPixelFormat = rawPixelFormatForNativeTextureFormat(snapshot.format);
+  if (snapshotPixelFormat !== expected.pixelFormat) {
+    throw new Error(
+      `Native renderer frame ${frameIndex} format changed from ${expected.pixelFormat} to ${snapshotPixelFormat} (${describeNativeFrameHealth(snapshot)})`,
+    );
+  }
 }
 
 export function describeFrameTarget(target: FrameSequenceTarget): string {
@@ -224,6 +363,7 @@ export async function startNativeJpegSequence(
   settings: Pick<OfflineRenderSettings, 'width' | 'height' | 'fps'>,
   baseName: string,
   totalFrames: number,
+  pixelFormat: 'rgba' | 'bgra' = 'rgba',
 ): Promise<NativeJpegSequenceSession | null> {
   if (target.kind !== 'electron' || !target.path || !isElectron) return null;
   const jobId = `jpeg-seq-${generateUUID()}`;
@@ -235,11 +375,21 @@ export async function startNativeJpegSequence(
     height: settings.height,
     fps: settings.fps,
     totalFrames,
+    pixelFormat,
   });
   if (!result?.success) {
     throw new Error(result?.error || 'Could not start native JPEG sequence encoder');
   }
-  return { jobId, baseName, target };
+  return {
+    jobId,
+    baseName,
+    target,
+    width: settings.width,
+    height: settings.height,
+    fps: settings.fps,
+    totalFrames,
+    pixelFormat,
+  };
 }
 
 export async function writeNativeJpegSequenceFrame(
@@ -251,10 +401,345 @@ export async function writeNativeJpegSequenceFrame(
     jobId: session.jobId,
     frameIndex,
     bytes: pixels.data,
+    pixelFormat: session.pixelFormat,
   });
   if (!result?.success) {
     throw new Error(result?.error || `Could not write JPEG frame ${frameIndex}`);
   }
+}
+
+export async function writeNativeJpegSequenceFrameFile(
+  session: NativeJpegSequenceSession,
+  frameIndex: number,
+  path: string,
+  deleteAfterWrite = false,
+): Promise<void> {
+  const result = await invoke<{ success?: boolean; error?: string }>('jpeg_sequence_write_frame_file', {
+    jobId: session.jobId,
+    frameIndex,
+    path,
+    pixelFormat: session.pixelFormat,
+    deleteAfterWrite,
+  });
+  if (!result?.success) {
+    throw new Error(result?.error || `Could not write JPEG frame file ${frameIndex}`);
+  }
+}
+
+export async function writeNativeRendererJpegSequenceFrame(
+  session: NativeJpegSequenceSession,
+  frameIndex: number,
+  timeSeconds: number,
+): Promise<NativeRendererFrameSnapshotExportResult> {
+  if (session.target.kind !== 'electron' || !session.target.path) {
+    throw new Error('Native renderer frame capture requires the desktop app frame-sequence encoder');
+  }
+  const rawName = `.${session.baseName}_${session.jobId}_${String(frameIndex).padStart(6, '0')}.${session.pixelFormat}`;
+  const rawPath = `${session.target.path}/${rawName}`;
+  const snapshot = await exportNativeRendererFrameSnapshot(rawPath, {
+    time: timeSeconds,
+    frame_index: frameIndex,
+  });
+  assertNativeRendererFrameExport(snapshot, frameIndex, session);
+  await writeNativeJpegSequenceFrameFile(session, frameIndex, rawPath, true);
+  return snapshot;
+}
+
+export async function startNativeJpegFrameEncoder(
+  settings: Pick<OfflineRenderSettings, 'width' | 'height' | 'fps'>,
+  totalFrames: number,
+  pixelFormat: 'rgba' | 'bgra' = 'rgba',
+): Promise<NativeJpegFrameEncoderSession> {
+  if (!isElectron) {
+    throw new Error('Native frame capture requires the desktop app.');
+  }
+  const jobId = `jpeg-frame-${generateUUID()}`;
+  const result = await invoke<{
+    success?: boolean;
+    error?: string;
+    tempDir?: string;
+    pixelFormat?: string;
+  }>('jpeg_frame_encoder_start', {
+    jobId,
+    width: settings.width,
+    height: settings.height,
+    fps: settings.fps,
+    totalFrames,
+    pixelFormat,
+  });
+  if (!result?.success || !result.tempDir) {
+    throw new Error(result?.error || 'Could not start native JPEG frame encoder');
+  }
+  return {
+    jobId,
+    tempDir: result.tempDir,
+    width: settings.width,
+    height: settings.height,
+    fps: settings.fps,
+    totalFrames,
+    pixelFormat: rawPixelFormatForNativeTextureFormat(result.pixelFormat || pixelFormat),
+  };
+}
+
+export async function encodeNativeRendererJpegFrame(
+  session: NativeJpegFrameEncoderSession,
+  frameIndex: number,
+  timeSeconds: number,
+): Promise<Uint8Array> {
+  const rawName = `native_frame_${session.jobId}_${String(frameIndex).padStart(6, '0')}.${session.pixelFormat}`;
+  const rawPath = joinNativeTempPath(session.tempDir, rawName);
+  const snapshot = await exportNativeRendererFrameSnapshot(rawPath, {
+    time: timeSeconds,
+    frame_index: frameIndex,
+  });
+  assertNativeRendererFrameExport(snapshot, frameIndex, session);
+
+  const result = await invoke<{
+    success?: boolean;
+    error?: string;
+    bytes?: unknown;
+    byteLength?: number;
+  }>('jpeg_frame_encoder_encode_file', {
+    jobId: session.jobId,
+    frameIndex,
+    path: rawPath,
+    pixelFormat: session.pixelFormat,
+    deleteAfterWrite: true,
+  });
+  if (!result?.success || !result.bytes) {
+    throw new Error(result?.error || `Could not encode native JPEG frame ${frameIndex}`);
+  }
+  const jpegBytes = coerceUint8Array(result.bytes);
+  if (jpegBytes.byteLength <= 0) {
+    throw new Error(`Native JPEG encoder returned an empty frame at ${frameIndex}`);
+  }
+  return jpegBytes;
+}
+
+export async function finishNativeJpegFrameEncoder(session: NativeJpegFrameEncoderSession): Promise<void> {
+  const result = await invoke<{ success?: boolean; error?: string }>('jpeg_frame_encoder_finish', {
+    jobId: session.jobId,
+  });
+  if (!result?.success) {
+    throw new Error(result?.error || 'Could not finalize native JPEG frame encoder');
+  }
+}
+
+export async function cancelNativeJpegFrameEncoder(session: NativeJpegFrameEncoderSession): Promise<void> {
+  await invoke('jpeg_frame_encoder_cancel', { jobId: session.jobId }).catch(() => {});
+}
+
+export async function startNativeMp4FrameEncoder(
+  settings: Pick<OfflineRenderSettings, 'width' | 'height' | 'fps' | 'quality' | 'filename' | 'codec'>,
+  totalFrames: number,
+  pixelFormat: 'rgba' | 'bgra' = 'rgba',
+  /** Live fallback capture only: read the core's record target or one
+   *  Screen ("slice:<id>") instead of the program output. */
+  captureSource?: string,
+): Promise<NativeMp4FrameEncoderSession> {
+  if (!isElectron) {
+    throw new Error('Native MP4 encoding requires the desktop app.');
+  }
+  const jobId = `mp4-frame-${generateUUID()}`;
+  const codec = recordingCodecOption(settings.codec);
+  const outputName = `${sanitizeFilenamePart(settings.filename || 'Offline Render', 'Offline_Render')}.${codec.extension}`;
+  const expectedFrames = Number.isFinite(totalFrames) && totalFrames > 0 ? Math.round(totalFrames) : 0;
+  const result = await invoke<{
+    success?: boolean;
+    error?: string;
+    tempDir?: string;
+    outputPath?: string;
+    pixelFormat?: string;
+  }>('mp4_frame_encoder_start', {
+    jobId,
+    width: settings.width,
+    height: settings.height,
+    fps: settings.fps,
+    quality: settings.quality,
+    totalFrames: expectedFrames,
+    outputName,
+    pixelFormat,
+    codec: codec.id,
+    ...(captureSource && captureSource !== 'output' ? { captureSource } : {}),
+  });
+  if (!result?.success || !result.tempDir || !result.outputPath) {
+    throw new Error(result?.error || 'Could not start native MP4 frame encoder');
+  }
+  return {
+    jobId,
+    tempDir: result.tempDir,
+    outputPath: result.outputPath,
+    width: settings.width,
+    height: settings.height,
+    fps: settings.fps,
+    totalFrames: expectedFrames,
+    pixelFormat: rawPixelFormatForNativeTextureFormat(result.pixelFormat || pixelFormat),
+    quality: settings.quality,
+    extension: codec.extension,
+    mime: codec.mime,
+  };
+}
+
+export async function writeNativeMp4Frame(
+  session: NativeMp4FrameEncoderSession,
+  frameIndex: number,
+  pixels: { width: number; height: number; data: Uint8Array },
+): Promise<void> {
+  if (pixels.width !== session.width || pixels.height !== session.height) {
+    throw new Error(
+      `MP4 frame ${frameIndex} size mismatch: got ${pixels.width}x${pixels.height}, expected ${session.width}x${session.height}`,
+    );
+  }
+  const result = await invoke<{ success?: boolean; error?: string }>('mp4_frame_encoder_write_frame', {
+    jobId: session.jobId,
+    frameIndex,
+    bytes: pixels.data,
+    pixelFormat: session.pixelFormat,
+  });
+  if (!result?.success) {
+    throw new Error(result?.error || `Could not write MP4 frame ${frameIndex}`);
+  }
+}
+
+export async function writeNativeMp4FrameFile(
+  session: NativeMp4FrameEncoderSession,
+  frameIndex: number,
+  path: string,
+  deleteAfterWrite = false,
+): Promise<void> {
+  const result = await invoke<{ success?: boolean; error?: string }>('mp4_frame_encoder_write_frame_file', {
+    jobId: session.jobId,
+    frameIndex,
+    path,
+    pixelFormat: session.pixelFormat,
+    deleteAfterWrite,
+  });
+  if (!result?.success) {
+    throw new Error(result?.error || `Could not write MP4 frame file ${frameIndex}`);
+  }
+}
+
+export async function writeNativeRendererMp4Frame(
+  session: NativeMp4FrameEncoderSession,
+  frameIndex: number,
+  timeSeconds: number,
+): Promise<NativeRendererFrameSnapshotExportResult> {
+  const rawName = `native_mp4_${session.jobId}_${String(frameIndex).padStart(6, '0')}.${session.pixelFormat}`;
+  const rawPath = joinNativeTempPath(session.tempDir, rawName);
+  const snapshot = await exportNativeRendererFrameSnapshot(rawPath, {
+    time: timeSeconds,
+    frame_index: frameIndex,
+  });
+  assertNativeRendererFrameExport(snapshot, frameIndex, session);
+  await writeNativeMp4FrameFile(session, frameIndex, rawPath, true);
+  return snapshot;
+}
+
+/** Live-clock variant: snapshot whatever the core is presenting right
+ *  now (no manual time override) and write it as frames fromIndex..
+ *  toIndex inclusive. Duplicating one capture across the span is how
+ *  live REC keeps wall-clock pacing when a capture takes longer than a
+ *  frame interval — the encoded timeline stays real-time instead of
+ *  compressing (which played back sped-up). Returns the snapshot. */
+export async function writeNativeRendererMp4FrameLiveSpan(
+  session: NativeMp4FrameEncoderSession,
+  fromIndex: number,
+  toIndex: number,
+): Promise<NativeRendererFrameSnapshotExportResult> {
+  let snapshot!: NativeRendererFrameSnapshotExportResult;
+  const last = Math.max(fromIndex, toIndex);
+  for (let first = fromIndex; first <= last; first += 120) {
+    const result = await invoke<{ success: boolean; error?: string; snapshot: NativeRendererFrameSnapshotExportResult }>(
+      'mp4_frame_encoder_capture_live', { jobId: session.jobId, fromIndex: first, toIndex: Math.min(last, first + 119) });
+    if (!result?.success) throw new Error(result?.error || 'Native live frame capture failed');
+    snapshot = result.snapshot;
+    assertNativeRendererFrameExport(snapshot, first, session);
+  }
+  return snapshot;
+}
+
+export async function finishNativeMp4FrameEncoder(
+  session: NativeMp4FrameEncoderSession,
+): Promise<{ outputPath: string; size: number; frames: number; nativeAudio: boolean }> {
+  const result = await invoke<{
+    success?: boolean;
+    error?: string;
+    outputPath?: string;
+    size?: number;
+    frames?: number;
+    nativeAudio?: boolean;
+  }>('mp4_frame_encoder_finish', {
+    jobId: session.jobId,
+  });
+  if (!result?.success || !result.outputPath) {
+    throw new Error(result?.error || 'Could not finalize native MP4 frame encoder');
+  }
+  return {
+    outputPath: result.outputPath,
+    size: Number(result.size ?? 0),
+    frames: Number(result.frames ?? session.totalFrames),
+    // Live recordings: the native clip audio tap is held for the mux.
+    nativeAudio: result.nativeAudio === true,
+  };
+}
+
+export async function cancelNativeMp4FrameEncoder(session: NativeMp4FrameEncoderSession): Promise<void> {
+  await invoke('mp4_frame_encoder_cancel', { jobId: session.jobId }).catch(() => {});
+}
+
+/**
+ * Prompt for a save location and copy an already-encoded MP4 there.
+ *
+ * The encoder always writes into the app-managed generated-video folder,
+ * which is the right home for the media-library entry but not a place a
+ * user can find. This is a fast on-disk copy (no IPC bytes), so both the
+ * library entry and the user's own copy survive.
+ *
+ * Cancelling is a normal outcome, not a failure: the render is already
+ * complete and the file is still at `outputPath`. Returns the chosen
+ * destination, or null when the user dismissed the dialog or the copy
+ * could not be made.
+ */
+export async function promptSaveMp4(
+  outputPath: string,
+  name: string,
+  title = 'Save Video',
+  extension = 'mp4',
+): Promise<string | null> {
+  try {
+    const result = await invoke('save_project_dialog', {
+      title,
+      defaultPath: `${name}.${extension}`,
+      filters: [
+        extension === 'mov'
+          ? { name: 'QuickTime Movie', extensions: ['mov'] }
+          : { name: 'MP4 Video', extensions: ['mp4'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    }) as { canceled?: boolean; filePath?: string | null } | null;
+    if (result?.canceled || !result?.filePath) return null;
+    const copy = await invoke('copy_file_to_project', {
+      sourcePath: outputPath,
+      destPath: result.filePath,
+    }) as { success?: boolean; error?: string } | null;
+    if (!copy?.success) {
+      console.warn('[OfflineRender] Failed to copy render to chosen path:', copy?.error);
+      return null;
+    }
+    return result.filePath;
+  } catch (err) {
+    console.warn('[OfflineRender] Save prompt failed:', err);
+    return null;
+  }
+}
+
+/** Show a finished render in Finder/Explorer. Best-effort — a render that
+ *  cannot be revealed still shows its path in the completion panel. */
+export async function revealOutputPath(path: string): Promise<void> {
+  if (!isElectron || !path) return;
+  await invoke('video_converter_reveal_path', { path }).catch((err) => {
+    console.warn('[OfflineRender] Reveal failed:', err);
+  });
 }
 
 export async function finishNativeJpegSequence(session: NativeJpegSequenceSession): Promise<void> {
@@ -477,18 +962,21 @@ function createOfflineRenderStore() {
   }
 
   async function start(settings: OfflineRenderSettings): Promise<boolean> {
-    if (!engineRef || !canvasRef) {
-      setStatus('error', 'Render engine not ready');
+    // The WebGL engine only exists in non-native builds. Native capture
+    // renders + reads frames entirely in the core, so it must not require it.
+    if ((!engineRef || !canvasRef) && settings.captureBackend !== 'native') {
+      setStatus('error', 'Render engine not ready — this build renders natively; use the native capture backend.');
       return false;
     }
     const engine = engineRef;
     const canvas = canvasRef;
     const outputMode = settings.outputMode ?? 'mp4';
+    const useNativeMp4Encoder = outputMode === 'mp4' && isElectron;
     const totalFrames = Math.max(1, Math.round(settings.durationSeconds * settings.fps));
     cancelRequested = false;
     set({
       ...INITIAL_STATE,
-      status: outputMode === 'frames' ? 'choosing-folder' : 'loading-ffmpeg',
+      status: outputMode === 'frames' ? 'choosing-folder' : (useNativeMp4Encoder ? 'rendering' : 'loading-ffmpeg'),
       totalFrames,
       currentFrame: 0,
       startedAtMs: performance.now(),
@@ -496,15 +984,39 @@ function createOfflineRenderStore() {
 
     // Save state to restore after render so the live editor returns
     // to exactly how it was. Both engine size + the time overrides.
-    const restoreWidth  = (engine as any).width  ?? canvas.width;
-    const restoreHeight = (engine as any).height ?? canvas.height;
-    const restoreManual = engine.manualTime;
-    const restoreCanvasVisibility = canvas.style.visibility;
+    // Without an engine (native shell) the output size to restore comes
+    // from the core's own status just before we resize it.
+    let restoreWidth  = (engine as any)?.width  ?? canvas?.width ?? settings.width;
+    let restoreHeight = (engine as any)?.height ?? canvas?.height ?? settings.height;
+    const restoreManual = engine ? engine.manualTime : null;
+    const restoreCanvasVisibility = canvas?.style.visibility ?? '';
 
     let ffmpeg: FFmpeg | null = null;
     let frameTarget: FrameSequenceTarget | null = null;
     let nativeJpegSequence: NativeJpegSequenceSession | null = null;
+    let nativeJpegFrameEncoder: NativeJpegFrameEncoderSession | null = null;
+    let nativeMp4FrameEncoder: NativeMp4FrameEncoderSession | null = null;
     let nativeJpegSequenceFinished = false;
+    let nativeJpegFrameEncoderFinished = false;
+    let nativeMp4FrameEncoderFinished = false;
+    let nativeFrameCaptureActive = false;
+    let nativeOutputNeedsRestore = false;
+    /** True once the live sync RAF has been suspended for this render. */
+    let manualClockExportHeld = false;
+    /** Virtual-time analysis of a file audio source, when we could decode
+     *  one. Null for live inputs (mic / system), which cannot be
+     *  virtualized — see the warning in OfflineRenderModal. */
+    let fileAudioSession: OfflineFileAudioSession | null = null;
+    /** True once the live analyser has been told to stand down because
+     *  `fileAudioSession` is supplying frames instead. */
+    let liveAnalysisHeld = false;
+    /** Media element we paused for a file-audio export, so playback can be
+     *  handed back exactly as we found it. */
+    let pausedAudioElement: HTMLAudioElement | HTMLVideoElement | null = null;
+    /** True when the show timeline was running live and we paused it so the
+     *  render loop's per-frame seek is the only thing driving it. */
+    let showTimelineWasPlaying = false;
+    let nativeCapturePixelFormat: 'rgba' | 'bgra' = 'rgba';
     const frameBaseName = frameSequenceBaseName(settings.filename, 'render');
     if (outputMode === 'frames') {
       try {
@@ -514,7 +1026,7 @@ function createOfflineRenderStore() {
         setStatus('error', formatErr(err));
         return false;
       }
-    } else {
+    } else if (!useNativeMp4Encoder) {
       try {
         ffmpeg = await loadFFmpeg();
       } catch (err) {
@@ -525,8 +1037,8 @@ function createOfflineRenderStore() {
     if (cancelRequested) { _finish('cancelled'); return false; }
 
     setStatus('rendering');
-    canvas.style.visibility = 'hidden';
-    const segmentFrameCount = outputMode === 'frames'
+    if (canvas) canvas.style.visibility = 'hidden';
+    const segmentFrameCount = outputMode === 'frames' || useNativeMp4Encoder
       ? totalFrames
       : getOfflineSegmentFrameCount(settings);
     const segmentNames: string[] = [];
@@ -537,12 +1049,141 @@ function createOfflineRenderStore() {
       // Resize the engine to the offline resolution. Live editor will
       // briefly show this size; restored at the end. The engine.resize
       // path rebuilds all render targets cleanly.
-      engine.resize(settings.width, settings.height);
-      canvas.width = settings.width;
-      canvas.height = settings.height;
-      if (outputMode === 'frames' && frameTarget) {
-        nativeJpegSequence = await startNativeJpegSequence(frameTarget, settings, frameBaseName, totalFrames);
+      engine?.resize(settings.width, settings.height);
+      if (canvas) {
+        canvas.width = settings.width;
+        canvas.height = settings.height;
       }
+      if (settings.captureBackend === 'native') {
+        const caps = await getNativeRendererCapabilities();
+        if (
+          !caps?.features?.frame_snapshot_export ||
+          !caps?.features?.native_frame_sequence_export ||
+          !caps.implemented_methods?.includes('export_frame_snapshot')
+        ) {
+          throw new Error('Native frame capture is not available in this renderer build.');
+        }
+        if (!engine) {
+          // No WebGL engine to read the pre-render size from; the core's
+          // status is the ground truth for what to restore.
+          const preStatus = await getNativeRendererStatus();
+          if (preStatus.output_width > 0) restoreWidth = preStatus.output_width;
+          if (preStatus.output_height > 0) restoreHeight = preStatus.output_height;
+        }
+        await submitNativeRendererCommands([
+          { type: 'set_output', width: settings.width, height: settings.height, refresh_hz: settings.fps },
+        ]);
+        nativeOutputNeedsRestore = true;
+        const nativeStatus = await getNativeRendererStatus();
+        nativeCapturePixelFormat = rawPixelFormatForNativeTextureFormat(nativeStatus.output_format);
+        nativeFrameCaptureActive = true;
+        // Lock the world clock to the render clock: from here until the
+        // finally block, the ONLY thing advancing the core is this loop's
+        // renderManualFrame() call. The live sync RAF would otherwise keep
+        // flushing presents at the export's virtual time, which used to
+        // stack extra simulation steps on top of each captured frame.
+        getActiveNativeRendererSync()?.beginManualClockExport();
+        manualClockExportHeld = true;
+      }
+      if (outputMode === 'frames' && frameTarget) {
+        nativeJpegSequence = await startNativeJpegSequence(
+          frameTarget,
+          settings,
+          frameBaseName,
+          totalFrames,
+          nativeCapturePixelFormat,
+        );
+      } else if (outputMode === 'mp4' && nativeFrameCaptureActive) {
+        nativeMp4FrameEncoder = await startNativeMp4FrameEncoder(
+          settings,
+          totalFrames,
+          nativeCapturePixelFormat,
+        );
+      } else if (outputMode === 'mp4' && useNativeMp4Encoder) {
+        nativeMp4FrameEncoder = await startNativeMp4FrameEncoder(
+          settings,
+          totalFrames,
+          'rgba',
+        );
+      }
+      // ─── Audio: pin the reactive signal to the render clock ────────
+      //
+      // Two independent wall-clock couplings live here.
+      //
+      // (1) The visual-audio FOLLOWER integrates every envelope, LFO and
+      //     beat-phase on real seconds. Left alone, a 10 s export that
+      //     takes 15 s of wall time folds 15 s of reactive motion into
+      //     10 s of video. Pinning it to the virtual clock fixes that for
+      //     EVERY input type, so it always runs.
+      //
+      // (2) The audio CONTENT itself. Only a file source can be
+      //     virtualized — decode it once and analyse at virtual time
+      //     below. A microphone or system-audio stream has no virtual
+      //     time to seek to; its content necessarily follows real elapsed
+      //     time, which is what the render modal warns about.
+      // (3) THE SHOW TIMELINE'S OWN AUDIO takes priority over the analyser
+      //     input when the user has programmed one — that IS the show's
+      //     soundtrack, and it is the only signal whose position we can
+      //     reproduce exactly at any virtual time (we know every track's
+      //     offset). Mixed down once, then sampled per frame through the
+      //     same OfflineFileAudioAnalyzer the file-input path uses.
+      const showState = get(showTimeline);
+      if (showState.audioTracks.some(t => !t.muted && t.url && t.duration > 0)) {
+        // Its RAF would race the render loop's own seek() — the render owns
+        // the clock for the duration.
+        showTimelineWasPlaying = showState.isPlaying;
+        if (showTimelineWasPlaying) showTimeline.pause();
+        fileAudioSession = await prepareShowOfflineAudio(
+          showState.audioTracks,
+          showState.duration,
+          { loop: showState.loop, bandSmoothing: audioAnalyzer.getSmoothing() },
+        );
+        if (fileAudioSession) {
+          audioAnalyzer.beginAnalysisHold();
+          liveAnalysisHeld = true;
+          console.info(
+            `[offlineRender] show timeline audio pinned to the render clock ` +
+            `(${fileAudioSession.durationSeconds.toFixed(2)}s): ${fileAudioSession.label}`,
+          );
+        }
+      }
+
+      const audioState = get(audioStore);
+      if (!fileAudioSession && audioState.inputType === 'file') {
+        const element = audioAnalyzer.getMediaElement();
+        // Freeze the playhead BEFORE the decode: the export starts from
+        // wherever the user left the track, not from wherever it drifted
+        // to while a few MB of audio were being decoded.
+        const wasPlaying = !!element && !element.paused;
+        if (wasPlaying && element) {
+          try { element.pause(); } catch { /* best-effort */ }
+        }
+        fileAudioSession = await prepareOfflineFileAudio(
+          element,
+          audioAnalyzer.getAudioContext(),
+          {
+            startOffsetSeconds: element ? element.currentTime : 0,
+            bandSmoothing: audioAnalyzer.getSmoothing(),
+          },
+        );
+        if (fileAudioSession) {
+          // The live RAF would keep overwriting the store with wall-clock
+          // frames — and with the element paused, with silence. Stand it
+          // down for the duration.
+          audioAnalyzer.beginAnalysisHold();
+          liveAnalysisHeld = true;
+          if (wasPlaying) pausedAudioElement = element;
+          console.info(
+            `[offlineRender] file audio pinned to the render clock (${fileAudioSession.durationSeconds.toFixed(2)}s @ +${fileAudioSession.startOffsetSeconds.toFixed(2)}s): ${fileAudioSession.label}`,
+          );
+        } else if (wasPlaying && element) {
+          // Couldn't virtualize it after all — give the user their audio
+          // back and fall through to follower-only pinning.
+          void element.play().catch(() => { /* user can hit play again */ });
+        }
+      }
+      setVisualAudioManualTime(0);
+
       // Let the resize settle before the first capture.
       await nextFrame();
 
@@ -560,12 +1201,38 @@ function createOfflineRenderStore() {
         // clock. Engine = shader iTime; ISF = ISF shaders' TIME;
         // stage effects = per-slice brightness; keyframes + sequencer
         // = parameter / opacity overrides.
-        engine.manualTime = virtualTime;
+        if (engine) engine.manualTime = virtualTime;
         setISFManualTime(virtualTime);
           setStageEffectsManualTime(virtualTime);
+          // Audio-reactive content: publish this frame's spectrum (file
+          // sources only) and advance the follower by exactly 1/fps of
+          // virtual time. Must land BEFORE renderManualFrame() — the graph
+          // build reads getVisualAudioSnapshot() synchronously.
+          if (fileAudioSession) {
+            audioStore.injectAnalysisFrame(
+              fileAudioSession.analyzer.frameAt(offlineFileAudioTime(fileAudioSession, virtualTime)),
+            );
+          }
+          pumpVisualAudio(virtualTime);
           keyframeTimeline.seek(virtualTime);
           layerSequencer.seek(virtualTime);
           vjLayerSequencer.seek(virtualTime);
+          // Show timeline: evaluates which preset clip owns this instant and
+          // fires the composition swap ONLY when that answer changes. Must
+          // run after the sub-transport seeks above — loadComposition
+          // re-hydrates them, and with `restoreTransports:false` (which the
+          // show timeline passes under a manual clock) it will not fight the
+          // next frame's seeks. A show with no clips is a no-op.
+          showTimeline.seek(virtualTime);
+          // Native graphs (splat, model3d, text, GPU instruments…)
+          // animate from the render clock the sync sends — pin it to
+          // the virtual time and flush so this frame's compute lands
+          // in the core before the snapshot is taken. Without this,
+          // graph content keeps animating on the wall clock and
+          // exports play faster than intended.
+          if (nativeFrameCaptureActive) {
+            await getActiveNativeRendererSync()?.renderManualFrame(virtualTime);
+          }
 
         // Wait one RAF so the live render loop picks up the new
         // state. (True offline-rate rendering — where we'd call
@@ -577,26 +1244,52 @@ function createOfflineRenderStore() {
         if (outputMode === 'frames') {
           if (!frameTarget) throw new Error('Frame export folder not ready');
           if (nativeJpegSequence) {
-            const pixels = (engine as any).readCompositePixels() as { width: number; height: number; data: Uint8Array };
-            await writeNativeJpegSequenceFrame(nativeJpegSequence, globalFrame, pixels);
+            if (nativeFrameCaptureActive) {
+              await writeNativeRendererJpegSequenceFrame(nativeJpegSequence, globalFrame, virtualTime);
+            } else {
+              if (!engine) throw new Error('WebGL frame capture needs the render engine');
+              const pixels = (engine as any).readCompositePixels() as { width: number; height: number; data: Uint8Array };
+              await writeNativeJpegSequenceFrame(nativeJpegSequence, globalFrame, pixels);
+            }
           } else {
+            if (!engine) throw new Error('WebGL frame capture needs the render engine');
             const jpegBytes = await captureFrameJPEG(engine, 0.92);
             const frameName = `${frameBaseName}_${String(globalFrame).padStart(6, '0')}.jpg`;
             await writeFrameTargetBytes(frameTarget, frameName, jpegBytes);
           }
         } else {
-          if (!ffmpeg) throw new Error('FFmpeg encoder not ready');
-          // MP4 export still feeds compressed JPEG intermediates into
-          // ffmpeg.wasm so the wasm heap stays below its ~2GB limit.
-          const jpegBytes = await captureFrameJPEG(engine, 0.92);
-          const frameName = `frame_${String(localFrame).padStart(6, '0')}.jpg`;
-          await ffmpeg.writeFile(frameName, jpegBytes);
+          if (nativeMp4FrameEncoder) {
+            if (nativeFrameCaptureActive) {
+              await writeNativeRendererMp4Frame(nativeMp4FrameEncoder, globalFrame, virtualTime);
+            } else {
+              if (!engine) throw new Error('WebGL frame capture needs the render engine');
+              const pixels = (engine as any).readCompositePixels() as { width: number; height: number; data: Uint8Array };
+              await writeNativeMp4Frame(nativeMp4FrameEncoder, globalFrame, pixels);
+            }
+          } else {
+            if (!ffmpeg) throw new Error('FFmpeg encoder not ready');
+            // Browser fallback: compressed JPEG intermediates keep
+            // ffmpeg.wasm below its ~2GB heap limit.
+            if (!engine && !(nativeJpegFrameEncoder && nativeFrameCaptureActive)) {
+              throw new Error('WebGL frame capture needs the render engine');
+            }
+            const jpegBytes = nativeJpegFrameEncoder && nativeFrameCaptureActive
+              ? await encodeNativeRendererJpegFrame(nativeJpegFrameEncoder, globalFrame, virtualTime)
+              : await captureFrameJPEG(engine!, 0.92);
+            const frameName = `frame_${String(localFrame).padStart(6, '0')}.jpg`;
+            await ffmpeg.writeFile(frameName, jpegBytes);
+          }
         }
 
         update(s => ({ ...s, currentFrame: globalFrame + 1 }));
         }
 
         if (outputMode === 'frames') {
+          currentSegmentFrames = 0;
+          continue;
+        }
+
+        if (nativeMp4FrameEncoder) {
           currentSegmentFrames = 0;
           continue;
         }
@@ -625,6 +1318,10 @@ function createOfflineRenderStore() {
       }
 
       if (cancelRequested) { _finish('cancelled'); return false; }
+      if (nativeJpegFrameEncoder && !nativeJpegFrameEncoderFinished) {
+        await finishNativeJpegFrameEncoder(nativeJpegFrameEncoder);
+        nativeJpegFrameEncoderFinished = true;
+      }
 
       if (outputMode === 'frames') {
         if (!frameTarget) throw new Error('Frame export folder not ready');
@@ -648,6 +1345,49 @@ function createOfflineRenderStore() {
           lastOutputKind: 'frames',
           lastOutputName: frameBaseName,
           lastOutputPath: describeFrameTarget(frameTarget!),
+        }));
+        return true;
+      }
+
+      if (nativeMp4FrameEncoder && !nativeMp4FrameEncoderFinished) {
+        setStatus('encoding');
+        const encoded = await finishNativeMp4FrameEncoder(nativeMp4FrameEncoder);
+        nativeMp4FrameEncoderFinished = true;
+        update(s => ({ ...s, encodeProgress: 1 }));
+        if (cancelRequested) { _finish('cancelled'); return false; }
+
+        setStatus('saving');
+        const url = pathToFileUrl(encoded.outputPath);
+        const thumbnail = await thumbnailFromVideoUrl(url, Math.min(2, settings.durationSeconds * 0.4));
+        const niceName = `${settings.filename || 'Offline Render'} ${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}`;
+        const assetRef: AssetRef = {
+          kind: 'local-file',
+          originalPath: encoded.outputPath,
+          name: `${niceName}.${nativeMp4FrameEncoder.extension}`,
+          mime: nativeMp4FrameEncoder.mime,
+          size: encoded.size,
+          lastModified: Date.now(),
+        };
+        mediaLibrary.addItem({
+          id: generateUUID(),
+          name: niceName,
+          type: 'video',
+          src: url,
+          thumbnail,
+          _assetRef: assetRef,
+        });
+        // Ask where the user wants their copy. The library entry above is
+        // already committed, so cancelling just means "leave it in the
+        // app folder" — the completion panel surfaces that path either way.
+        const savedPath = await promptSaveMp4(encoded.outputPath, niceName, 'Save Video', nativeMp4FrameEncoder.extension);
+        update(s => ({
+          ...s,
+          status: 'complete',
+          lastOutputUrl: url,
+          lastOutputName: niceName,
+          lastOutputKind: 'video',
+          lastOutputPath: encoded.outputPath,
+          lastOutputSavedPath: savedPath,
         }));
         return true;
       }
@@ -725,11 +1465,50 @@ function createOfflineRenderStore() {
       if (nativeJpegSequence && !nativeJpegSequenceFinished) {
         await cancelNativeJpegSequence(nativeJpegSequence);
       }
-      engine.manualTime = restoreManual;
-      canvas.style.visibility = restoreCanvasVisibility;
+      if (nativeJpegFrameEncoder && !nativeJpegFrameEncoderFinished) {
+        await cancelNativeJpegFrameEncoder(nativeJpegFrameEncoder);
+      }
+      if (nativeMp4FrameEncoder && !nativeMp4FrameEncoderFinished) {
+        await cancelNativeMp4FrameEncoder(nativeMp4FrameEncoder);
+      }
+      if (nativeOutputNeedsRestore) {
+        await submitNativeRendererCommands([
+          { type: 'set_output', width: restoreWidth, height: restoreHeight, refresh_hz: settings.fps },
+        ]).catch(() => {});
+      }
+      if (engine && restoreManual !== null) engine.manualTime = restoreManual;
+      getActiveNativeRendererSync()?.setRenderClock(null);
+      if (manualClockExportHeld) {
+        manualClockExportHeld = false;
+        getActiveNativeRendererSync()?.endManualClockExport();
+      }
+      if (canvas) canvas.style.visibility = restoreCanvasVisibility;
       setISFManualTime(null);
       setStageEffectsManualTime(null);
-      try { engine.resize(restoreWidth, restoreHeight); } catch (e) { /* nothing we can do */ }
+      // Hand the audio clock back. setVisualAudioManualTime(null) also
+      // resets the follower and restores the pre-export published state,
+      // so the live show doesn't resume mid-envelope on the export's
+      // virtual timeline.
+      setVisualAudioManualTime(null);
+      if (liveAnalysisHeld) {
+        liveAnalysisHeld = false;
+        audioAnalyzer.endAnalysisHold();
+      }
+      if (pausedAudioElement) {
+        const element = pausedAudioElement;
+        pausedAudioElement = null;
+        void element.play().catch(() => { /* user can hit play again */ });
+      }
+      if (showTimelineWasPlaying) {
+        showTimelineWasPlaying = false;
+        // Rewind first: the render left the playhead at the last virtual
+        // frame, and resuming from there would drop the operator into the
+        // middle of a show they were watching from somewhere else.
+        showTimeline.stop();
+        showTimeline.play();
+      }
+      fileAudioSession = null;
+      try { engine?.resize(restoreWidth, restoreHeight); } catch (e) { /* nothing we can do */ }
     }
   }
 
@@ -777,9 +1556,9 @@ export function formatErr(err: unknown): string {
 }
 
 
-export async function thumbnailFromBlob(blob: Blob, url: string, atSeconds: number): Promise<string | undefined> {
-  // `url` stays alive after this returns — it's the media-library item's
-  // src. Only the temporary <video> below must be released.
+export async function thumbnailFromVideoUrl(url: string, atSeconds: number): Promise<string | undefined> {
+  // `url` stays alive after this returns when it is the media-library
+  // item's src. Only the temporary <video> below must be released.
   const v = document.createElement('video');
   try {
     v.src = url;
@@ -806,6 +1585,11 @@ export async function thumbnailFromBlob(blob: Blob, url: string, atSeconds: numb
     v.removeAttribute('src');
     try { v.load(); } catch { /* ignore */ }
   }
+}
+
+export async function thumbnailFromBlob(blob: Blob, url: string, atSeconds: number): Promise<string | undefined> {
+  void blob;
+  return thumbnailFromVideoUrl(url, atSeconds);
 }
 
 export function downloadBlob(blob: Blob, filename: string) {

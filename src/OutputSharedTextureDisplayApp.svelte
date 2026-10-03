@@ -47,7 +47,6 @@
    * Toggleable at runtime by pressing `S`.
    */
   import { onMount, onDestroy } from 'svelte';
-  import { invoke } from '$lib/bridge';
 
   const urlParams = new URLSearchParams(window.location.search);
   let showStats = urlParams.get('stats') === '1';
@@ -624,20 +623,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   }
 
   function handleKeydown(e: KeyboardEvent): void {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      exitOutputFullscreen();
-      return;
-    }
     if (e.key === 's' || e.key === 'S') {
       showStats = !showStats;
     }
-  }
-
-  function exitOutputFullscreen(): void {
-    invoke('output_exit_fullscreen').catch((err: any) => {
-      console.warn('[OutputSharedTexture] Failed to exit fullscreen:', err);
-    });
   }
 
   // Register the port intake listener IMMEDIATELY (top-level script
@@ -810,7 +798,7 @@ press S to hide</pre>
     bottom: 8px;
     left: 8px;
     color: var(--text-muted, #888);
-    font-family: var(--ga-font-ui, 'Space Grotesk', system-ui, sans-serif);
+    font-family: var(--ga-font-ui, 'Geist', system-ui, sans-serif);
     font-size: 12px;
     background: rgba(0, 0, 0, 0.6);
     padding: 4px 8px;
@@ -822,7 +810,7 @@ press S to hide</pre>
     bottom: 12px;
     right: 12px;
     color: #fff;
-    font-family: var(--ga-font-ui, 'Space Grotesk', system-ui, sans-serif);
+    font-family: var(--ga-font-ui, 'Geist', system-ui, sans-serif);
     font-size: 13px;
     font-weight: 600;
     padding: 6px 10px;
@@ -845,7 +833,7 @@ press S to hide</pre>
     top: 8px;
     right: 8px;
     color: #0f0;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 12px;
     line-height: 1.4;
     background: rgba(0, 0, 0, 0.7);

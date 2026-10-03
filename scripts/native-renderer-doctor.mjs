@@ -1,0 +1,665 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { createNativeRendererBroker } from '../electron/native-renderer-broker.js';
+import {
+  COMPOSITOR_BLEND_MODES,
+  COMPOSITOR_EFFECTS,
+  assertNativeCompositorBlendParity,
+  assertNativeCompositorEffectParity,
+  assertNativeCompositorManifest,
+  precompileNativeCompositorParityShaders,
+} from './native-renderer-smoke.mjs';
+
+const root = process.cwd();
+const bin = join(root, 'native-renderer', 'target', 'release', process.platform === 'win32' ? 'ghost-render-core.exe' : 'ghost-render-core');
+const REQUIRED_GRAPH_INSTRUMENTS = [
+  'planet',
+  'smoke-3d',
+  'particle-field',
+  'volumetric-spheres',
+  'smoke-riders',
+  'ink-cloud',
+  'flythrough',
+  'pixel-particles',
+  'point-cloud-fx',
+];
+const STATEFUL_NATIVE_GRAPH_EFFECT_TYPES = new Set([
+  'gpuFluidSim',
+  'eulerianMagnify',
+]);
+
+function readNativeEffectPassManifest() {
+  const source = readFileSync(join(root, 'src/lib/renderer/nativeEffectPass.ts'), 'utf8');
+  const entries = [];
+  const pattern = /\{\s*id:\s*'([^']+)'\s*,\s*code:\s*(\d+)/g;
+  let match = pattern.exec(source);
+  while (match) {
+    entries.push({ id: match[1], code: Number(match[2]) });
+    match = pattern.exec(source);
+  }
+  if (!entries.length) throw new Error('could not parse NATIVE_EFFECT_PASS_MANIFEST');
+  return entries;
+}
+
+function nativeEffectPassIdForEffectType(effectType) {
+  return String(effectType)
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/_/g, '-')
+    .toLowerCase();
+}
+
+function readPublicEffectTypes() {
+  const catalogSource = readFileSync(join(root, 'src/lib/effects/effectCatalog.ts'), 'utf8');
+  const catalogTypes = [...catalogSource.matchAll(/type:\s*'([^']+)'/g)].map((entry) => entry[1]);
+  return Array.from(new Set([
+    ...catalogTypes,
+    'brightness',
+    'contrast',
+    'saturation',
+    'hue',
+  ]));
+}
+
+function readNativeEffectCoverage() {
+  const publicEffectTypes = readPublicEffectTypes();
+  const nativePassIds = readNativeEffectPassManifest().map((entry) => entry.id);
+  const nativePassSet = new Set(nativePassIds);
+  const publicPassIds = new Set(publicEffectTypes.map(nativeEffectPassIdForEffectType));
+  const nativePublicEffectTypes = publicEffectTypes.filter((effectType) =>
+    nativePassSet.has(nativeEffectPassIdForEffectType(effectType)),
+  );
+  const missingPublicEffectTypes = publicEffectTypes.filter((effectType) =>
+    !nativePassSet.has(nativeEffectPassIdForEffectType(effectType)),
+  );
+  const sourceFramePassEligibleEffectTypes = publicEffectTypes.filter(
+    (effectType) => !STATEFUL_NATIVE_GRAPH_EFFECT_TYPES.has(effectType),
+  );
+  const nativeSourceFramePassEffectTypes = sourceFramePassEligibleEffectTypes.filter((effectType) =>
+    nativePassSet.has(nativeEffectPassIdForEffectType(effectType)),
+  );
+  const missingSourceFramePassEffectTypes = sourceFramePassEligibleEffectTypes.filter((effectType) =>
+    !nativePassSet.has(nativeEffectPassIdForEffectType(effectType)),
+  );
+  const deferredNativeGraphEffectTypes = publicEffectTypes.filter((effectType) =>
+    STATEFUL_NATIVE_GRAPH_EFFECT_TYPES.has(effectType),
+  );
+  const nativeOnlyPassIds = nativePassIds.filter((passId) => !publicPassIds.has(passId));
+  return {
+    publicEffectCount: publicEffectTypes.length,
+    nativePassCount: nativePassIds.length,
+    nativePublicEffectCount: nativePublicEffectTypes.length,
+    missingPublicEffectCount: missingPublicEffectTypes.length,
+    sourceFramePassEligibleEffectCount: sourceFramePassEligibleEffectTypes.length,
+    nativeSourceFramePassEffectCount: nativeSourceFramePassEffectTypes.length,
+    missingSourceFramePassEffectCount: missingSourceFramePassEffectTypes.length,
+    deferredNativeGraphEffectCount: deferredNativeGraphEffectTypes.length,
+    nativeOnlyPassCount: nativeOnlyPassIds.length,
+    missingSample: missingSourceFramePassEffectTypes.slice(0, 6).join(','),
+    deferredNativeGraphEffectTypes,
+    nativeOnlyPassIds,
+  };
+}
+
+function readGhostAudioUniformLayout() {
+  const source = readFileSync(join(root, 'src/lib/audio/ghostAudioUniform.ts'), 'utf8');
+  const version = Number(/schema_version:\s*(\d+)/.exec(source)?.[1] ?? 0);
+  const readFields = (key) => {
+    const match = new RegExp(`${key}:\\s*\\[([^\\]]+)\\]\\s*as const`).exec(source);
+    if (!match) throw new Error(`could not parse ${key} from GHOST_AUDIO_UNIFORM_LAYOUT`);
+    return [...match[1].matchAll(/'([^']+)'/g)].map((entry) => entry[1]);
+  };
+  if (!version) throw new Error('could not parse GHOST_AUDIO_UNIFORM_LAYOUT schema_version');
+  return {
+    schema_version: version,
+    audio0: readFields('audio0'),
+    audio1: readFields('audio1'),
+    audio2: readFields('audio2'),
+  };
+}
+
+function audioUniformLayoutMatches(actual, expected) {
+  if (!actual || Number(actual.schema_version) !== expected.schema_version) return false;
+  return ['audio0', 'audio1', 'audio2'].every((key) =>
+    Array.isArray(actual[key]) &&
+    actual[key].length === expected[key].length &&
+    actual[key].every((field, index) => String(field) === expected[key][index]),
+  );
+}
+const REQUIRED_FEATURES = [
+  'compute_graph_host',
+  'compute_graph_render',
+  'compute_graph_multi_render',
+  'compute_graph_instanced_render',
+  'compute_graph_indirect_render',
+  'compute_graph_texture_sampling',
+  'compute_graph_depth_render',
+  'compute_graph_line_render',
+  'compute_graph_clear_color',
+  'compute_graph_source_frame_target',
+  'persistent_compute_buffers',
+  'native_output_mirror_texture',
+  'native_frame_export',
+  'native_frame_sequence_export',
+  'native_planet_graph',
+  'native_3d_smoke_graph',
+  'native_particle_field_graph',
+  'native_volumetric_spheres_graph',
+  'native_smoke_riders_graph',
+  'native_ink_cloud_graph',
+  'native_flythrough_graph',
+  'native_pixel_particles_graph',
+  'native_point_cloud_fx_graph',
+  'native_stage3d_textured_mesh_preview',
+  'native_stage3d_primitive_meshes',
+  'native_stage3d_xyz_mesh_transforms',
+  'native_stage3d_lighting_preview',
+  'native_stage3d_output_renderer',
+  'native_stage3d_recording_parity',
+  'native_stage3d',
+  'native_projection_sim_mesh_preview',
+  'native_projection_sim_textured_mesh_preview',
+  'native_projection_sim_xyz_mesh_transforms',
+  'native_projection_sim_output_renderer',
+  'native_projection_sim_recording_parity',
+  'native_projection_sim',
+];
+
+function check(cmd, args) {
+  const result = spawnSync(cmd, args, { encoding: 'utf8' });
+  if (result.error) return { ok: false, detail: result.error.message };
+  return {
+    ok: result.status === 0,
+    detail: (result.stdout || result.stderr || '').trim().split('\n')[0] || `exit ${result.status}`,
+  };
+}
+
+function formatBlockers(blockers) {
+  if (!Array.isArray(blockers) || blockers.length === 0) return '';
+  return blockers
+    .map((blocker) => String(blocker || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join(' | ');
+}
+
+function directCoreNativeShareSenderState(features = {}) {
+  if (features.native_texture_share_sender) return 'on';
+  if (features.shared_texture_output_export) return 'electron-bridge';
+  return 'pending';
+}
+
+function editorPreviewDetail(capabilities) {
+  const features = capabilities?.features ?? {};
+  const preview = capabilities?.native_editor_preview ?? {};
+  const presentation = preview.presentation ? `/${preview.presentation}` : '';
+  const presenter = preview.needs_underlay_lock_in ? '/needs-embedded-presenter' : '';
+  const production = preview.production_ready ? '/production' : '/diagnostic';
+  if (features.native_editor_preview_frame_source && preview.source === 'core-output-composite') {
+    return `${preview.mode || 'native'}${presentation}${presenter}${production}:${preview.source}`;
+  }
+  if (preview.source) return `${preview.mode || 'unavailable'}${presentation}${presenter}${production}:${preview.source}`;
+  return 'native-unavailable';
+}
+
+function expectedOutputTextureTransport() {
+  if (process.platform === 'darwin') {
+    return { platform: 'iosurface', handleScope: 'global-id', preferredTransport: 'handle' };
+  }
+  if (process.platform === 'win32') {
+    return { platform: 'dxgi', handleScope: 'process-local', preferredTransport: 'shared_name' };
+  }
+  return { platform: 'unsupported', handleScope: '', preferredTransport: '' };
+}
+
+function expectedSourceFrameSharedTextureImport() {
+  if (process.platform === 'darwin') {
+    return { available: true, backend: 'metal', platform: 'iosurface', importer: 'metal-iosurface', handleScope: 'global-id' };
+  }
+  if (process.platform === 'win32') {
+    return { available: true, backend: 'd3d12', platform: 'dxgi', importer: 'd3d12-open-shared-handle', handleScope: 'process-handle' };
+  }
+  return { available: false, backend: 'vulkan', platform: 'unsupported', importer: 'none', handleScope: '' };
+}
+
+function sourceFrameSharedTextureImportOk(capabilities, expected = expectedSourceFrameSharedTextureImport()) {
+  const features = capabilities?.features ?? {};
+  const contract = capabilities?.source_frame_shared_texture_import;
+  if (!contract || !!features.shared_texture_source_frame_upload !== expected.available) return false;
+  if (!!contract.available !== expected.available) return false;
+  if (String(contract.backend ?? '') !== expected.backend) return false;
+  if (String(contract.platform ?? '') !== expected.platform) return false;
+  if (String(contract.importer ?? '') !== expected.importer) return false;
+  if (String(contract.handle_scope ?? '') !== expected.handleScope) return false;
+  if (!expected.available) return true;
+  const encodings = new Set(Array.isArray(contract.accepted_handle_encodings) ? contract.accepted_handle_encodings.map(String) : []);
+  const formats = new Set(Array.isArray(contract.accepted_formats) ? contract.accepted_formats.map(String) : []);
+  return encodings.has('integer') &&
+    encodings.has('base64') &&
+    encodings.has('hex') &&
+    encodings.has('opaque') &&
+    formats.has('bgra8unorm') &&
+    formats.has('rgba8unorm') &&
+    formats.has('80') &&
+    formats.has('87') &&
+    formats.has('28') &&
+    formats.has('70');
+}
+
+function sourceFrameSharedTextureImportDetail(capabilities) {
+  const contract = capabilities?.source_frame_shared_texture_import;
+  if (!contract) return 'missing';
+  return [
+    contract.available ? 'on' : 'off',
+    String(contract.platform ?? 'unknown'),
+    String(contract.importer ?? 'unknown'),
+    String(contract.handle_scope ?? 'unknown'),
+  ].join('/');
+}
+
+function outputTextureTransportOk(texture, expected = expectedOutputTextureTransport()) {
+  if (expected.platform === 'unsupported') return !texture?.available;
+  if (!texture?.available) return false;
+  if (String(texture.platform ?? '') !== expected.platform) return false;
+	  if (String(texture.handle_scope ?? '') !== expected.handleScope) return false;
+	  if (String(texture.preferred_transport ?? '') !== expected.preferredTransport) return false;
+	  if (String(texture.format ?? '') !== 'bgra8unorm') return false;
+	  if (String(texture.color_space ?? '') !== 'srgb') return false;
+	  if (String(texture.storage_format ?? '') !== 'bgra8unorm') return false;
+	  if (String(texture.storage_encoding ?? '') !== 'srgb-encoded-bgra8unorm') return false;
+	  if (String(texture.alpha_mode ?? '') !== 'opaque') return false;
+	  if (texture.premultiplied_alpha !== false) return false;
+	  if (texture.single_render_source !== 'core-output-composite') return false;
+	  if (texture.zero_conversions !== true) return false;
+	  if (!(Number(texture.width ?? 0) > 0 && Number(texture.height ?? 0) > 0)) return false;
+  if (!String(texture.handle ?? '').length) return false;
+  if (expected.platform === 'dxgi') {
+    return String(texture.shared_name ?? '').includes('GhostArcadeNativeOutput');
+  }
+  return true;
+}
+
+function outputTextureTransportDetail(texture, expected = expectedOutputTextureTransport()) {
+  if (expected.platform === 'unsupported') {
+    return texture?.available ? 'unexpected-platform-output-texture' : 'unsupported';
+  }
+  if (!texture?.available) {
+    return `missing(${String(texture?.reason ?? 'not available').replace(/\s+/g, '-')})`;
+  }
+  const parts = [
+	    String(texture.platform ?? 'unknown'),
+	    String(texture.preferred_transport ?? 'unknown'),
+	    String(texture.handle_scope ?? 'unknown'),
+	    `${String(texture.color_space ?? 'unknown')}-${String(texture.storage_format ?? 'unknown')}`,
+	    `${Number(texture.width ?? 0)}x${Number(texture.height ?? 0)}`,
+	  ];
+  if (texture.shared_name) parts.push('named');
+  if (!outputTextureTransportOk(texture, expected)) parts.push('mismatch');
+  return parts.join('/');
+}
+
+function createRpcProcess() {
+  const child = spawn(bin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let nextId = 1;
+  let stdout = '';
+  let stderr = '';
+  const pending = new Map();
+
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+    let index = stdout.indexOf('\n');
+    while (index >= 0) {
+      const line = stdout.slice(0, index).trim();
+      stdout = stdout.slice(index + 1);
+      if (line) {
+        const message = JSON.parse(line);
+        const wait = pending.get(message.id);
+        if (wait) {
+          clearTimeout(wait.timer);
+          pending.delete(message.id);
+          if (message.ok) wait.resolve(message.result);
+          else wait.reject(new Error(message.error || `${wait.method} failed`));
+        }
+      }
+      index = stdout.indexOf('\n');
+    }
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+
+  const send = (method, params = {}, timeoutMs = 8000) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`native render-core timed out handling ${method}`));
+    }, timeoutMs);
+    pending.set(id, { resolve, reject, timer, method });
+    child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+  });
+
+  const close = async () => {
+    try {
+      await send('shutdown', {}, 1000);
+    } catch {
+      // Process may already be gone after a startup failure.
+    }
+    child.kill();
+    return stderr.trim();
+  };
+
+  return { send, close };
+}
+
+async function inspectCore() {
+  if (!existsSync(bin)) {
+    return { ok: false, detail: 'render-core binary missing' };
+  }
+  const rpc = createRpcProcess();
+  try {
+    const status = await rpc.send('start', {
+      config: {
+        backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+        width: 320,
+        height: 180,
+        target_fps: 30,
+      },
+    }, 12000);
+    const capabilities = await rpc.send('capabilities', {}, 5000);
+    const readiness = await rpc.send('readiness', {}, 5000);
+    const outputTexture = await rpc.send('output_shared_texture', {}, 5000);
+    const features = capabilities?.features ?? {};
+    const instruments = new Set(capabilities?.native_graph_instruments ?? []);
+    const expectedAudioLayout = readGhostAudioUniformLayout();
+    const audioLayoutOk = !!features.audio_uniform_layout &&
+      audioUniformLayoutMatches(capabilities?.audio_uniform_layout, expectedAudioLayout);
+    const missingFeatures = REQUIRED_FEATURES.filter((feature) => !features[feature]);
+    const missingInstruments = REQUIRED_GRAPH_INSTRUMENTS.filter((instrument) => !instruments.has(instrument));
+    const proxyFallbackDisabled = features.native_instrument_proxies === false;
+    const blockers = Array.isArray(readiness?.blockers) ? readiness.blockers : [];
+    const outputTransportOk = !features.shared_texture_output_export || outputTextureTransportOk(outputTexture);
+    const sourceFrameImportOk = sourceFrameSharedTextureImportOk(capabilities);
+    assertNativeCompositorManifest(capabilities);
+    await precompileNativeCompositorParityShaders(rpc);
+    const blendParity = await assertNativeCompositorBlendParity(rpc);
+    const effectParity = await assertNativeCompositorEffectParity(rpc);
+    const nativeEffectCoverage = readNativeEffectCoverage();
+    const blendParityChecksum = blendParity?.readbacks?.['native-compositor-blend-output']?.checksum;
+    const effectParityChecksum = effectParity?.readbacks?.['native-compositor-effect-output']?.checksum;
+    if (!blendParityChecksum || !effectParityChecksum) {
+      throw new Error(`native compositor parity probes returned no checksums: ${JSON.stringify({ blendParity, effectParity })}`);
+    }
+    const ok =
+      !!status?.backend_ready &&
+      audioLayoutOk &&
+      missingFeatures.length === 0 &&
+      missingInstruments.length === 0 &&
+      proxyFallbackDisabled &&
+      outputTransportOk &&
+      sourceFrameImportOk &&
+      blockers.length === 0;
+    return {
+      ok,
+      detail: [
+        `backend=${status?.backend ?? 'unknown'}`,
+        `adapter=${status?.adapter_name ?? 'unknown'}`,
+        `graphs=${instruments.size}/${REQUIRED_GRAPH_INSTRUMENTS.length}`,
+        `graphHost=${features.compute_graph_host ? 'on' : 'missing'}`,
+        `graphMultiRender=${features.compute_graph_multi_render ? 'on' : 'missing'}`,
+        `graphInstancing=${features.compute_graph_instanced_render ? 'on' : 'missing'}`,
+        `graphIndirect=${features.compute_graph_indirect_render ? 'on' : 'missing'}`,
+        `graphTextureSampling=${features.compute_graph_texture_sampling ? 'on' : 'missing'}`,
+        `graphDepth=${features.compute_graph_depth_render ? 'on' : 'missing'}`,
+        `graphLines=${features.compute_graph_line_render ? 'on' : 'missing'}`,
+        `graphClearColor=${features.compute_graph_clear_color ? 'on' : 'missing'}`,
+        `legacyProxy=${proxyFallbackDisabled ? 'off' : 'on'}`,
+        `audioLayout=${audioLayoutOk ? `v${expectedAudioLayout.schema_version}` : 'mismatch'}`,
+        `outputFormat=${status?.output_format ?? 'unknown'}`,
+        `outputMirror=${features.native_output_mirror_texture ? 'on' : 'missing'}`,
+        `frameExport=${features.native_frame_export ? 'on' : 'missing'}`,
+        `frameSequence=${features.native_frame_sequence_export ? 'on' : 'missing'}`,
+        `staticImageDecode=${features.native_static_image_decode ? 'native' : 'missing'}`,
+        `staticImagePrefetch=${features.native_static_image_prefetch ? 'native' : 'missing'}`,
+        `normalMediaDecode=${features.native_media_decode ? 'native' : features.native_static_image_decode ? 'static-native/video-native-pending' : 'missing'}`,
+        `videoFrameWindow=${features.native_video_frame_prefetch_window ? 'on' : 'pending'}`,
+        `mediaSourceClock=${features.native_media_source_playback_state ? 'on' : 'pending'}`,
+        `videoDecodePump=${features.native_video_decode_pump ? 'on' : 'pending'}`,
+        `pumpWindow=${features.native_video_decode_pump_window ? 'on' : 'pending'}`,
+        `liveSharedFrameImport=${sourceFrameSharedTextureImportDetail(capabilities)}`,
+        sourceFrameImportOk ? '' : 'sourceFrameSharedImportMismatch=1',
+        `fullMediaSharedTexture=${features.shared_texture_upload ? 'on' : 'pending'}`,
+        `compositorParity=${COMPOSITOR_BLEND_MODES.length}b/${COMPOSITOR_EFFECTS.length}fx`,
+        `effectCoverage=${nativeEffectCoverage.nativePublicEffectCount}/${nativeEffectCoverage.publicEffectCount}`,
+        `effectCoverageMissing=${nativeEffectCoverage.missingPublicEffectCount}`,
+        `effectPassCoverage=${nativeEffectCoverage.nativeSourceFramePassEffectCount}/${nativeEffectCoverage.sourceFramePassEligibleEffectCount}`,
+        `effectPassMissing=${nativeEffectCoverage.missingSourceFramePassEffectCount}`,
+        nativeEffectCoverage.deferredNativeGraphEffectCount ? `deferredGraphEffects=${nativeEffectCoverage.deferredNativeGraphEffectTypes.join(',')}` : '',
+        nativeEffectCoverage.nativeOnlyPassCount ? `nativeOnlyEffectPasses=${nativeEffectCoverage.nativeOnlyPassIds.join(',')}` : '',
+        nativeEffectCoverage.missingSample ? `effectPassNext=${nativeEffectCoverage.missingSample}` : '',
+        `blendParity=${blendParityChecksum}`,
+        `effectParity=${effectParityChecksum}`,
+	        `outputSharedTexture=${features.shared_texture_output_export ? 'on' : 'pending'}`,
+	        `outputTransport=${outputTextureTransportDetail(outputTexture)}`,
+	        `editorPreview=${editorPreviewDetail(capabilities)}`,
+	        `nativeShareSender=${directCoreNativeShareSenderState(features)}`,
+        outputTransportOk ? '' : 'outputTransportMismatch=1',
+        missingFeatures.length ? `missingFeatures=${missingFeatures.join(',')}` : '',
+        missingInstruments.length ? `missingGraphs=${missingInstruments.join(',')}` : '',
+        proxyFallbackDisabled ? '' : 'legacyProxy=enabled',
+        blockers.length ? `blockers=${blockers.join('|')}` : '',
+      ].filter(Boolean).join(' '),
+    };
+  } finally {
+    await rpc.close();
+  }
+}
+
+async function inspectAppBridge() {
+  if (!existsSync(bin)) {
+    return { ok: false, detail: 'render-core binary missing' };
+  }
+  const fullNativeExpected = process.platform === 'darwin' || process.platform === 'win32';
+  const outputExportExpected = fullNativeExpected;
+  const broker = createNativeRendererBroker({
+    appRoot: root,
+    resourcesPath: null,
+    isPackaged: false,
+    platform: process.platform,
+    env: process.env,
+    // Reports what the platform's texture-share sender is CAPABLE of, which is
+    // what the readiness contract asks for (nativeOutputCapable || nativeOutputActive);
+    // nothing is emitting frames in a headless probe, so nativeOutputActive stays false.
+    // This previously hardcoded non-darwin as unavailable, which was written before
+    // Spout was wired and has been reporting a phantom blocker on Windows ever since.
+    textureShareStatusProvider: () => {
+      const isMac = process.platform === 'darwin';
+      const capable = isMac || process.platform === 'win32';
+      return {
+        platform: isMac ? 'syphon' : 'spout',
+        label: isMac ? 'Syphon' : 'Spout',
+        available: capable,
+        error: capable ? null : 'native texture-share sender bridge is pending on this platform',
+        nativeOutputCapable: capable,
+        nativeOutputActive: false,
+        senderMode: isMac
+          ? 'native-iosurface-capable'
+          : capable ? 'native-shared-texture-capable' : 'native-texture-share-pending',
+      };
+    },
+    nativeFrameEncoderStatusProvider: () => ({
+      available: true,
+      activeSessions: 0,
+      jpegActiveSessions: 0,
+      mp4ActiveSessions: 0,
+      encoder: 'ffmpeg',
+    }),
+  });
+
+  try {
+    const status = await broker.invoke('native_renderer_start', {
+      config: {
+        backend: process.platform === 'darwin' ? 'metal' : process.platform === 'win32' ? 'd3d12' : 'vulkan',
+        width: 320,
+        height: 180,
+        target_fps: 30,
+      },
+    });
+    const capabilities = await broker.invoke('native_renderer_get_capabilities');
+    const decodeCapabilities = await broker.invoke('native_renderer_get_decode_capabilities');
+    const readiness = await broker.invoke('native_renderer_get_readiness_report');
+    const outputTexture = await broker.invoke('native_renderer_get_output_shared_texture');
+    const features = capabilities?.features ?? {};
+    const expectedAudioLayout = readGhostAudioUniformLayout();
+    const audioLayoutOk = !!features.audio_uniform_layout &&
+      audioUniformLayoutMatches(capabilities?.audio_uniform_layout, expectedAudioLayout);
+    const effectPassDescriptors = Array.isArray(capabilities?.native_effect_pass_descriptors)
+      ? capabilities.native_effect_pass_descriptors
+      : [];
+    const expectedEffectPassDescriptors = readNativeEffectPassManifest();
+    const nativeEffectCoverage = readNativeEffectCoverage();
+    const effectPassCodes = new Map(effectPassDescriptors.map((entry) => [String(entry?.id ?? ''), Number(entry?.code)]));
+    const effectPassManifestOk = !!(
+      features.native_effect_pass_manifest &&
+      effectPassDescriptors.length === expectedEffectPassDescriptors.length &&
+      expectedEffectPassDescriptors.every((entry) => effectPassCodes.get(entry.id) === entry.code)
+    );
+    const checks = new Map((readiness?.checks ?? []).map((check) => [check?.id, check]));
+    const directSharedRpc = capabilities?.implemented_methods?.includes('upload_source_gpu_shared_texture');
+    const nativeOutputDriverReady = !!(
+      checks.get('native-output-driver')?.ok &&
+      readiness?.modes?.output_driver?.ok
+    );
+    const fullV2Ready = !!readiness?.modes?.full_v2?.ok;
+    const fullV2Blockers = readiness?.modes?.full_v2?.blockers ?? [];
+    const fullV2BlockerDetail = formatBlockers(fullV2Blockers);
+    // The doctor drives the broker headlessly — it constructs no BrowserWindow,
+    // so no editor-preview presenter can attach or present a frame, and the
+    // readiness contract requires framesPresented > 0. That blocker describes
+    // this harness, not the build, and it is unreachable on every platform.
+    // Verify the presenter in the running app instead: the renderer status line
+    // reports previewAttached=true previewMode=shared-texture-import-blit.
+    // Every other full-v2 blocker is still fatal here.
+    const HEADLESS_ONLY_FULL_V2_BLOCKERS = new Set([
+      'editor preview presenter is not production zero-copy',
+    ]);
+    const fatalFullV2Blockers = fullV2Blockers
+      .map((blocker) => String(blocker || '').replace(/\s+/g, ' ').trim())
+      .filter((blocker) => blocker && !HEADLESS_ONLY_FULL_V2_BLOCKERS.has(blocker));
+    const fullV2OkHeadless = fullV2Ready || fatalFullV2Blockers.length === 0;
+    const outputTransportOk = !outputExportExpected || outputTextureTransportOk(outputTexture);
+    const sourceFrameImportOk = sourceFrameSharedTextureImportOk(capabilities);
+    const ok =
+      !!status?.backend_ready &&
+      !!features.shared_texture_output_export === outputExportExpected &&
+      !!features.native_texture_share_sender === outputExportExpected &&
+      outputTransportOk &&
+      !!features.native_mp4_frame_encoder &&
+      !!features.native_recording &&
+      audioLayoutOk &&
+      effectPassManifestOk &&
+      sourceFrameImportOk &&
+      nativeOutputDriverReady &&
+      fullV2OkHeadless === fullNativeExpected &&
+      !!checks.get('native-texture-share-sender')?.ok === outputExportExpected &&
+      !!checks.get('native-mp4-frame-encoder')?.ok &&
+      !!directSharedRpc;
+    return {
+      ok,
+      detail: [
+        `bridge=${process.platform === 'darwin' ? 'Syphon' : process.platform === 'win32' ? 'Spout' : 'unsupported'}`,
+        `outputFormat=${status?.output_format ?? 'unknown'}`,
+        `decodeBackend=${status?.decode_backend ?? 'unknown'}`,
+	        `outputSharedTexture=${features.shared_texture_output_export ? 'on' : 'pending'}`,
+	        `outputTransport=${outputTextureTransportDetail(outputTexture)}`,
+	        `editorPreview=${editorPreviewDetail(capabilities)}`,
+	        outputTransportOk ? '' : 'outputTransportMismatch=1',
+        `nativeShareSender=${features.native_texture_share_sender ? 'on' : 'pending'}`,
+        `nativeMp4Encoder=${features.native_mp4_frame_encoder ? 'on' : 'missing'}`,
+        `audioLayout=${audioLayoutOk ? `v${expectedAudioLayout.schema_version}` : 'mismatch'}`,
+        `effectPass=${features.native_effect_pass_manifest ? `${effectPassDescriptors.length}fx` : 'pending'}`,
+        effectPassManifestOk ? '' : `effectPassExpected=${expectedEffectPassDescriptors.length}fx`,
+        `effectCoverage=${nativeEffectCoverage.nativePublicEffectCount}/${nativeEffectCoverage.publicEffectCount}`,
+        `effectCoverageMissing=${nativeEffectCoverage.missingPublicEffectCount}`,
+        `effectPassCoverage=${nativeEffectCoverage.nativeSourceFramePassEffectCount}/${nativeEffectCoverage.sourceFramePassEligibleEffectCount}`,
+        `effectPassMissing=${nativeEffectCoverage.missingSourceFramePassEffectCount}`,
+        nativeEffectCoverage.deferredNativeGraphEffectCount ? `deferredGraphEffects=${nativeEffectCoverage.deferredNativeGraphEffectTypes.join(',')}` : '',
+        nativeEffectCoverage.nativeOnlyPassCount ? `nativeOnlyEffectPasses=${nativeEffectCoverage.nativeOnlyPassIds.join(',')}` : '',
+        nativeEffectCoverage.missingSample ? `effectPassNext=${nativeEffectCoverage.missingSample}` : '',
+        `frameExport=${features.native_frame_export ? 'on' : 'missing'}`,
+        `shadowMode=${readiness?.modes?.shadow?.ok ? 'on' : 'pending'}`,
+        `outputDriver=${nativeOutputDriverReady ? 'on' : 'pending'}`,
+        `outputActive=${readiness?.modes?.output_active?.ok ? 'on' : 'idle'}`,
+        `fullV2Required=${fullNativeExpected ? 'yes' : 'no'}`,
+        `fullV2=${fullV2Ready
+          ? 'ready'
+          : fatalFullV2Blockers.length === 0
+            ? `ready-except-headless(${fullV2Blockers.length})`
+            : `pending(${fatalFullV2Blockers.length})`}`,
+        fullV2BlockerDetail ? `fullV2Blockers="${fullV2BlockerDetail}"` : '',
+        `stage3dSceneIngest=${features.native_stage3d_scene_ingest ? 'on' : 'pending'}`,
+        `stage3dOverlayPreview=${features.native_stage3d_overlay_preview ? 'on' : 'pending'}`,
+        `stage3dMeshPreview=${features.native_stage3d_mesh_preview ? 'on' : 'pending'}`,
+        `stage3dTexturedMeshPreview=${features.native_stage3d_textured_mesh_preview ? 'on' : 'pending'}`,
+        `stage3dPrimitiveMeshes=${features.native_stage3d_primitive_meshes ? 'on' : 'pending'}`,
+        `stage3dTransforms=${features.native_stage3d_xyz_mesh_transforms ? 'xyz' : 'pending'}`,
+        `stage3dLighting=${features.native_stage3d_lighting_preview ? 'on' : 'pending'}`,
+        `stage3dRenderer=${features.native_stage3d_output_renderer ? 'on' : 'pending'}`,
+        `stage3dRecordingParity=${features.native_stage3d_recording_parity ? 'on' : 'pending'}`,
+        `projectionSceneIngest=${features.native_projection_sim_scene_ingest ? 'on' : 'pending'}`,
+        `projectionOverlayPreview=${features.native_projection_sim_overlay_preview ? 'on' : 'pending'}`,
+        `projectionMeshPreview=${features.native_projection_sim_mesh_preview ? 'on' : 'pending'}`,
+        `projectionTexturedMeshPreview=${features.native_projection_sim_textured_mesh_preview ? 'on' : 'pending'}`,
+        `projectionTransforms=${features.native_projection_sim_xyz_mesh_transforms ? 'xyz' : 'pending'}`,
+        `projectionRenderer=${features.native_projection_sim_output_renderer ? 'on' : 'pending'}`,
+        `projectionRecordingParity=${features.native_projection_sim_recording_parity ? 'on' : 'pending'}`,
+        `staticImageDecode=${features.native_static_image_decode ? 'native' : 'missing'}`,
+        `staticImagePrefetch=${features.native_static_image_prefetch ? 'native' : 'missing'}`,
+        `normalMediaDecode=${features.native_media_decode ? 'native' : features.native_static_image_decode ? 'static-native/video-native-pending' : 'missing'}`,
+        `videoFramePrefetch=${decodeCapabilities?.native_video_frame_prefetch ? 'on' : 'pending'}`,
+        `videoFrameWindow=${decodeCapabilities?.native_video_frame_prefetch_window ? 'on' : 'pending'}`,
+        `mediaSourceClock=${features.native_media_source_playback_state ? 'on' : 'pending'}`,
+        `videoDecodePump=${decodeCapabilities?.native_video_decode_pump ? 'on' : 'pending'}`,
+        `pumpWindow=${decodeCapabilities?.native_video_decode_pump_window ? 'on' : 'pending'}`,
+        `liveSharedFrameImport=${sourceFrameSharedTextureImportDetail(capabilities)}`,
+        sourceFrameImportOk ? '' : 'sourceFrameSharedImportMismatch=1',
+        `directSharedTextureRpc=${directSharedRpc ? 'on' : 'missing'}`,
+        `textureShareCheck=${checks.get('native-texture-share-sender')?.ok ? 'on' : 'pending'}`,
+        `recordingCheck=${checks.get('native-mp4-frame-encoder')?.ok ? 'on' : 'pending'}`,
+      ].filter(Boolean).join(' '),
+    };
+  } finally {
+    await broker.invoke('native_renderer_stop').catch(() => {});
+    broker.shutdownSync();
+  }
+}
+
+const cargo = check('cargo', ['--version']);
+const rustc = check('rustc', ['--version']);
+const binary = existsSync(bin);
+
+console.log('Ghost Native Renderer Doctor');
+console.log(`cargo: ${cargo.ok ? 'ok' : 'missing'} ${cargo.detail}`);
+console.log(`rustc: ${rustc.ok ? 'ok' : 'missing'} ${rustc.detail}`);
+console.log(`render-core binary: ${binary ? 'ok' : 'missing'} ${bin}`);
+
+let core = { ok: false, detail: 'skipped' };
+let appBridge = { ok: false, detail: 'skipped' };
+if (binary) {
+  try {
+    core = await inspectCore();
+  } catch (err) {
+    core = { ok: false, detail: err?.message || String(err) };
+  }
+  console.log(`render-core capability/readiness: ${core.ok ? 'ok' : 'failed'} ${core.detail}`);
+
+  try {
+    appBridge = await inspectAppBridge();
+  } catch (err) {
+    appBridge = { ok: false, detail: err?.message || String(err) };
+  }
+  console.log(`electron bridge capability/readiness: ${appBridge.ok ? 'ok' : 'failed'} ${appBridge.detail}`);
+}
+
+if (!cargo.ok || !rustc.ok || !binary || !core.ok || !appBridge.ok) process.exitCode = 1;

@@ -16,9 +16,16 @@
    * can drive the wet/dry mix directly.
    */
   import { macros, type Macro } from '../stores/macros';
+  import { macroTargetAvailable, type MacroAssignment } from '../stores/macroAssignments';
+  import { vjClipLauncher } from '../stores/vjClipLauncher';
+  import { project } from '../stores/layers';
+  import { nativeEffectChainWarning } from '../renderer/nativeEffectChainPolicy';
+  import CubeLutControls from './CubeLutControls.svelte';
   import EffectPickerModal from './EffectPickerModal.svelte';
   import { effectParamLabels, type ParamMeta } from '../effects/effectUX';
   import { EFFECT_CATALOG } from '../effects/effectCatalog';
+  import { isNativeSelectableEffect } from '../renderer/nativeEffectCoverage';
+  import { NATIVE_ENGINE_ONLY, settings } from '../stores/settings';
   import type { EffectType, Effect, EffectParams } from '../types';
 
   // Drag state — track which knob is being dragged + start position.
@@ -48,6 +55,37 @@
   // Inline name-edit state.
   let renamingId: string | null = null;
   let renameDraft = '';
+  $: nativeInventoryLocked = NATIVE_ENGINE_ONLY && Boolean($settings.experimental?.outputNativeCore);
+
+  $: chainWarning = nativeInventoryLocked ? nativeEffectChainWarning([
+    ...($project.mappingComposition?.enabled ? $project.mappingComposition.effects ?? [] : []),
+    ...$macros.macros.filter(macro => macro.value > 0.001).flatMap(macro => macro.effects ?? []),
+  ]) : null;
+
+  function knobKey(event: KeyboardEvent, macro: Macro) {
+    const step = event.shiftKey ? 0.001 : 0.01;
+    const changes: Record<string, number> = { ArrowUp: step, ArrowRight: step, ArrowDown: -step, ArrowLeft: -step };
+    if (event.key === 'Home' || event.key === 'End' || event.key in changes) {
+      event.preventDefault();
+      macros.setMacroValue(macro.id, event.key === 'Home' ? 0 : event.key === 'End' ? 1 : macro.value + changes[event.key]);
+    }
+  }
+
+  function setAssignmentRange(macroId: string, assignment: MacroAssignment, field: 'from' | 'to', event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const value = input.valueAsNumber;
+    if (!Number.isFinite(value)) { input.value = String(assignment[field]); return; }
+    macros.assignParameter(macroId, { ...assignment, [field]: value });
+  }
+
+  function nativeEffectPending(effectType: EffectType | string): boolean {
+    return nativeInventoryLocked && !isNativeSelectableEffect(effectType);
+  }
+
+  function toggleMacroEffectIfNativeReady(macroId: string, fx: Effect) {
+    if (nativeEffectPending(fx.type) && !fx.enabled) return;
+    macros.toggleEffect(macroId, fx.id);
+  }
 
   // Cache: effect type → human label (from EFFECT_CATALOG). Falls back to
   // the type string if no entry. Used in the effect-row title.
@@ -160,16 +198,24 @@
 
 <svelte:window onclick={onWindowClick} />
 
-<div class="macro-bar">
+<div data-help-page="macros-snapshots" class="macro-bar">
   {#each $macros.macros as m (m.id)}
     {@const fxCount = m.effects.length}
+    {@const assignmentCount = m.assignments?.length ?? 0}
     {@const enabledFxCount = m.effects.filter(e => e.enabled).length}
     <div
       class="macro-slot"
-      title="{m.name} — {enabledFxCount}/{fxCount} effect{fxCount === 1 ? '' : 's'} · drag vertically · right-click to edit"
+      title="{m.name} — {enabledFxCount}/{fxCount} effect{fxCount === 1 ? '' : 's'} · {m.assignments?.length ?? 0} parameters · drag vertically · right-click to edit"
     >
       <button
         class="macro-knob"
+        role="slider"
+        aria-label={`Macro ${m.name}`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(m.value * 100)}
+        aria-valuetext={`${Math.round(m.value * 100)} percent; ${assignmentCount} parameter assignments`}
+        onkeydown={(event) => knobKey(event, m)}
         style="--macro-color: {m.color}"
         onpointerdown={(e) => knobStartDrag(e, m)}
         onpointermove={(e) => knobOnPointerMove(e, m)}
@@ -201,8 +247,8 @@
           style="transform: rotate({-135 + m.value * 270}deg)"
           aria-hidden="true"
         ></span>
-        {#if fxCount > 0}
-          <span class="macro-dest-count" style="--macro-color: {m.color}" title="{enabledFxCount} of {fxCount} effects enabled">{fxCount}</span>
+        {#if fxCount + assignmentCount > 0}
+          <span class="macro-dest-count" style="--macro-color: {m.color}" title="{assignmentCount} parameter assignments · {enabledFxCount} of {fxCount} effects enabled">{fxCount + assignmentCount}</span>
         {/if}
       </button>
 
@@ -226,10 +272,14 @@
   {/each}
 </div>
 
+{#if chainWarning}
+  <div data-help-page="macros-snapshots" class="macro-chain-warning" role="status">Output effects: {chainWarning}</div>
+{/if}
+
 {#if editPopoverFor}
   {@const m = $macros.macros.find(x => x.id === editPopoverFor)}
   {#if m}
-    <div class="macro-popover" bind:this={popoverEl} style="left:{popoverX}px;top:{popoverY}px">
+    <div data-help-page="macros-snapshots" class="macro-popover" bind:this={popoverEl} style="left:{popoverX}px;top:{popoverY}px">
       <div class="macro-popover-head">
         <input
           class="macro-popover-name"
@@ -244,6 +294,26 @@
           title="Knob color"
         />
         <button class="macro-popover-close" onclick={closePopover} title="Close">×</button>
+      </div>
+
+      <div class="macro-popover-section">
+        <div class="macro-popover-section-title">PARAMETER ASSIGNMENTS</div>
+        {#if !m.assignments?.length}
+          <div class="macro-assignment-hint">Choose this macro beside an effect parameter to connect it.</div>
+        {/if}
+        {#each m.assignments ?? [] as assignment}
+          {@const available = macroTargetAvailable(assignment.target, $project, $vjClipLauncher)}
+          <div class="macro-assignment" class:unavailable={!available}>
+            <span title={assignment.label}>{assignment.label}</span>
+            {#if !available}<div class="macro-assignment-missing">Target unavailable — assignment retained</div>{/if}
+            <div class="macro-assignment-range">
+              <label>Start <input type="number" aria-label={`${assignment.label} start`} min={assignment.min} max={assignment.max} step="any" value={assignment.from} onchange={(e) => setAssignmentRange(m.id, assignment, 'from', e)} /></label>
+              <label>End <input type="number" aria-label={`${assignment.label} end`} min={assignment.min} max={assignment.max} step="any" value={assignment.to} onchange={(e) => setAssignmentRange(m.id, assignment, 'to', e)} /></label>
+              <button title="Invert range" onclick={() => macros.assignParameter(m.id, { ...assignment, from: assignment.to, to: assignment.from })}>⇄</button>
+              <button title="Remove assignment" onclick={() => macros.unassignParameter(assignment.target)}>×</button>
+            </div>
+          </div>
+        {/each}
       </div>
 
       <!-- Beat-pulse: auto-cycle the macro value at a beat division.
@@ -317,9 +387,11 @@
             {#each m.effects as fx, fxIdx (fx.id)}
               {@const paramMetas = getParamMetas(fx.type)}
               {@const isExpanded = expandedFxId === fx.id}
+              {@const pendingNativeEffect = nativeEffectPending(fx.type)}
               <div
                 class="macro-fx-card"
                 class:disabled={!fx.enabled}
+                class:native-pending={pendingNativeEffect}
                 class:dragging={dragEffectIdx === fxIdx}
                 class:expanded={isExpanded}
                 ondragover={(e) => { e.preventDefault(); e.dataTransfer!.dropEffect = 'move'; }}
@@ -350,8 +422,9 @@
                     }}
                   >⋮⋮</span>
                   <button class="macro-dest-toggle"
-                    title={fx.enabled ? 'Bypass this effect' : 'Enable this effect'}
-                    onclick={() => macros.toggleEffect(m.id, fx.id)}>
+                    disabled={pendingNativeEffect && !fx.enabled}
+                    title={pendingNativeEffect ? 'Pending native port' : (fx.enabled ? 'Bypass this effect' : 'Enable this effect')}
+                    onclick={() => toggleMacroEffectIfNativeReady(m.id, fx)}>
                     {fx.enabled ? '●' : '○'}
                   </button>
                   <button
@@ -390,6 +463,14 @@
                       <span>Effect</span>
                       <strong>{EFFECT_LABEL_BY_TYPE[fx.type] ?? fx.type}</strong>
                     </div>
+                    {#if pendingNativeEffect}
+                      <div class="native-effect-lockout">
+                        Pending native port. Disable or remove this effect before using the macro in native v2.
+                      </div>
+                    {/if}
+                    {#if fx.type === 'cubeLut'}
+                      <CubeLutControls lut={fx.params.cubeLut} contextKey={`macro:${m.id}:${fx.id}`} onChange={(cubeLut) => macros.updateEffectParams(m.id, fx.id, { cubeLut })} />
+                    {/if}
                     {#if paramMetas.length === 0}
                       <div class="macro-fx-params-empty">
                         This effect has no editable parameters — just toggle on/off
@@ -455,6 +536,24 @@
 />
 
 <style>
+  .macro-assignment-missing { color: #dcb67c; font-size: 10px; margin-bottom: 5px; }
+  .macro-assignment.unavailable { border-left: 2px solid #806437; padding-left: 6px; }
+  .macro-assignment-hint { font-size: 11px; color: #a4aab5; }
+  .macro-assignment { padding: 7px 0; font-size: 11px; }
+  .macro-assignment > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 5px; }
+  .macro-assignment-range { display: flex; align-items: center; gap: 6px; }
+  .macro-assignment-range label { display: flex; align-items: center; gap: 4px; }
+  .macro-assignment-range input { width: 65px; min-width: 0; padding: 4px; border-radius: 5px; background: #11151c; color: #dce6fa; border: 1px solid #344467; }
+  .macro-assignment-range button { border: 1px solid #344467; border-radius: 5px; background: #172747; color: #dce6fa; cursor: pointer; }
+
+  .macro-chain-warning {
+    font-size: 11px;
+    color: #e4ba7b;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: #221d15;
+  }
+
   .macro-bar {
     display: inline-flex;
     align-items: center;
@@ -677,6 +776,10 @@
   }
   .macro-fx-card:hover { border-color: rgba(255, 255, 255, 0.12); }
   .macro-fx-card.disabled { opacity: 0.45; }
+  .macro-fx-card.native-pending {
+    border-color: rgba(255, 170, 64, 0.32);
+    background: rgba(255, 170, 64, 0.045);
+  }
   .macro-fx-card.dragging { opacity: 0.55; background: rgba(187, 134, 252, 0.06); border-color: rgba(187, 134, 252, 0.4); }
   .macro-fx-card.expanded { background: rgba(255, 255, 255, 0.045); border-color: rgba(187, 134, 252, 0.35); }
   .macro-fx-row {
@@ -799,7 +902,7 @@
   }
   .macro-fx-param-value {
     font-size: 13px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     color: #BB86FC;
     text-align: right;
     user-select: none;
@@ -824,6 +927,9 @@
   }
   .macro-fx-handle:active { cursor: grabbing; }
   .macro-fx-meta {
+    /* Real flex-basis, not 0 — the skin's global range styling forces
+       width:100% !important on the opacity slider, and with a 0 basis here
+       the name column collapsed to nothing, hiding the effect name. */
     flex: 1 1 150px;
     min-width: 0;
     display: flex;
@@ -846,9 +952,38 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .native-effect-badge {
+    flex: 0 0 auto;
+    border: 1px solid rgba(88, 231, 255, 0.38);
+    background: rgba(88, 231, 255, 0.08);
+    color: #58e7ff;
+    border-radius: 3px;
+    padding: 2px 5px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    line-height: 1;
+  }
+  .native-effect-badge.pending {
+    border-color: rgba(255, 170, 64, 0.42);
+    background: rgba(255, 170, 64, 0.1);
+    color: #ffb85f;
+  }
+  .native-effect-lockout {
+    border: 1px solid rgba(255, 170, 64, 0.28);
+    background: rgba(255, 170, 64, 0.08);
+    color: #ffcf91;
+    border-radius: 4px;
+    padding: 7px 8px;
+    margin-bottom: 7px;
+    font-size: 11px;
+    line-height: 1.35;
+  }
   .macro-fx-opacity {
-    width: 110px;
+    /* flex-basis pins the used size even against the skin's
+       `width: 100% !important` on range inputs. */
     flex: 0 0 110px;
+    width: 110px;
     height: 4px;
     -webkit-appearance: none;
     appearance: none;
@@ -976,7 +1111,7 @@
     white-space: nowrap;
   }
   .macro-dest-path {
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 12px;
     color: #666;
     overflow: hidden;
@@ -1001,7 +1136,7 @@
     font-size: 13px;
     padding: 2px 4px;
     border-radius: 3px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
   }
   .macro-dest-remove {
     background: none;
@@ -1086,7 +1221,7 @@
 
   :global(html[data-theme="arcade"]) .macro-name {
     color: rgba(238, 240, 244, 0.50);
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     letter-spacing: 0.04em;
   }
 

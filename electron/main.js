@@ -13,7 +13,7 @@
  * No pixels touch CPU memory in the send path.
  */
 
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, net as electronNet, powerSaveBlocker, protocol, screen, session, shell, utilityProcess } from 'electron';
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, net as electronNet, powerSaveBlocker, protocol, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, fork, execSync } from 'child_process';
@@ -21,12 +21,93 @@ import { createRequire } from 'module';
 import fs from 'fs';
 import net from 'net';
 import dgram from 'dgram';
+import { createNativeRendererBroker, nativeRendererCommandNames } from './native-renderer-broker.js';
+import {
+  nativePreviewGeometryMatches,
+  nativePreviewRectSignature,
+  nativePreviewRectToDevicePixels,
+  normalizeNativePreviewRect,
+} from './native-preview-geometry.js';
+import { createJsSourceHost, JS_SOURCE_SCHEME } from './js-source-host.js';
 // License system removed in OSS build — see src/lib/stores/license.ts.
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
-const { parseOSCPacket } = require('./osc-parser.cjs');
+const { parseOSCPacket, encodeOSCMessage } = require('./osc-parser.cjs');
+const { randomUUID } = require('crypto');
+
+// Development runs can use a throwaway profile, so a test boot never shares
+// Local Storage (and the project autosave kept there) or the single-instance
+// lock with an installed copy that is open at the same time.
+if (!app.isPackaged && process.env.GA_USER_DATA_DIR) {
+  app.setPath('userData', process.env.GA_USER_DATA_DIR);
+}
+
+// Start-at-boot / show mode (electron/show-startup.cjs). Created after the
+// userData override so a test profile keeps its own config. The session
+// query is synchronous: the renderer needs to know whether to suppress its
+// first-run prompts before its first frame.
+const { createShowStartup } = require('./show-startup.cjs');
+const showStartup = createShowStartup({ app });
+ipcMain.on('show_startup_session', (event) => {
+  try { event.returnValue = showStartup.get(); } catch { event.returnValue = null; }
+});
+ipcMain.handle('show_startup_get', () => showStartup.get());
+ipcMain.handle('show_startup_set', (_, patch) => showStartup.set(patch));
+
+// PJLink passwords live here, encrypted with safeStorage, never in project
+// files and never sent back to the renderer (electron/pjlink-credentials.cjs).
+const { createPjlinkClient } = require('./pjlink.cjs');
+const { createPjlinkCredentials } = require('./pjlink-credentials.cjs');
+const pjlinkCredentials = createPjlinkCredentials({ safeStorage, dir: app.getPath('userData') });
+const pjlinkClient = createPjlinkClient({ credentials: pjlinkCredentials });
+
+// Debug: measure main-thread event-loop lag (see main-lag-probe.js). Loaded
+// lazily so normal runs pay nothing for it.
+if (process.env.GA_MAIN_LAG_PROBE === '1') {
+  import('./main-lag-probe.js')
+    .then(({ startMainLagProbe }) => startMainLagProbe({
+      extras: {
+        BrowserWindow,
+        screen,
+        nativePreviewStatus: () => nativePreviewAddon?.status?.() ?? null,
+      },
+    }))
+    .catch(err => console.warn('[MainLag] probe failed to start:', err?.message || err));
+}
+const nativeRendererBroker = createNativeRendererBroker({
+  appRoot: path.join(__dirname, '..'),
+  resourcesPath: process.resourcesPath,
+  isPackaged: app.isPackaged,
+  platform: process.platform,
+  env: process.env,
+  textureShareStatusProvider: () => {
+    loadSpoutAddon();
+    return {
+      ...getTextureShareLoadStatus(),
+      senderMode: getTextureShareSenderMode(),
+      osrActive,
+      osrFailureReason,
+    };
+  },
+  nativeEditorPreviewStatusProvider: () => getNativePreviewStatus(),
+  nativeFrameEncoderStatusProvider: () => getNativeFrameEncoderStatus(),
+  sharedTextureHandlePreparer: prepareSharedTextureHandlesForNativeCore,
+});
+
+// three.js / p5.js media sources render in offscreen windows and send their
+// frames to the core through the broker above (see js-source-host.js).
+const jsSourceHost = createJsSourceHost({
+  broker: nativeRendererBroker,
+  libDir: app.isPackaged
+    ? path.join(__dirname, '..', 'dist', 'lib')
+    : path.join(__dirname, '..', 'public', 'lib'),
+  // A production dependency, so it ships inside the app package as well.
+  threeDir: path.join(__dirname, '..', 'node_modules', 'three'),
+  preloadPath: path.join(__dirname, 'js-source-preload.cjs'),
+  isPackaged: app.isPackaged,
+});
 
 // Force Chromium to use the discrete GPU (NVIDIA/AMD) on Optimus laptops.
 // Must be set before app.whenReady() — affects the GPU process.
@@ -61,9 +142,28 @@ if (PROJECTION_SAFE_MODE) {
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 // Disable pinch-to-zoom at the browser level (we handle zoom ourselves)
 app.commandLine.appendSwitch('disable-pinch');
-// Force high DPI support — ensures CSS pixels match layout pixels
+// High-DPI. `high-dpi-support` stays on; the forced device scale factor does
+// not.
+//
+// force-device-scale-factor=1 made Chromium ignore the OS display scale
+// entirely. On macOS that is inert -- AppKit owns the backing scale, and the
+// app measures devicePixelRatio 2 on a Retina panel with overlays aligned. On
+// Windows it is not: display scaling IS the device scale factor there, so a
+// machine set to 150% or 200% got a UI drawn at 1x physical pixels. Reported
+// as "the whole interface was extremely tiny -- I could change my display
+// setting, but then everything else is changed", which is exactly the
+// workaround this forces on someone.
+//
+// It has been here since the v0.5.0 fork. The comment claimed it made CSS
+// pixels match layout pixels, but macOS already runs at 2x with warp handles
+// and the native preview underlay aligned, so the renderer does not depend on
+// a 1:1 ratio -- Canvas and the slice sync both read devicePixelRatio and
+// per-display scaleFactor directly.
+//
+// Windows is the platform this changes, and the things to watch there are
+// overlay alignment: warp handles, mapping-mode drag hit-testing, and the
+// preview underlay tracking the DOM canvas.
 app.commandLine.appendSwitch('high-dpi-support', '1');
-app.commandLine.appendSwitch('force-device-scale-factor', '1');
 
 // Debug log to file (stdout doesn't always flush from background Electron)
 // In production, __dirname is inside the asar (read-only), so write to %LOCALAPPDATA%
@@ -138,6 +238,8 @@ console.log(`[Main] Projection safe mode=${PROJECTION_SAFE_MODE} experimentalGpu
 
 let powerSaveBlockerId = null;
 
+// Keep the display awake for the entire app lifetime — projection rigs
+// must never fall into display sleep / screensaver mid-show.
 function startPowerSaveBlocker() {
   if (powerSaveBlockerId !== null && powerSaveBlocker.isStarted(powerSaveBlockerId)) return;
   powerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep');
@@ -222,6 +324,16 @@ protocol.registerSchemesAsPrivileged([
       bypassCSP: true,
     },
   },
+  {
+    // Origin for the pages the three.js / p5.js source hosts serve.
+    scheme: JS_SOURCE_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+    },
+  },
 ]);
 
 // ============================================================
@@ -247,9 +359,38 @@ let pendingOutputWindowConfig = null;
 let pendingOutputWindowConfigTimer = null;
 let sidecarProcess = null;
 let embeddedServerModule = null;
+const { buildWLEDRealtimePacket } = require('./wled-packet.cjs');
 const wledSockets = new Map();  // controllerId -> dgram.Socket
+const { createPixelMapOutput } = require('./pixelmap-output.cjs');
+// Art-Net / sACN pixel mapping. One socket for every fixture and node.
+const pixelMapOutput = createPixelMapOutput({ dgram });
+const { createDmxInput } = require('./dmx-input.cjs');
+const os = require('os');
+// Art-Net / sACN DMX input. Off until the renderer starts it (opt-in).
+const dmxInput = createDmxInput({
+  dgram,
+  onChanges: (batch) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('dmx-input-changes', batch);
+  },
+  onStatus: (status) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('dmx-input-status', status);
+  },
+  // Pixel-map output to a node on this machine, or broadcast, would
+  // otherwise come straight back in as desk input.
+  listInterfaces: () => Object.entries(os.networkInterfaces()).flatMap(([name, list]) => (list || [])
+    .filter(item => item.family === 'IPv4' || item.family === 4)
+    .map(item => ({ name, address: item.address }))),
+  isOwnPacket: (rinfo) => {
+    const port = pixelMapOutput.localPort();
+    if (!port || rinfo?.port !== port) return false;
+    if (rinfo.address === '127.0.0.1') return true;
+    return Object.values(os.networkInterfaces()).some(list => (list || []).some(item => item.address === rinfo.address));
+  },
+});
 let activeVideoConverterJob = null;
 const activeJpegSequenceJobs = new Map();
+const activeJpegFrameEncoderJobs = new Map();
+const activeMp4FrameEncoderJobs = new Map();
 const activeVideoLoopJobs = new Map();
 
 // Platform flags (used elsewhere in this file)
@@ -293,6 +434,25 @@ function resolveFfmpegPath() {
   }
 
   return isWin ? 'ffmpeg.exe' : 'ffmpeg';
+}
+
+function getNativeFrameEncoderStatus() {
+  let ffmpegPath = null;
+  let reason = null;
+  try {
+    ffmpegPath = resolveFfmpegPath();
+  } catch (err) {
+    reason = err?.message || String(err);
+  }
+  return {
+    available: !!ffmpegPath,
+    encoder: 'ffmpeg',
+    ffmpegPath,
+    activeSessions: activeJpegFrameEncoderJobs.size + activeMp4FrameEncoderJobs.size,
+    jpegActiveSessions: activeJpegFrameEncoderJobs.size,
+    mp4ActiveSessions: activeMp4FrameEncoderJobs.size,
+    reason,
+  };
 }
 
 function assertAbsolutePath(filePath, label = 'file path') {
@@ -345,7 +505,7 @@ function naturalCompare(a, b) {
 function listImageSequenceFrames(folderPath) {
   const folder = assertAbsolutePath(folderPath, 'sequence folder');
   if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
-    throw new Error('Choose a folder that contains JPG frames.');
+    throw new Error('Choose a folder that contains image frames.');
   }
 
   const exts = new Set(['.jpg', '.jpeg', '.png']);
@@ -387,6 +547,53 @@ function safeJpegSequenceBaseName(name) {
     .slice(0, 80) || 'render';
 }
 
+function normalizeRawVideoPixelFormat(value, fallback = 'rgba') {
+  const format = String(value || fallback).trim().toLowerCase();
+  if (format.includes('bgra')) return 'bgra';
+  if (format.includes('rgba')) return 'rgba';
+  throw new Error(`Unsupported raw video pixel format: ${value}`);
+}
+
+function crfForVideoQuality(quality) {
+  const q = String(quality || 'high').trim().toLowerCase();
+  if (q === 'archive') return '14';
+  if (q === 'web') return '23';
+  return '18';
+}
+
+function presetForVideoQuality(quality) {
+  const q = String(quality || 'high').trim().toLowerCase();
+  if (q === 'archive') return 'medium';
+  if (q === 'web') return 'veryfast';
+  return 'fast';
+}
+
+function createMp4FrameEncoderTempDir() {
+  return fs.mkdtempSync(path.join(app.getPath('temp'), 'ghost-native-mp4-'));
+}
+
+function writeEncoderStdin(job, buffer, frameIndex, label) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      job.process.stdin?.off?.('error', onError);
+      job.process.off?.('close', onClose);
+    };
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (err) reject(err);
+      else resolve();
+    };
+    const onError = (err) => finish(err);
+    const onClose = () => finish(new Error(`${label} encoder closed while writing frame ${frameIndex}.`));
+    job.process.stdin?.once?.('error', onError);
+    job.process.once?.('close', onClose);
+    job.process.stdin.write(buffer, (err) => finish(err));
+  });
+}
+
 function startJpegSequenceJob(args = {}) {
   const jobId = String(args.jobId || '').trim();
   if (!jobId) throw new Error('Missing JPEG sequence job id.');
@@ -403,6 +610,9 @@ function startJpegSequenceJob(args = {}) {
   if (!width || !height) throw new Error('Invalid JPEG sequence dimensions.');
 
   const baseName = safeJpegSequenceBaseName(args.baseName);
+  const pixelFormat = normalizeRawVideoPixelFormat(
+    args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format,
+  );
   const outputPattern = path.join(folderPath, `${baseName}_%06d.jpg`);
   const ffmpegPath = resolveFfmpegPath();
   const ffmpegArgs = [
@@ -410,7 +620,7 @@ function startJpegSequenceJob(args = {}) {
     '-loglevel', 'warning',
     '-y',
     '-f', 'rawvideo',
-    '-pix_fmt', 'rgba',
+    '-pix_fmt', pixelFormat,
     '-s:v', `${width}x${height}`,
     '-framerate', String(fps),
     '-i', 'pipe:0',
@@ -433,6 +643,7 @@ function startJpegSequenceJob(args = {}) {
     height,
     totalFrames,
     frameBytes: width * height * 4,
+    pixelFormat,
     writtenFrames: 0,
     stderr: '',
     settled: false,
@@ -464,6 +675,7 @@ function startJpegSequenceJob(args = {}) {
     jobId,
     outputPattern,
     ffmpegPath,
+    pixelFormat,
   };
 }
 
@@ -477,6 +689,10 @@ async function writeJpegSequenceFrame(args = {}) {
   const buffer = bytesToBuffer(args.bytes);
   if (buffer.byteLength !== job.frameBytes) {
     throw new Error(`JPEG sequence frame has ${buffer.byteLength} bytes; expected ${job.frameBytes}.`);
+  }
+  const framePixelFormat = args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format;
+  if (framePixelFormat && normalizeRawVideoPixelFormat(framePixelFormat) !== job.pixelFormat) {
+    throw new Error(`JPEG sequence pixel format mismatch: got ${framePixelFormat}, expected ${job.pixelFormat}.`);
   }
 
   const frameIndex = Math.round(clampNumber(args.frameIndex, 0, Number.MAX_SAFE_INTEGER, job.writtenFrames));
@@ -505,6 +721,60 @@ async function writeJpegSequenceFrame(args = {}) {
   });
 
   job.writtenFrames++;
+  return { success: true, writtenFrames: job.writtenFrames };
+}
+
+async function writeJpegSequenceFrameFile(args = {}) {
+  const jobId = String(args.jobId || '').trim();
+  const job = activeJpegSequenceJobs.get(jobId);
+  if (!job) throw new Error('JPEG sequence job is not active.');
+  if (job.settled) {
+    throw new Error(`JPEG sequence encoder exited early.${job.stderr ? ` ${job.stderr.trim()}` : ''}`);
+  }
+  const framePath = assertAbsolutePath(
+    args.path || args.filePath || args.rawPath || args.rgbaPath,
+    'JPEG sequence frame file',
+  );
+  const stat = fs.statSync(framePath);
+  if (!stat.isFile()) throw new Error('JPEG sequence frame path is not a file.');
+  if (stat.size !== job.frameBytes) {
+    throw new Error(`JPEG sequence frame file has ${stat.size} bytes; expected ${job.frameBytes}.`);
+  }
+  const framePixelFormat = args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format;
+  if (framePixelFormat && normalizeRawVideoPixelFormat(framePixelFormat) !== job.pixelFormat) {
+    throw new Error(`JPEG sequence frame file pixel format mismatch: got ${framePixelFormat}, expected ${job.pixelFormat}.`);
+  }
+
+  const frameIndex = Math.round(clampNumber(args.frameIndex, 0, Number.MAX_SAFE_INTEGER, job.writtenFrames));
+  if (frameIndex !== job.writtenFrames) {
+    throw new Error(`JPEG sequence frame order mismatch: got ${frameIndex}, expected ${job.writtenFrames}.`);
+  }
+
+  const buffer = fs.readFileSync(framePath);
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      job.process.stdin?.off?.('error', onError);
+      job.process.off?.('close', onClose);
+    };
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (err) reject(err);
+      else resolve();
+    };
+    const onError = (err) => finish(err);
+    const onClose = () => finish(new Error(`JPEG sequence encoder closed while writing frame ${frameIndex}.`));
+    job.process.stdin?.once?.('error', onError);
+    job.process.once?.('close', onClose);
+    job.process.stdin.write(buffer, (err) => finish(err));
+  });
+
+  job.writtenFrames++;
+  if (args.deleteAfterWrite || args.delete_after_write || args.delete) {
+    try { fs.unlinkSync(framePath); } catch { /* best-effort temp cleanup */ }
+  }
   return { success: true, writtenFrames: job.writtenFrames };
 }
 
@@ -558,23 +828,542 @@ async function cancelJpegSequenceJob(jobIdInput) {
   return { success: true };
 }
 
-function quoteFfconcatPath(filePath) {
-  const normalized = path.resolve(filePath).replace(/\\/g, '/');
-  return `'${normalized.replace(/'/g, "'\\''")}'`;
+function createJpegFrameEncoderTempDir() {
+  return fs.mkdtempSync(path.join(app.getPath('temp'), 'ghost-native-jpeg-'));
+}
+
+function extractNextJpegFrame(job) {
+  const soi = Buffer.from([0xff, 0xd8]);
+  const eoi = Buffer.from([0xff, 0xd9]);
+  let start = job.stdoutBuffer.indexOf(soi);
+  if (start < 0) {
+    if (job.stdoutBuffer.length > 1024 * 1024) {
+      job.stdoutBuffer = Buffer.alloc(0);
+    }
+    return null;
+  }
+  if (start > 0) {
+    job.stdoutBuffer = job.stdoutBuffer.subarray(start);
+    start = 0;
+  }
+  const end = job.stdoutBuffer.indexOf(eoi, start + 2);
+  if (end < 0) return null;
+  const jpeg = Buffer.from(job.stdoutBuffer.subarray(start, end + 2));
+  job.stdoutBuffer = job.stdoutBuffer.subarray(end + 2);
+  return jpeg;
+}
+
+function rejectPendingJpegFrameEncodes(job, error) {
+  while (job.pending.length > 0) {
+    const pending = job.pending.shift();
+    pending.reject(error);
+  }
+}
+
+function flushJpegFrameEncoderOutput(job) {
+  while (job.pending.length > 0) {
+    const jpeg = extractNextJpegFrame(job);
+    if (!jpeg) break;
+    const pending = job.pending.shift();
+    job.encodedFrames++;
+    pending.resolve(jpeg);
+  }
+}
+
+function startJpegFrameEncoderJob(args = {}) {
+  const jobId = String(args.jobId || '').trim();
+  if (!jobId) throw new Error('Missing JPEG frame encoder job id.');
+  if (activeJpegFrameEncoderJobs.has(jobId)) throw new Error('JPEG frame encoder job already exists.');
+
+  const width = Math.round(clampNumber(args.width, 1, 16384, 0));
+  const height = Math.round(clampNumber(args.height, 1, 16384, 0));
+  const fps = clampNumber(args.fps, 1, 240, 30);
+  const totalFrames = Math.round(clampNumber(args.totalFrames, 1, 10_000_000, 1));
+  if (!width || !height) throw new Error('Invalid JPEG frame encoder dimensions.');
+  const pixelFormat = normalizeRawVideoPixelFormat(
+    args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format,
+  );
+  const tempDir = createJpegFrameEncoderTempDir();
+  const ffmpegPath = resolveFfmpegPath();
+  const ffmpegArgs = [
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-f', 'rawvideo',
+    '-pix_fmt', pixelFormat,
+    '-s:v', `${width}x${height}`,
+    '-framerate', String(fps),
+    '-i', 'pipe:0',
+    '-frames:v', String(totalFrames),
+    '-c:v', 'mjpeg',
+    '-q:v', '2',
+    '-pix_fmt', 'yuvj444p',
+    '-f', 'image2pipe',
+    'pipe:1',
+  ];
+
+  const child = spawn(ffmpegPath, ffmpegArgs, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const job = {
+    id: jobId,
+    process: child,
+    tempDir,
+    width,
+    height,
+    totalFrames,
+    frameBytes: width * height * 4,
+    pixelFormat,
+    writtenFrames: 0,
+    encodedFrames: 0,
+    pending: [],
+    stdoutBuffer: Buffer.alloc(0),
+    stderr: '',
+    settled: false,
+    cancelled: false,
+    exitCode: null,
+    exitSignal: null,
+    exitPromise: null,
+  };
+
+  job.exitPromise = new Promise((resolve) => {
+    child.stdout?.on('data', (chunk) => {
+      job.stdoutBuffer = Buffer.concat([job.stdoutBuffer, Buffer.from(chunk)]);
+      flushJpegFrameEncoderOutput(job);
+    });
+    child.stderr?.setEncoding?.('utf8');
+    child.stderr?.on('data', (chunk) => {
+      job.stderr += String(chunk);
+      if (job.stderr.length > 12_000) job.stderr = job.stderr.slice(-12_000);
+    });
+    child.on('error', (err) => {
+      job.stderr += `\n${err?.message || err}`;
+      rejectPendingJpegFrameEncodes(job, err);
+    });
+    child.on('close', (code, signal) => {
+      job.settled = true;
+      job.exitCode = code;
+      job.exitSignal = signal;
+      if (job.pending.length > 0) {
+        const detail = job.stderr.trim() || `exit code ${code}${signal ? ` (${signal})` : ''}`;
+        rejectPendingJpegFrameEncodes(job, new Error(`JPEG frame encoder closed early: ${detail}`));
+      }
+      resolve({ code, signal });
+    });
+  });
+
+  activeJpegFrameEncoderJobs.set(jobId, job);
+  return {
+    jobId,
+    tempDir,
+    ffmpegPath,
+    pixelFormat,
+  };
+}
+
+async function encodeJpegFrameFromFile(args = {}) {
+  const jobId = String(args.jobId || '').trim();
+  const job = activeJpegFrameEncoderJobs.get(jobId);
+  if (!job) throw new Error('JPEG frame encoder job is not active.');
+  if (job.settled) {
+    throw new Error(`JPEG frame encoder exited early.${job.stderr ? ` ${job.stderr.trim()}` : ''}`);
+  }
+  const framePath = assertAbsolutePath(
+    args.path || args.filePath || args.rawPath || args.rgbaPath,
+    'JPEG frame encoder raw frame file',
+  );
+  const resolvedFramePath = path.resolve(framePath);
+  const resolvedTempDir = path.resolve(job.tempDir);
+  if (!resolvedFramePath.startsWith(`${resolvedTempDir}${path.sep}`)) {
+    throw new Error('JPEG frame encoder raw frame must live in its temp folder.');
+  }
+  const stat = fs.statSync(resolvedFramePath);
+  if (!stat.isFile()) throw new Error('JPEG frame encoder raw frame path is not a file.');
+  if (stat.size !== job.frameBytes) {
+    throw new Error(`JPEG frame encoder raw frame has ${stat.size} bytes; expected ${job.frameBytes}.`);
+  }
+  const framePixelFormat = args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format;
+  if (framePixelFormat && normalizeRawVideoPixelFormat(framePixelFormat) !== job.pixelFormat) {
+    throw new Error(`JPEG frame encoder pixel format mismatch: got ${framePixelFormat}, expected ${job.pixelFormat}.`);
+  }
+  const frameIndex = Math.round(clampNumber(args.frameIndex, 0, Number.MAX_SAFE_INTEGER, job.writtenFrames));
+  if (frameIndex !== job.writtenFrames) {
+    throw new Error(`JPEG frame encoder frame order mismatch: got ${frameIndex}, expected ${job.writtenFrames}.`);
+  }
+
+  const buffer = fs.readFileSync(resolvedFramePath);
+  let pendingRef = null;
+  const jpegPromise = new Promise((resolve, reject) => {
+    pendingRef = { resolve, reject };
+    job.pending.push(pendingRef);
+  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        job.process.stdin?.off?.('error', onError);
+        job.process.off?.('close', onClose);
+      };
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve();
+      };
+      const onError = (err) => finish(err);
+      const onClose = () => finish(new Error(`JPEG frame encoder closed while writing frame ${frameIndex}.`));
+      job.process.stdin?.once?.('error', onError);
+      job.process.once?.('close', onClose);
+      job.process.stdin.write(buffer, (err) => finish(err));
+    });
+  } catch (err) {
+    const index = job.pending.indexOf(pendingRef);
+    if (index >= 0) job.pending.splice(index, 1);
+    pendingRef?.reject?.(err);
+    await jpegPromise.catch(() => {});
+    throw err;
+  } finally {
+    if (args.deleteAfterWrite || args.delete_after_write || args.delete) {
+      try { fs.unlinkSync(resolvedFramePath); } catch { /* best-effort temp cleanup */ }
+    }
+  }
+
+  job.writtenFrames++;
+  const jpeg = await jpegPromise;
+  return { success: true, frameIndex, bytes: jpeg, byteLength: jpeg.byteLength };
+}
+
+async function finishJpegFrameEncoderJob(jobIdInput) {
+  const jobId = String(jobIdInput || '').trim();
+  const job = activeJpegFrameEncoderJobs.get(jobId);
+  if (!job) return { success: true, alreadyFinished: true };
+
+  try {
+    if (!job.process.stdin.destroyed && !job.process.stdin.writableEnded) {
+      job.process.stdin.end();
+    }
+  } catch { /* ignore */ }
+
+  const { code, signal } = await job.exitPromise;
+  activeJpegFrameEncoderJobs.delete(jobId);
+  try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+
+  if (job.cancelled) return { success: false, cancelled: true };
+  if (code !== 0) {
+    const detail = job.stderr.trim() || `exit code ${code}${signal ? ` (${signal})` : ''}`;
+    throw new Error(`JPEG frame encoder failed: ${detail}`);
+  }
+  if (job.writtenFrames !== job.totalFrames || job.encodedFrames !== job.totalFrames) {
+    throw new Error(`JPEG frame encoder ended after ${job.encodedFrames}/${job.writtenFrames} frames; expected ${job.totalFrames}.`);
+  }
+  return {
+    success: true,
+    frames: job.encodedFrames,
+  };
+}
+
+async function cancelJpegFrameEncoderJob(jobIdInput) {
+  const jobId = String(jobIdInput || '').trim();
+  const job = activeJpegFrameEncoderJobs.get(jobId);
+  if (!job) return { success: true };
+  job.cancelled = true;
+  rejectPendingJpegFrameEncodes(job, new Error('JPEG frame encoder was cancelled.'));
+  try {
+    job.process.stdin?.destroy?.();
+  } catch { /* ignore */ }
+  try {
+    job.process.kill('SIGTERM');
+  } catch { /* ignore */ }
+  try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  activeJpegFrameEncoderJobs.delete(jobId);
+  setTimeout(() => {
+    try { job.process.kill('SIGKILL'); } catch { /* ignore */ }
+  }, 1500).unref?.();
+  return { success: true };
+}
+
+function startMp4FrameEncoderJob(args = {}) {
+  const jobId = String(args.jobId || '').trim();
+  if (!jobId) throw new Error('Missing MP4 frame encoder job id.');
+  if (activeMp4FrameEncoderJobs.has(jobId)) throw new Error('MP4 frame encoder job already exists.');
+
+  const width = Math.round(clampNumber(args.width, 1, 16384, 0));
+  const height = Math.round(clampNumber(args.height, 1, 16384, 0));
+  const fps = clampNumber(args.fps, 1, 240, 30);
+  const requestedTotalFrames = Number(args.totalFrames);
+  const totalFrames = Number.isFinite(requestedTotalFrames) && requestedTotalFrames > 0
+    ? Math.round(clampNumber(requestedTotalFrames, 1, 10_000_000, 1))
+    : 0;
+  if (!width || !height) throw new Error('Invalid MP4 frame encoder dimensions.');
+  const pixelFormat = normalizeRawVideoPixelFormat(
+    args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format,
+  );
+  const quality = String(args.quality || 'high').trim().toLowerCase();
+  const { recordingCodec, recordingEncoderArgs } = require('./recording-formats.cjs');
+  const codec = recordingCodec(args.codec);
+  // Live fallback capture reads the program output unless the recorder
+  // asked for the record target or one Screen ("slice:<id>").
+  const captureSource = typeof args.captureSource === 'string'
+    && (args.captureSource === 'record_target' || /^slice:[^\s]+$/.test(args.captureSource))
+    ? args.captureSource : null;
+  const tempDir = createMp4FrameEncoderTempDir();
+  const requestedName = String(args.outputName || args.filename || 'Offline Render.mp4');
+  const outputPath = safeGeneratedVideoPath(codec.id === 'h264'
+    ? requestedName
+    : `${requestedName.replace(/\.[a-z0-9]{2,4}$/i, '')}.${codec.extension}`);
+  const ffmpegPath = resolveFfmpegPath();
+  const ffmpegArgs = codec.id !== 'h264' ? recordingEncoderArgs({
+    codec: codec.id, width, height, fps, quality, outputPath, pixelFormat,
+    hardwareProRes: args.hardwareProRes === true, totalFrames,
+  }) : [
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-y',
+    '-f', 'rawvideo',
+    '-pix_fmt', pixelFormat,
+    '-s:v', `${width}x${height}`,
+    '-framerate', String(fps),
+    '-i', 'pipe:0',
+    ...(totalFrames > 0 ? ['-frames:v', String(totalFrames)] : []),
+    '-an',
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    '-crf', crfForVideoQuality(quality),
+    '-preset', presetForVideoQuality(quality),
+    '-movflags', '+faststart',
+    outputPath,
+  ];
+
+  const child = spawn(ffmpegPath, ffmpegArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+  const job = {
+    id: jobId,
+    process: child,
+    tempDir,
+    outputPath,
+    width,
+    height,
+    fps,
+    totalFrames,
+    frameBytes: width * height * 4,
+    pixelFormat,
+    quality,
+    codec: codec.id,
+    captureSource,
+    writtenFrames: 0,
+    stderr: '',
+    settled: false,
+    cancelled: false,
+    exitCode: null,
+    exitSignal: null,
+    exitPromise: null,
+  };
+
+  job.exitPromise = new Promise((resolve) => {
+    child.stderr?.setEncoding?.('utf8');
+    child.stderr?.on('data', (chunk) => {
+      job.stderr += String(chunk);
+      if (job.stderr.length > 12_000) job.stderr = job.stderr.slice(-12_000);
+    });
+    child.on('error', (err) => {
+      job.stderr += `\n${err?.message || err}`;
+    });
+    child.on('close', (code, signal) => {
+      job.settled = true;
+      job.exitCode = code;
+      job.exitSignal = signal;
+      resolve({ code, signal });
+    });
+  });
+
+  activeMp4FrameEncoderJobs.set(jobId, job);
+  return {
+    jobId,
+    outputPath,
+    tempDir,
+    ffmpegPath,
+    pixelFormat,
+    codec: codec.id,
+    extension: codec.extension,
+    mime: codec.mime,
+  };
+}
+
+async function writeMp4FrameEncoderFrame(args = {}) {
+  const jobId = String(args.jobId || '').trim();
+  const job = activeMp4FrameEncoderJobs.get(jobId);
+  if (!job) throw new Error('MP4 frame encoder job is not active.');
+  if (job.settled) {
+    throw new Error(`MP4 frame encoder exited early.${job.stderr ? ` ${job.stderr.trim()}` : ''}`);
+  }
+  const buffer = bytesToBuffer(args.bytes);
+  if (buffer.byteLength !== job.frameBytes) {
+    throw new Error(`MP4 frame has ${buffer.byteLength} bytes; expected ${job.frameBytes}.`);
+  }
+  const framePixelFormat = args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format;
+  if (framePixelFormat && normalizeRawVideoPixelFormat(framePixelFormat) !== job.pixelFormat) {
+    throw new Error(`MP4 frame pixel format mismatch: got ${framePixelFormat}, expected ${job.pixelFormat}.`);
+  }
+
+  const frameIndex = Math.round(clampNumber(args.frameIndex, 0, Number.MAX_SAFE_INTEGER, job.writtenFrames));
+  if (frameIndex !== job.writtenFrames) {
+    throw new Error(`MP4 frame order mismatch: got ${frameIndex}, expected ${job.writtenFrames}.`);
+  }
+
+  await writeEncoderStdin(job, buffer, frameIndex, 'MP4 frame');
+  job.writtenFrames++;
+  return { success: true, writtenFrames: job.writtenFrames };
+}
+
+async function writeMp4FrameEncoderFrameFile(args = {}) {
+  const jobId = String(args.jobId || '').trim();
+  const job = activeMp4FrameEncoderJobs.get(jobId);
+  if (!job) throw new Error('MP4 frame encoder job is not active.');
+  if (job.settled) {
+    throw new Error(`MP4 frame encoder exited early.${job.stderr ? ` ${job.stderr.trim()}` : ''}`);
+  }
+  const framePath = assertAbsolutePath(
+    args.path || args.filePath || args.rawPath || args.rgbaPath,
+    'MP4 raw frame file',
+  );
+  const resolvedFramePath = path.resolve(framePath);
+  const resolvedTempDir = path.resolve(job.tempDir);
+  if (!resolvedFramePath.startsWith(`${resolvedTempDir}${path.sep}`)) {
+    throw new Error('MP4 raw frame must live in its temp folder.');
+  }
+  const stat = await fs.promises.stat(resolvedFramePath);
+  if (!stat.isFile()) throw new Error('MP4 raw frame path is not a file.');
+  if (stat.size !== job.frameBytes) {
+    throw new Error(`MP4 raw frame file has ${stat.size} bytes; expected ${job.frameBytes}.`);
+  }
+  const framePixelFormat = args.pixelFormat || args.pixel_format || args.rawPixelFormat || args.raw_pixel_format;
+  if (framePixelFormat && normalizeRawVideoPixelFormat(framePixelFormat) !== job.pixelFormat) {
+    throw new Error(`MP4 raw frame file pixel format mismatch: got ${framePixelFormat}, expected ${job.pixelFormat}.`);
+  }
+
+  const frameIndex = Math.round(clampNumber(args.frameIndex, 0, Number.MAX_SAFE_INTEGER, job.writtenFrames));
+  if (frameIndex !== job.writtenFrames) {
+    throw new Error(`MP4 frame order mismatch: got ${frameIndex}, expected ${job.writtenFrames}.`);
+  }
+
+  const buffer = await fs.promises.readFile(resolvedFramePath);
+  await writeEncoderStdin(job, buffer, frameIndex, 'MP4 frame');
+  job.writtenFrames++;
+  if (args.deleteAfterWrite || args.delete_after_write || args.delete) {
+    try { fs.unlinkSync(resolvedFramePath); } catch { /* best-effort temp cleanup */ }
+  }
+  return { success: true, writtenFrames: job.writtenFrames };
+}
+
+async function captureLiveMp4Frame(args = {}, clockOwned = false) {
+    const job = activeMp4FrameEncoderJobs.get(String(args.jobId || ''));
+    if (!job || job.settled || job.cancelled || job.closing) return { success: false, error: 'Recording encoder is not running' };
+    if (job.liveClock && !clockOwned) return { success: false, error: 'Recording capture is owned by the live clock' };
+    if (job.captureBusy) return { success: false, error: 'Recording capture already in progress' };
+    const from = Number(args.fromIndex), to = Number(args.toIndex);
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from !== job.writtenFrames || to < from || to - from >= 120) {
+      return { success: false, error: 'Invalid recording frame range' };
+    }
+    if (job.pixelFormat !== 'bgra') return { success: false, error: 'Native live capture requires BGRA' };
+    job.captureBusy = true;
+    try {
+      const { createNativeFrameSink } = require('./native-frame-stream.cjs');
+      job.frameSink ??= await createNativeFrameSink({ write: chunk => writeEncoderStdin(job, chunk, job.writtenFrames, 'Native live frame') });
+      const snapshot = await job.frameSink.capture(job.frameBytes * (to - from + 1),
+        sink => nativeRendererBroker.invoke('native_renderer_stream_output_frame', {
+          ...sink, width: job.width, height: job.height, copies: to - from + 1,
+          ...(job.captureSource ? { capture_source: job.captureSource } : {}),
+        }));
+      job.writtenFrames = to + 1;
+      return { success: true, snapshot };
+    } catch (error) {
+      // A partial raw frame cannot safely be retried into the same encoder.
+      await cancelMp4FrameEncoderJob(job.id);
+      return { success: false, error: error?.message || String(error) };
+    } finally { job.captureBusy = false; }
+}
+
+async function finishMp4FrameEncoderJob(jobIdInput) {
+  const jobId = String(jobIdInput || '').trim();
+  const job = activeMp4FrameEncoderJobs.get(jobId);
+  if (!job) return { success: true, alreadyFinished: true };
+  job.detachCaptureOwner?.();
+  await job.liveClock?.stop();
+  job.closing = true;
+  await job.frameSink?.close();
+  // Frame i of a live-clock job was captured at liveStartedUnixMs + i / fps.
+  const audioTap = job.audioTap;
+  job.audioTap = null;
+  const nativeAudio = settleRecordingAudioTap(audioTap, job.outputPath, job.liveStartedUnixMs ?? 0);
+
+  try {
+    if (!job.process.stdin.destroyed && !job.process.stdin.writableEnded) {
+      job.process.stdin.end();
+    }
+  } catch { /* ignore */ }
+
+  const { code, signal } = await job.exitPromise;
+  activeMp4FrameEncoderJobs.delete(jobId);
+  try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  if (audioTap && (job.cancelled || code !== 0 || job.writtenFrames <= 0)) {
+    await nativeAudio;
+    discardPendingRecordingAudio(pendingNativeRecordingAudio.get(job.outputPath));
+    pendingNativeRecordingAudio.delete(job.outputPath);
+  }
+
+  if (job.cancelled) return { success: false, cancelled: true };
+  if (code !== 0) {
+    try { fs.rmSync(job.outputPath, { force: true }); } catch { /* ignore */ }
+    const detail = job.stderr.trim() || `exit code ${code}${signal ? ` (${signal})` : ''}`;
+    throw new Error(`MP4 frame encoder failed: ${detail}`);
+  }
+  if (job.totalFrames > 0 && job.writtenFrames !== job.totalFrames) {
+    try { fs.rmSync(job.outputPath, { force: true }); } catch { /* ignore */ }
+    throw new Error(`MP4 frame encoder ended after ${job.writtenFrames} frames; expected ${job.totalFrames}.`);
+  }
+  if (job.totalFrames <= 0 && job.writtenFrames <= 0) {
+    try { fs.rmSync(job.outputPath, { force: true }); } catch { /* ignore */ }
+    throw new Error('MP4 frame encoder ended without any frames.');
+  }
+  const stat = fs.statSync(job.outputPath);
+  if (!stat.size) throw new Error('MP4 frame encoder produced an empty file.');
+  return {
+    success: true,
+    outputPath: job.outputPath,
+    size: stat.size,
+    frames: job.writtenFrames,
+    nativeAudio: await nativeAudio,
+  };
+}
+
+async function cancelMp4FrameEncoderJob(jobIdInput) {
+  const jobId = String(jobIdInput || '').trim();
+  const job = activeMp4FrameEncoderJobs.get(jobId);
+  if (!job) return { success: true };
+  job.cancelled = true;
+  job.detachCaptureOwner?.();
+  job.liveClock?.cancel();
+  await job.frameSink?.close();
+  const audioTap = job.audioTap;
+  job.audioTap = null;
+  await audioTap?.cancel().catch(() => null);
+  try {
+    job.process.stdin?.destroy?.();
+  } catch { /* ignore */ }
+  try {
+    job.process.kill('SIGTERM');
+  } catch { /* ignore */ }
+  try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  try { fs.rmSync(job.outputPath, { force: true }); } catch { /* ignore */ }
+  activeMp4FrameEncoderJobs.delete(jobId);
+  setTimeout(() => {
+    try { job.process.kill('SIGKILL'); } catch { /* ignore */ }
+  }, 1500).unref?.();
+  return { success: true };
 }
 
 function makeConcatList(frames, fps) {
   const tmpDir = fs.mkdtempSync(path.join(app.getPath('temp'), 'ghost-arcade-seq-'));
   const listPath = path.join(tmpDir, 'frames.ffconcat');
-  const duration = (1 / Math.max(1, fps)).toFixed(8);
-  const lines = ['ffconcat version 1.0'];
-  for (const frame of frames) {
-    lines.push(`file ${quoteFfconcatPath(frame.path)}`);
-    lines.push(`duration ${duration}`);
-  }
-  // ffconcat uses the last file's duration only when the file appears twice.
-  lines.push(`file ${quoteFfconcatPath(frames[frames.length - 1].path)}`);
-  fs.writeFileSync(listPath, `${lines.join('\n')}\n`, 'utf8');
+  fs.writeFileSync(listPath, sequenceConcatText(frames.map(frame => frame.path), fps), 'utf8');
   return { tmpDir, listPath };
 }
 
@@ -998,6 +1787,8 @@ function publishVideoConverterProgress(sender, payload) {
   });
 }
 
+const { conversionFormat, conversionOutputArgs, stageConversionOutput, sequenceConcatText, probeConversionInput } = require('./video-converter-options.cjs');
+
 function spawnFfmpegConversion({
   sender,
   jobId,
@@ -1007,20 +1798,24 @@ function spawnFfmpegConversion({
   startMessage,
   completeMessage,
   cleanup,
+  finalize,
   progressMode = 'time',
   totalFrames = 0,
+  reservedJob,
+  ffmpegPath = resolveFfmpegPath(),
 }) {
-  if (activeVideoConverterJob) {
+  if (activeVideoConverterJob && activeVideoConverterJob !== reservedJob) {
     throw new Error('A video conversion is already running.');
   }
 
   return new Promise((resolve, reject) => {
-    const ffmpegPath = resolveFfmpegPath();
     const child = spawn(ffmpegPath, args, { windowsHide: true });
-    const job = { id: jobId, process: child, cancelled: false, cleanup };
+    const job = reservedJob || { id: jobId, cancelled: false, cleanup };
+    job.process = child;
     activeVideoConverterJob = job;
 
     let stderr = '';
+    let pendingLine = '';
     let settled = false;
     let bestProgress = 0;
     let detectedDuration = durationSec > 0 ? durationSec : 0;
@@ -1049,17 +1844,14 @@ function spawnFfmpegConversion({
     const sendPercent = (rawProgress) => {
       const bounded = clampNumber(rawProgress, 0, 0.99, 0);
       const pct = Math.max(1, Math.min(99, Math.floor(bounded * 100)));
-      send(bounded, `Encoding MP4 (${pct}%)...`);
+      send(bounded, `Encoding video (${pct}%)...`);
     };
 
     publishVideoConverterProgress(sender, { jobId, stage: 'converting', progress: 0.01, message: startMessage, outputPath });
 
     const heartbeat = setInterval(() => {
       const elapsed = (Date.now() - startedAt) / 1000;
-      const drift = detectedDuration > 0
-        ? Math.min(0.96, elapsed / Math.max(1, detectedDuration))
-        : Math.min(0.88, 0.04 + (1 - Math.exp(-elapsed / 90)) * 0.84);
-      send(drift, `Encoding MP4 (${Math.floor(elapsed)}s elapsed)...`);
+      send(bestProgress, `Encoding video (${Math.floor(elapsed)}s elapsed)...`);
     }, 1000);
     heartbeat.unref?.();
 
@@ -1069,7 +1861,10 @@ function spawnFfmpegConversion({
       stderr += text;
       if (stderr.length > 12_000) stderr = stderr.slice(-12_000);
 
-      for (const rawLine of text.split(/\r?\n/)) {
+      pendingLine += text;
+      const lines = pendingLine.split(/\r?\n/);
+      pendingLine = (lines.pop() ?? '').slice(-16000);
+      for (const rawLine of lines) {
         const line = rawLine.trim();
         if (!line) continue;
         const duration = parseDurationLine(line);
@@ -1085,11 +1880,11 @@ function spawnFfmpegConversion({
               sendPercent(frame / totalFrames);
             }
           } else if (key === 'progress' && value === 'end') {
-            send(0.99, 'Finalizing MP4...');
+            send(0.99, 'Finalizing video...');
           } else if (progressMode !== 'frames' && (key === 'out_time_ms' || key === 'out_time_us')) {
             const raw = Number(value);
             if (Number.isFinite(raw) && detectedDuration > 0) {
-              const seconds = raw > 10_000 ? raw / 1_000_000 : raw / 1000;
+              const seconds = raw / 1_000_000;
               sendPercent(seconds / detectedDuration);
             }
           } else if (progressMode !== 'frames' && key === 'out_time') {
@@ -1132,6 +1927,7 @@ function spawnFfmpegConversion({
         settle(reject, new Error(`FFmpeg exited with code ${code}${signal ? ` (${signal})` : ''}.${tail ? `\n${tail}` : ''}`));
         return;
       }
+      try { finalize?.(); } catch (err) { settle(reject, err); return; }
       publishVideoConverterProgress(sender, { jobId, stage: 'complete', progress: 1, message: completeMessage, outputPath });
       settle(resolve, { success: true, outputPath, ffmpegPath });
     });
@@ -1139,6 +1935,10 @@ function spawnFfmpegConversion({
 }
 
 function closeAuxiliaryWindows() {
+  // Hidden offscreen page hosts count as open windows and would keep the app
+  // from quitting once the main window closes.
+  jsSourceHost.closeAll();
+
   if (stage3dWindow && !stage3dWindow.isDestroyed()) {
     const win = stage3dWindow;
     stage3dWindow = null;
@@ -1229,6 +2029,57 @@ let spoutSendW = 1920;      // Output resolution for OSR window
 let spoutSendH = 1080;
 let spoutCpuFallbackWarned = false;
 
+// Native render-core output sharing. On macOS the Rust core exports its
+// offscreen composite as an IOSurfaceID; SyphonOutput can publish that directly.
+let nativeOutputTextureSharePump = null;
+let nativeOutputTextureShareActive = false;
+let nativeOutputTextureShareFrameCount = 0;
+let nativeOutputTextureShareLastPublishedFrame = 0;
+let nativeOutputTextureShareLastPublishedHandle = null;
+let nativeOutputTextureShareLastLogTime = 0;
+let nativeOutputTextureShareFailCount = 0;
+let nativeOutputTextureShareInFlight = false;
+let nativeOutputTextureShareWaitingForFrame = false;
+let nativeOutputTextureShareWaitingForFrameLogged = false;
+let nativeOutputTextureSharePromoteTimer = null;
+let nativeOutputTextureSharePromoteInFlight = false;
+let nativeOutputTextureSharePromoteAttempts = 0;
+let nativeOutputTextureSharePromotionReason = null;
+
+// Embedded native editor preview presenter. This is intentionally separate
+// from the external output-window path: the editor preview is a child/native
+// view inside the main BrowserWindow, fed by the render core's one composite
+// IOSurface/DXGI texture. No browser-side renderer or floating OS window.
+let nativePreviewAddon = null;
+let nativePreviewAddonLoadAttempted = false;
+let nativePreviewAddonLoadError = null;
+let nativePreviewAddonLoadPath = null;
+let nativePreviewAddonLoadCandidates = [];
+let nativePreviewPump = null;
+let nativePreviewPumpInFlight = false;
+let nativePreviewAttached = false;
+let nativePreviewLastPresentedFrame = 0;
+let nativePreviewFrameCount = 0;
+let nativePreviewLastAddonFrameCount = 0;
+let nativePreviewLastLogTime = 0;
+let nativePreviewFailCount = 0;
+let nativePreviewLastRectSignature = '';
+let nativePreviewGeometryGeneration = 0;
+let nativePreviewCachedTexture = null;
+let nativePreviewNextTexturePollAt = 0;
+let nativePreviewLastTextureFrame = -1;
+let nativePreviewLastTextureFrameAt = 0;
+let nativePreviewPausedForStaleFrame = false;
+// True when the last value handed to the pump came straight from the core, false
+// when it is the retained cache because the query failed or timed out. A failed
+// read tells us nothing about whether the core is still rendering, so it must not
+// be counted as evidence of an idle frame counter.
+let nativePreviewLastTextureReadWasLive = false;
+// How long a run of failed reads may suppress the idle check before we accept
+// that the core really is gone and let the display link stop.
+const NATIVE_PREVIEW_STALE_READ_GRACE_MS = 4000;
+let nativePreviewStaleReadSince = 0;
+
 // Multi-slice zero-copy atlas state. The slice-atlas OSR window renders
 // every Spout/Syphon sender slice into one atlas texture and publishes
 // its packed layout; SpoutAtlasOutput sub-copies each tile into a
@@ -1251,6 +2102,77 @@ let atlasSendFailCount = 0;
 // Sidecar: Rust WS/HTTP/Spout backend
 // ============================================================
 
+// The LAN remote's ports. Development builds can move them with WS_PORT /
+// HTTP_PORT so a second copy runs beside another without the stale-port sweep
+// in startNodeServer() killing the other copy's server. Packaged builds ignore
+// the variables: WS_PORT is a generic name, and a stray one would point that
+// sweep at somebody else's process.
+function remotePort(value, fallback) {
+  const port = Number(value);
+  return !app.isPackaged && Number.isInteger(port) && port > 0 && port < 65536 ? port : fallback;
+}
+const REMOTE_WS_PORT = remotePort(process.env.WS_PORT, 9001);
+const REMOTE_HTTP_PORT = remotePort(process.env.HTTP_PORT, 9002);
+
+// ─── LAN remote pairing ─────────────────────────────────────────────
+// The token a phone must present to the remote's WebSocket and HTTP servers
+// (server/pairing.cjs). One per install, kept in userData beside the rest of
+// the app's state, so a paired phone still connects after a restart.
+//
+// Deliberately not the MCP token. That one is issued fresh each time MCP is
+// switched on, and Settings promises that toggling it revokes a client; a
+// token that persists and travels over venue Wi-Fi in a QR code cannot keep
+// that promise. The two share the checking code instead.
+const {
+  generatePairingToken,
+  loadOrCreatePairingToken,
+  writePairingToken,
+} = require('../server/pairing.cjs');
+
+let remotePairingToken = null;
+
+function remotePairingFile() {
+  return path.join(app.getPath('userData'), 'remote-pairing.json');
+}
+
+function getRemotePairingToken() {
+  if (remotePairingToken) return remotePairingToken;
+  try {
+    remotePairingToken = loadOrCreatePairingToken(remotePairingFile());
+  } catch (err) {
+    // An unwritable profile should not leave the remote dead. A token for this
+    // session still pairs; phones just scan again after a restart.
+    console.error('[Main] Could not save the remote pairing token:', err?.message || err);
+    remotePairingToken = generatePairingToken();
+  }
+  return remotePairingToken;
+}
+
+function remotePairingInfo() {
+  return { token: getRemotePairingToken(), wsPort: REMOTE_WS_PORT, httpPort: REMOTE_HTTP_PORT };
+}
+
+/** New token, which unpairs every phone, the ones connected right now too. */
+async function resetRemotePairing() {
+  const token = generatePairingToken();
+  // Do not claim revocation if the old on-disk token would return at restart.
+  writePairingToken(remotePairingFile(), token);
+  remotePairingToken = token;
+  if (embeddedServerModule?.setPairingToken) {
+    embeddedServerModule.setPairingToken(token);
+  } else if (sidecarProcess) {
+    // The fallback child got its token in its environment at spawn, so a new
+    // token means a new child. Killing the old one drops its connections.
+    const oldChild = sidecarProcess;
+    const exited = new Promise(resolve => oldChild.once('exit', resolve));
+    killChildProcess(oldChild, 'server sidecar');
+    sidecarProcess = null;
+    await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 3000))]);
+    await startNodeServer();
+  }
+  return remotePairingInfo();
+}
+
 async function startNodeServer() {
   // Start the Node.js WS/HTTP server (server/ws-server.js)
   const serverPath = path.join(__dirname, '..', 'server', 'ws-server.js');
@@ -1259,29 +2181,14 @@ async function startNodeServer() {
     return;
   }
 
-  // Kill any stale process on port 9001 before starting
-  try {
-    if (process.platform === 'win32') {
-      execSync('for /f "tokens=5" %a in (\'netstat -ano ^| findstr :9001 ^| findstr LISTENING\') do taskkill /F /PID %a', {
-        shell: 'cmd.exe', stdio: 'ignore', timeout: 5000
-      });
-    } else {
-      // macOS / Linux: use lsof to find and kill process on port 9001
-      execSync("lsof -ti:9001 | xargs kill -9 2>/dev/null || true", {
-        stdio: 'ignore', timeout: 5000
-      });
-    }
-    // Small delay to let the port release
-    await new Promise(r => setTimeout(r, 500));
-  } catch {
-    // No process on the port — good
-  }
+  // A busy port may belong to another live show. Never kill an unrelated
+  // listener; report startup failure and leave the existing process alone.
 
   console.log('[Main] Starting Node.js server:', serverPath);
 
   // Set env vars the server expects
-  process.env.WS_PORT = '9001';
-  process.env.HTTP_PORT = '9002';
+  process.env.WS_PORT = String(REMOTE_WS_PORT);
+  process.env.HTTP_PORT = String(REMOTE_HTTP_PORT);
 
   // Import the server module in-process — it auto-starts on import.
   // On Windows, dynamic import() needs a file:// URL, not a raw path.
@@ -1289,27 +2196,60 @@ async function startNodeServer() {
     const serverUrl = new URL(`file:///${serverPath.replace(/\\/g, '/')}`).href;
     console.log('[Main] Importing server from:', serverUrl);
     embeddedServerModule = await import(serverUrl);
+    await embeddedServerModule.listening;
     console.log('[Main] Server module loaded in-process');
   } catch (e) {
     console.error('[Main] Failed to load server in-process:', e.message);
+    if (embeddedServerModule) {
+      embeddedServerModule.shutdownServer?.({ force: true });
+      embeddedServerModule = null;
+      return; // A bind failure is not fixed by starting another process.
+    }
     // Fallback: spawn with ELECTRON_RUN_AS_NODE
     console.log('[Main] Trying ELECTRON_RUN_AS_NODE spawn fallback...');
     try {
-      sidecarProcess = spawn(process.execPath, [serverPath], {
-        stdio: ['ignore', 'pipe', 'pipe'],
+      const child = spawn(process.execPath, [serverPath], {
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         cwd: path.join(__dirname, '..'),
-        env: { ...process.env, WS_PORT: '9001', HTTP_PORT: '9002', ELECTRON_RUN_AS_NODE: '1' },
+        // The token goes in this child's environment only, never main's own
+        // process.env, which every other child would inherit.
+        env: {
+          ...process.env,
+          WS_PORT: String(REMOTE_WS_PORT),
+          HTTP_PORT: String(REMOTE_HTTP_PORT),
+          GA_PAIRING_TOKEN: getRemotePairingToken(),
+          ELECTRON_RUN_AS_NODE: '1',
+        },
         windowsHide: true,
         shell: false,
       });
-      sidecarProcess.stdout?.on('data', (d) => console.log(`[Server] ${d.toString().trim()}`));
-      sidecarProcess.stderr?.on('data', (d) => console.error(`[Server] ${d.toString().trim()}`));
-      sidecarProcess.on('exit', (code) => { console.log(`[Main] Server exited ${code}`); sidecarProcess = null; });
-      sidecarProcess.on('error', (err) => { console.error(`[Main] Server spawn error: ${err.message}`); });
+      sidecarProcess = child;
+      child.stdout?.on('data', (d) => console.log(`[Server] ${d.toString().trim()}`));
+      child.stderr?.on('data', (d) => console.error(`[Server] ${d.toString().trim()}`));
+      // A pairing reset replaces the child, and the old one's exit arrives
+      // after its replacement is already running.
+      child.on('exit', (code) => {
+        console.log(`[Main] Server exited ${code}`);
+        if (sidecarProcess === child) sidecarProcess = null;
+      });
+      child.on('error', (err) => { console.error(`[Main] Server spawn error: ${err.message}`); });
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => finish(new Error('Remote server startup timed out')), 10000);
+        const onMessage = message => { if (message?.type === 'remote-server-ready') finish(); };
+        const onExit = () => finish(new Error('Remote server exited before listening'));
+        const finish = error => {
+          clearTimeout(timeout); child.off('message', onMessage); child.off('exit', onExit); child.off('error', finish);
+          if (error) { killChildProcess(child, 'failed remote server'); reject(error); } else resolve();
+        };
+        child.on('message', onMessage); child.once('exit', onExit); child.once('error', finish);
+      });
     } catch (e2) {
       console.error('[Main] Server spawn fallback also failed:', e2.message);
     }
   }
+
+  // The in-process server refuses every connection until it has the token.
+  embeddedServerModule?.setPairingToken?.(getRemotePairingToken());
 }
 
 function stopServer() {
@@ -1406,6 +2346,11 @@ function getTextureShareAddonCandidates(addonName) {
 }
 
 function getTextureShareLoadStatus() {
+  const nativeOutputTransport = isMac
+    ? 'iosurface-handle'
+    : isWin
+      ? 'dxgi-shared-name'
+      : 'unsupported';
   return {
     platform: textureSharePlatform,
     label: textureShareLabel,
@@ -1414,7 +2359,39 @@ function getTextureShareLoadStatus() {
     candidates: spoutAddonLoadCandidates,
     error: spoutAddonLoadError,
     cpuFallbackAllowed: ALLOW_CPU_TEXTURE_SHARE_FALLBACK,
+    receiverTextureInfoSupported: getReceiverTextureInfoSupport(spoutAddon),
+    nativeOutputCapable: getNativeOutputTextureShareSupport(spoutAddon),
+    nativeOutputTransport,
+    nativeOutputRequiresNamedTexture: isWin,
+    nativeOutputActive: nativeOutputTextureShareActive,
+    nativeOutputWaitingForFrame: nativeOutputTextureShareWaitingForFrame,
+    nativeOutputLastPublishedFrame: nativeOutputTextureShareLastPublishedFrame,
+    nativeOutputFailures: nativeOutputTextureShareFailCount,
+    nativeOutputPendingPromotion: nativeOutputTextureSharePromoteTimer !== null,
+    nativeOutputPromotionAttempts: nativeOutputTextureSharePromoteAttempts,
+    nativeOutputPromotionReason: nativeOutputTextureSharePromotionReason,
   };
+}
+
+function getReceiverTextureInfoSupport(addon = spoutAddon) {
+  if (!addon) return false;
+  const ReceiverClass = getReceiverClass(addon);
+  return !!(
+    ReceiverClass &&
+    ReceiverClass.prototype &&
+    typeof ReceiverClass.prototype.receiveTextureInfo === 'function'
+  );
+}
+
+function getNativeOutputTextureShareSupport(addon = spoutAddon) {
+  if (!addon) return false;
+  const OutputClass = getOutputClass(addon);
+  const method = isMac ? 'publishIOSurface' : 'sendTextureByName';
+  return !!(
+    OutputClass &&
+    OutputClass.prototype &&
+    typeof OutputClass.prototype[method] === 'function'
+  );
 }
 
 function loadSpoutAddon() {
@@ -1450,6 +2427,1134 @@ function loadSpoutAddon() {
     console.error(`[${textureShareLabel}] Failed to load native addon:`, spoutAddonLoadError);
     return null;
   }
+}
+
+function getNativePreviewAddonCandidates() {
+  if (isMac) return getTextureShareAddonCandidates('native_preview_addon.node');
+  if (process.platform === 'win32') return getTextureShareAddonCandidates('dxgi_preview_addon.node');
+  return [];
+}
+
+function loadNativePreviewAddon() {
+  if (nativePreviewAddon) return nativePreviewAddon;
+  if (nativePreviewAddonLoadAttempted) return null;
+  nativePreviewAddonLoadAttempted = true;
+  nativePreviewAddonLoadError = null;
+  nativePreviewAddonLoadCandidates = getNativePreviewAddonCandidates();
+  nativePreviewAddonLoadPath = null;
+
+  if (!isMac && process.platform !== 'win32') {
+    nativePreviewAddonLoadError = 'embedded native editor preview presenter is implemented on macOS and Windows only';
+    return null;
+  }
+
+  try {
+    const addonPath = nativePreviewAddonLoadCandidates.find(candidate => fs.existsSync(candidate));
+    if (!addonPath) {
+      nativePreviewAddonLoadError = isMac
+        ? 'native_preview_addon.node not built'
+        : 'dxgi_preview_addon.node not built';
+      console.warn(`[NativePreview] ${nativePreviewAddonLoadError}. Checked: ${nativePreviewAddonLoadCandidates.join(', ')}`);
+      return null;
+    }
+    nativePreviewAddonLoadPath = addonPath;
+    nativePreviewAddon = require(addonPath);
+    console.log(`[NativePreview] Native preview addon loaded: ${addonPath}`);
+    return nativePreviewAddon;
+  } catch (err) {
+    nativePreviewAddonLoadError = err?.message || String(err);
+    console.error('[NativePreview] Failed to load addon:', nativePreviewAddonLoadError);
+    return null;
+  }
+}
+
+let liveCaptureAddon = null;
+let liveCaptureAddonLoadAttempted = false;
+let liveCaptureAddonLoadPath = null;
+let liveCaptureAddonLoadError = null;
+
+function loadLiveCaptureAddon() {
+  if (liveCaptureAddon) return liveCaptureAddon;
+  if (liveCaptureAddonLoadAttempted) return null;
+  liveCaptureAddonLoadAttempted = true;
+  if (!isMac && process.platform !== 'win32') {
+    liveCaptureAddonLoadError = 'native live capture is implemented on macOS and Windows only';
+    return null;
+  }
+  // Windows uses win_capture_addon (Media Foundation + DXGI Duplication),
+  // macOS uses live_capture_addon (AVFoundation + ScreenCaptureKit). The
+  // two expose the same Napi surface so the IPC handlers stay identical.
+  const addonBasename = isMac ? 'live_capture_addon.node' : 'win_capture_addon.node';
+  const candidates = getTextureShareAddonCandidates(addonBasename);
+  try {
+    const addonPath = candidates.find(candidate => fs.existsSync(candidate));
+    if (!addonPath) {
+      liveCaptureAddonLoadError = 'live_capture_addon.node not built';
+      console.warn(`[LiveCapture] ${liveCaptureAddonLoadError}. Checked: ${candidates.join(', ')}`);
+      return null;
+    }
+    liveCaptureAddonLoadPath = addonPath;
+    liveCaptureAddon = require(addonPath);
+    console.log(`[LiveCapture] Native capture addon loaded: ${addonPath}`);
+    return liveCaptureAddon;
+  } catch (err) {
+    liveCaptureAddonLoadError = err?.message || String(err);
+    console.error('[LiveCapture] Failed to load addon:', liveCaptureAddonLoadError);
+    return null;
+  }
+}
+
+function getNativePreviewStatus(extra = {}) {
+  const addon = nativePreviewAddon || loadNativePreviewAddon();
+  let addonStatus = null;
+  try {
+    addonStatus = addon && typeof addon.status === 'function' ? addon.status() : null;
+  } catch (err) {
+    nativePreviewAddonLoadError = err?.message || String(err);
+  }
+  return {
+    available: !!addon,
+    addonPath: nativePreviewAddonLoadPath,
+    candidates: nativePreviewAddonLoadCandidates,
+    error: nativePreviewAddonLoadError,
+    attached: nativePreviewAttached && !!addonStatus?.attached,
+    pumpActive: nativePreviewPump !== null || !!addonStatus?.pumpActive,
+    lastPresentedFrame: nativePreviewLastPresentedFrame,
+    framesPresented: addonStatus?.framesPresented ?? nativePreviewFrameCount,
+    failCount: nativePreviewFailCount,
+    mode: addonStatus?.mode || (addon ? 'shared-texture-import-blit' : 'unavailable'),
+    presentation: addonStatus?.presentation || (addon ? 'underlay-zero-copy' : 'unavailable'),
+    transport: addonStatus?.transport || (isMac ? 'iosurface' : 'none'),
+    width: addonStatus?.width ?? 0,
+    height: addonStatus?.height ?? 0,
+    lastSurfaceID: addonStatus?.lastSurfaceID ?? 0,
+    addonStatus,
+    ...extra,
+  };
+}
+
+function stopNativeEditorPreviewPump(reason = 'stopped') {
+  if (nativePreviewPump) {
+    clearInterval(nativePreviewPump);
+    nativePreviewPump = null;
+  }
+  nativePreviewPumpInFlight = false;
+  nativePreviewCachedTexture = null;
+  nativePreviewNextTexturePollAt = 0;
+  nativePreviewLastTextureFrame = -1;
+  nativePreviewLastTextureFrameAt = 0;
+  nativePreviewPausedForStaleFrame = false;
+  nativePreviewLastTextureReadWasLive = false;
+  nativePreviewStaleReadSince = 0;
+  nativePreviewLastAddonFrameCount = 0;
+  try {
+    const addon = nativePreviewAddon || loadNativePreviewAddon();
+    if (addon && typeof addon.stopPump === 'function') addon.stopPump();
+  } catch {}
+  if (reason !== 'quiet') {
+    console.log(`[NativePreview] pump stopped (${reason})`);
+  }
+}
+
+async function nativePreviewTextureMetadataForPump() {
+  const now = Date.now();
+  const cachedReady = isPublishableNativeOutputTexture(nativePreviewCachedTexture);
+  if (cachedReady && now < nativePreviewNextTexturePollAt) {
+    // Serving the cache inside its own poll window is a deliberate skip, not a
+    // failed read: the frame counter it carries is as fresh as the last query.
+    return nativePreviewCachedTexture;
+  }
+  const texture = await getNativeOutputSharedTextureMetadata();
+  if (isPublishableNativeOutputTexture(texture)) {
+    const previousHandle = nativePreviewCachedTexture?.handle;
+    const previousSize = `${nativePreviewCachedTexture?.width ?? 0}x${nativePreviewCachedTexture?.height ?? 0}`;
+    const nextSize = `${texture.width ?? 0}x${texture.height ?? 0}`;
+    nativePreviewCachedTexture = texture;
+    nativePreviewNextTexturePollAt = now + 250;
+    nativePreviewLastTextureReadWasLive = true;
+    nativePreviewStaleReadSince = 0;
+    if (previousHandle !== texture.handle || previousSize !== nextSize) {
+      console.log(`[NativePreview] shared texture ${texture.platform}:${texture.handle} ${nextSize}`);
+    }
+    return texture;
+  }
+  // The core did not answer (timeout, or not publishable yet). Whatever we hand
+  // back now carries a frame counter we could not refresh.
+  nativePreviewLastTextureReadWasLive = false;
+  if (nativePreviewStaleReadSince === 0) nativePreviewStaleReadSince = now;
+  if (!cachedReady) {
+    nativePreviewNextTexturePollAt = now + 100;
+    return texture;
+  }
+  nativePreviewNextTexturePollAt = now + 250;
+  return nativePreviewCachedTexture;
+}
+
+function startNativeEditorPreviewPump() {
+  if (nativePreviewPump) return true;
+  const addon = nativePreviewAddon || loadNativePreviewAddon();
+  // macOS presents an IOSurface by global ID; Windows presents a named DXGI
+  // shared texture. Either presenter is enough to run the pump.
+  const dxgiPresenter = typeof addon?.presentSharedTexture === 'function';
+  if (!addon || (typeof addon.presentIOSurface !== 'function' && !dxgiPresenter)) return false;
+  // Both platforms can now pace presentation natively, off the JS thread:
+  // macOS via a CVDisplayLink (setIOSurface), Windows via a pump thread inside
+  // dxgi_preview_addon that blocks on DXGI vblank (setSharedTexture). Where one
+  // exists this timer stops being the clock and only republishes which texture
+  // to show, so it drops to a slow bookkeeping tick.
+  //
+  // Without it the JS interval WAS the clock, and on Windows it shared the
+  // Electron main thread with the texture-share output pump and the whole UI:
+  // it could not hold 60Hz and slipped unevenly, delivering 15-27fps against a
+  // core rendering a steady 55. The jitter, not the average, is what read as
+  // stutter in the editor viewport.
+  const nativeDisplayLinkPump = typeof addon.setIOSurface === 'function'
+    || (dxgiPresenter && typeof addon.setSharedTexture === 'function');
+  const intervalMs = nativeDisplayLinkPump ? 250 : Math.max(4, Math.round(1000 / OSR_PAINT_FPS));
+  nativePreviewLastLogTime = Date.now();
+  nativePreviewLastAddonFrameCount = Number(addon.status?.().framesPresented ?? 0);
+  nativePreviewPump = setInterval(async () => {
+    if (!nativePreviewAttached || nativePreviewPumpInFlight) return;
+    nativePreviewPumpInFlight = true;
+    try {
+      const texture = await nativePreviewTextureMetadataForPump();
+      if (!isPublishableNativeOutputTexture(texture)) return;
+      const frame = Number(texture.frame ?? 0);
+      const width = Number(texture.width ?? 0);
+      const height = Number(texture.height ?? 0);
+      // The core reports the Windows HANDLE as process-local, so it is
+      // meaningless here; the named resource is the portable transport.
+      const sharedName = typeof texture.shared_name === 'string' ? texture.shared_name : '';
+      const surfaceId = dxgiPresenter ? 1 : Number(texture.handle ?? 0);
+      if (dxgiPresenter && !sharedName) return;
+      if (!Number.isFinite(surfaceId) || surfaceId <= 0 || width <= 0 || height <= 0) return;
+      const now = Date.now();
+      const textureFrame = Number.isFinite(frame) ? frame : 0;
+      const textureFrameChanged = textureFrame !== nativePreviewLastTextureFrame;
+      if (textureFrameChanged) {
+        nativePreviewLastTextureFrame = textureFrame;
+        nativePreviewLastTextureFrameAt = now;
+        nativePreviewPausedForStaleFrame = false;
+      } else if (nativePreviewLastTextureFrameAt <= 0) {
+        nativePreviewLastTextureFrameAt = now;
+      }
+      // A frame counter that did not move is only evidence of an idle core if we
+      // actually managed to read it. When the query is timing out we are looking
+      // at a retained cache, and stopping the display link then is what turned a
+      // transport hiccup into a visible multi-second freeze. Hold the idle timer
+      // open across a bounded run of failed reads, then let it run again so a
+      // genuinely dead core still parks the pump.
+      if (!nativePreviewLastTextureReadWasLive) {
+        const stalledForMs = nativePreviewStaleReadSince > 0 ? now - nativePreviewStaleReadSince : 0;
+        if (stalledForMs <= NATIVE_PREVIEW_STALE_READ_GRACE_MS) {
+          nativePreviewLastTextureFrameAt = now;
+        }
+      }
+      const staleForMs = now - nativePreviewLastTextureFrameAt;
+      if (nativeDisplayLinkPump && !textureFrameChanged && staleForMs > 1000) {
+        if (!nativePreviewPausedForStaleFrame && typeof addon.stopPump === 'function') {
+          addon.stopPump();
+          nativePreviewPausedForStaleFrame = true;
+          console.log(`[NativePreview] display-link paused; core frame ${textureFrame} has been idle for ${staleForMs}ms`);
+        }
+        return;
+      }
+      const ok = dxgiPresenter
+        ? (nativeDisplayLinkPump
+          // Publish only; the addon's vblank thread decides when to present.
+          ? addon.setSharedTexture(sharedName, width, height)
+          : addon.presentSharedTexture(sharedName, width, height, false))
+        : nativeDisplayLinkPump
+          ? addon.setIOSurface(surfaceId, width, height, false)
+          : addon.presentIOSurface(surfaceId, width, height, false);
+      if (!ok) {
+        nativePreviewFailCount++;
+        if (nativePreviewFailCount <= 5) {
+          console.warn('[NativePreview] presentIOSurface returned false', getNativePreviewStatus({ texture }));
+        }
+        return;
+      }
+      if (frame > 0) nativePreviewLastPresentedFrame = frame;
+      if (!nativeDisplayLinkPump) nativePreviewFrameCount++;
+      if (now - nativePreviewLastLogTime > 5000) {
+        const elapsed = Math.max(0.001, (now - nativePreviewLastLogTime) / 1000);
+        if (nativeDisplayLinkPump) {
+          const addonFrames = Number(addon.status?.().framesPresented ?? nativePreviewLastAddonFrameCount);
+          const delta = Math.max(0, addonFrames - nativePreviewLastAddonFrameCount);
+          nativePreviewLastAddonFrameCount = addonFrames;
+          const transport = dxgiPresenter ? 'DXGI vblank' : 'display-link';
+          console.log(`[NativePreview] ${transport} presented ${delta} native frame(s) @ ${(delta / elapsed).toFixed(1)} fps`);
+        } else {
+          console.log(`[NativePreview] presented ${nativePreviewFrameCount} native IOSurface frame(s) @ ${(nativePreviewFrameCount / elapsed).toFixed(1)} fps`);
+          nativePreviewFrameCount = 0;
+        }
+        nativePreviewLastLogTime = now;
+      }
+    } catch (err) {
+      nativePreviewFailCount++;
+      if (nativePreviewFailCount <= 5) {
+        console.warn('[NativePreview] pump failed:', err?.message || err);
+      }
+    } finally {
+      nativePreviewPumpInFlight = false;
+    }
+  }, intervalMs);
+  nativePreviewPump.unref?.();
+  console.log(`[NativePreview] pump started @ ${nativeDisplayLinkPump ? 'display-link' : `${OSR_PAINT_FPS} fps`}`);
+  return true;
+}
+
+// ── Native output live recorder ──
+// Captures the core's output-export IOSurface entirely in the MAIN process:
+// the addon copies packed BGRA pixels per frame and ffmpeg (hardware
+// VideoToolbox H.264 on macOS) encodes from stdin. The renderer and the
+// render core do ZERO per-frame work — no snapshot re-render, no RPC, no
+// readback stall — so live output framerate is untouched while recording.
+let nativeOutputRecording = null;
+
+// Codec arguments live in recording-formats.cjs. H.264 on macOS has no
+// -realtime: it caps VideoToolbox near real time (about 100 fps for 1080p
+// here, against 375 without it), and the pump needs headroom to write the
+// frames it queued while the encoder was starting.
+function nativeOutputRecorderEncoderArgs(width, height, fps, quality, outputPath, codec = 'h264', hardwareProRes = false, hardwareH264 = null) {
+  const { recordingEncoderArgs } = require('./recording-formats.cjs');
+  return recordingEncoderArgs({ codec, width, height, fps, quality, outputPath, hardwareProRes, hardwareH264 });
+}
+
+/** What the bundled ffmpeg can record, for the recording UI. */
+async function nativeRecordingCodecs() {
+  const { probeRecordingCodecs } = require('./recording-formats.cjs');
+  return probeRecordingCodecs(resolveFfmpegPath());
+}
+
+/** Poll the core until a shared texture it is about to create exists and has
+ *  drawn a frame: the record target appears on the frame after it is set, a
+ *  Screen's slice output once the editor's sync has sent the Screen. */
+async function waitForNativeSurface(query, label, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    try { last = await query(); } catch (err) { last = { error: err?.message || String(err) }; }
+    const handle = Number(last?.handle ?? 0);
+    if (last?.available && Number.isFinite(handle) && handle > 0 && Number(last.width) > 0 && Number(last.height) > 0
+      && Number(last.frame ?? 1) > 0) {
+      return last;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`${label} is not rendering${last?.error ? `: ${last.error}` : ''}.`);
+}
+
+async function nativeSliceSurface(sliceId) {
+  const state = await nativeRendererBroker.invoke('native_renderer_get_slice_output_state', {});
+  const slice = Array.isArray(state?.slices) ? state.slices.find(entry => entry?.id === sliceId) : null;
+  return slice ? { available: true, ...slice } : { available: false };
+}
+
+function nativeRecordTargetSurface() {
+  return nativeRendererBroker.invoke('native_renderer_get_record_target_state', {});
+}
+
+function clearNativeRecordTarget() {
+  return nativeRendererBroker.invoke('native_renderer_set_record_target', { kind: 'none' })
+    .catch(err => console.warn('[NativeRec] could not clear the record target:', err?.message || err));
+}
+
+function nativeRecorderWriteStdin(rec, buffer) {
+  return new Promise((resolve, reject) => {
+    if (!rec.child.stdin.writable) {
+      reject(new Error('Recorder encoder stdin closed.'));
+      return;
+    }
+    const ok = rec.child.stdin.write(buffer, (err) => { if (err) reject(err); });
+    if (ok) resolve();
+    else rec.child.stdin.once('drain', resolve);
+  });
+}
+
+/** Encode one packed-BGRA frame to a 120x68 JPEG data URL via a one-shot
+ *  ffmpeg run — used for the media-library thumbnail. */
+function nativeRecorderThumbnail(buffer, width, height) {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(resolveFfmpegPath(), [
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'rawvideo', '-pix_fmt', 'bgra', '-s:v', `${width}x${height}`,
+        '-i', 'pipe:0',
+        '-frames:v', '1', '-vf', 'scale=120:68',
+        '-f', 'image2pipe', '-c:v', 'mjpeg', '-q:v', '6', 'pipe:1',
+      ], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+      const chunks = [];
+      child.stdout.on('data', (c) => chunks.push(c));
+      child.on('close', () => {
+        const jpeg = Buffer.concat(chunks);
+        resolve(jpeg.length > 0 ? `data:image/jpeg;base64,${jpeg.toString('base64')}` : null);
+      });
+      child.on('error', () => resolve(null));
+      child.stdin.end(buffer);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+// ── Native clip audio in recordings ──
+// The core's clip mix plays through its own audio device, so no renderer
+// capture can hear it. While a VJ recording runs the core streams that exact
+// device mix here (native-audio-tap.cjs); at stop the FLAC waits, keyed by
+// the video path, until native_recording_mux_audio mixes it into the MP4.
+const pendingNativeRecordingAudio = new Map(); // videoPath -> { tap, videoStartUnixMs, at }
+
+async function startRecordingAudioTap() {
+  const { startNativeAudioTapRecording } = require('./native-audio-tap.cjs');
+  return startNativeAudioTapRecording({
+    ffmpegPath: resolveFfmpegPath(),
+    directory: fs.mkdtempSync(path.join(app.getPath('temp'), 'ghost-native-audio-')),
+    startCore: sink => nativeRendererBroker.invoke('native_renderer_audio_tap_start', sink),
+    stopCore: () => nativeRendererBroker.invoke('native_renderer_audio_tap_stop', {}),
+  });
+}
+
+function discardPendingRecordingAudio(entry) {
+  try { if (entry?.tap?.directory) fs.rmSync(entry.tap.directory, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
+
+/** Stop a recording's tap and hold its audio for the mux. Never throws: a
+ *  failed tap leaves the recording exactly as it was before this feature. */
+async function settleRecordingAudioTap(audioTap, outputPath, videoStartUnixMs) {
+  if (!audioTap) return false;
+  try {
+    const tap = await audioTap.stop();
+    if (!tap) return false;
+    if (tap.dropped > 0) console.warn(`[NativeRec] clip audio tap dropped ${tap.dropped} frames (filled with silence)`);
+    for (const [key, entry] of pendingNativeRecordingAudio) {
+      if (key === outputPath || Date.now() - entry.at > 30 * 60 * 1000) { discardPendingRecordingAudio(entry); pendingNativeRecordingAudio.delete(key); }
+    }
+    pendingNativeRecordingAudio.set(outputPath, { tap, videoStartUnixMs, at: Date.now() });
+    return true;
+  } catch (err) {
+    console.warn('[NativeRec] clip audio tap failed:', err?.message || err);
+    return false;
+  }
+}
+
+/** Wall-clock instant a recording's frame 0 stands for: the renderer's REC
+ *  press when it sent a plausible one (same machine, same clock), else now. */
+function recordingStartUnixMs(requestedAtUnixMs) {
+  const now = Date.now();
+  const requested = Number(requestedAtUnixMs);
+  return Number.isFinite(requested) && requested <= now && now - requested < 5000 ? requested : now;
+}
+
+/**
+ * Record inside the core, straight off the GPU.
+ *
+ * The Electron recorder reads the composite back every frame (8.3MB at 1080p,
+ * ~250MB/s at 30fps), pipes it to ffmpeg, and ffmpeg uploads it to the GPU
+ * again for NVENC. The core already owns that surface and the encoder is on
+ * the same GPU, so the whole round trip exists only because the encoder used
+ * to live in another process. When the core can encode, let it.
+ *
+ * Returns null when this take is not eligible, and the caller falls back to
+ * the readback recorder, which still handles ProRes, HAP, layer/Screen
+ * targets and any platform whose core has no encoder yet.
+ */
+async function tryStartCoreNativeRecording({ source, codec, fps, quality, outputPath, args }) {
+  // H.264 program output only for now: the core encoder reads the output
+  // shared texture, and ProRes/HAP have no hardware encoder to hand.
+  if (codec.id !== 'h264' || source.kind !== 'output') return null;
+  let state = null;
+  try {
+    state = await nativeRendererBroker.invoke('native_renderer_native_recording_state', {});
+  } catch {
+    return null; // Core predates in-core recording; use the readback path.
+  }
+  if (!state?.available) return null;
+  try {
+    const started = await nativeRendererBroker.invoke('native_renderer_start_native_recording', {
+      path: outputPath, fps, quality,
+    });
+    if (!started?.started) return null;
+    const startedAt = recordingStartUnixMs(args.requestedAtUnixMs);
+    let audioTap = null;
+    if (args.nativeAudio === true) {
+      try { audioTap = await startRecordingAudioTap(); }
+      catch (err) { console.warn('[NativeRec] clip audio tap unavailable:', err?.message || err); }
+    }
+    nativeOutputRecording = {
+      coreEncoded: true,
+      width: Number(started.width) || 0,
+      height: Number(started.height) || 0,
+      fps,
+      outputPath,
+      startedAt,
+      audioTap,
+      codec,
+      source,
+      recordTargetSet: false,
+      surfaceWatch: null,
+    };
+    console.log(`[NativeRec] recording ${source.label} ${started.width}x${started.height}@${fps} `
+      + `${codec.id} in-core (no readback) -> ${outputPath}`);
+    return {
+      success: true, width: started.width, height: started.height, fps, outputPath,
+      nativeAudio: !!audioTap, codec: codec.id, extension: codec.extension,
+      mime: codec.mime, alpha: source.alpha,
+    };
+  } catch (err) {
+    console.warn('[NativeRec] in-core recording unavailable, using readback recorder:', err?.message || err);
+    nativeOutputRecording = null;
+    return null;
+  }
+}
+
+async function startNativeOutputRecording(args = {}) {
+  if (nativeOutputRecording) throw new Error('A native output recording is already running.');
+  const addon = nativePreviewAddon || loadNativePreviewAddon();
+  // macOS captures by IOSurface id, Windows by shared-texture name. Checking
+  // only for readIOSurfacePixels made this throw on every Windows machine, so
+  // REC silently fell back to the renderer's snapshot recorder: the live
+  // output stayed smooth while the FILE came out at a fraction of the frame
+  // rate and unusable. The DXGI presenter has exported readSharedTexturePixels
+  // all along -- the NDI output pump below already uses exactly this pair.
+  const captureFn = isMac ? 'readIOSurfacePixels' : 'readSharedTexturePixels';
+  if (!addon || typeof addon[captureFn] !== 'function') {
+    throw new Error(`Presenter addon lacks ${isMac ? 'IOSurface' : 'shared texture'} capture support.`);
+  }
+  const { recordingCodec, resolveRecordingSource, liveRecordingFps } = require('./recording-formats.cjs');
+  const codec = recordingCodec(args.codec);
+  const codecs = await nativeRecordingCodecs();
+  if (!codecs.codecs.find(entry => entry.id === codec.id)?.available) {
+    throw new Error(`${codec.label} is not available in this FFmpeg build.`);
+  }
+  // Composition (the program output, as always), one layer or VJ row (the
+  // core's record target), or one Screen (its slice output).
+  const source = resolveRecordingSource(args.source, codec.id);
+  let recordTargetSet = false;
+  let texture;
+  let querySurface;
+  try {
+    if (source.kind === 'record_target') {
+      await nativeRendererBroker.invoke('native_renderer_set_record_target', source.target);
+      recordTargetSet = true;
+      querySurface = nativeRecordTargetSurface;
+      texture = await waitForNativeSurface(querySurface, `The ${source.label} recording target`);
+    } else if (source.kind === 'screen') {
+      querySurface = () => nativeSliceSurface(source.sliceId);
+      texture = await waitForNativeSurface(querySurface, `${source.label}'s output`);
+    } else {
+      querySurface = getNativeOutputSharedTextureMetadata;
+      texture = await getNativeOutputSharedTextureMetadata();
+    }
+  } catch (err) {
+    if (recordTargetSet) await clearNativeRecordTarget();
+    throw err;
+  }
+  const surfaceId = Number(texture?.handle ?? 0);
+  // Windows addresses the texture by name; its `handle` is process-local and
+  // meaningless here, so it must not be part of the validity test.
+  const textureKey = isMac ? String(surfaceId) : String(texture?.shared_name ?? texture?.name ?? '');
+  const width = Number(texture?.width ?? 0);
+  const height = Number(texture?.height ?? 0);
+  const surfaceUsable = isMac ? Number.isFinite(surfaceId) && surfaceId > 0 : !!textureKey;
+  if (!texture?.available || !surfaceUsable || width <= 0 || height <= 0) {
+    if (recordTargetSet) await clearNativeRecordTarget();
+    throw new Error('Native output shared texture is not available for capture.');
+  }
+  const fps = liveRecordingFps(codec.id, clampNumber(args.fps, 1, 60, 30), codecs.hardwareProRes);
+  const quality = String(args.quality || 'high').trim().toLowerCase();
+  const outputPath = safeGeneratedVideoPath(`${String(args.namePrefix || 'Recording')}.${codec.extension}`);
+  const inCore = await tryStartCoreNativeRecording({ source, codec, fps, quality, outputPath, args });
+  if (inCore) {
+    if (recordTargetSet) await clearNativeRecordTarget();
+    return inCore;
+  }
+  const child = spawn(
+    resolveFfmpegPath(),
+    nativeOutputRecorderEncoderArgs(width, height, fps, quality, outputPath, codec.id, codecs.hardwareProRes, codecs.hardwareH264),
+    { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] },
+  );
+  // Frame 0 is the REC press, not the moment the encoder became ready: the
+  // pump queues frames through the encoder's 0.3-3.5 s start-up (see
+  // recording-frame-pump.cjs), so short recordings keep their start.
+  const startedAt = recordingStartUnixMs(args.requestedAtUnixMs);
+  const rec = {
+    child,
+    surfaceId,
+    textureKey,
+    lastCapturedFrame: 0,
+    width,
+    height,
+    fps,
+    outputPath,
+    startedAt,
+    stderr: '',
+    exitPromise: null,
+    pump: null,
+    audioTap: null,
+    codec,
+    source,
+    recordTargetSet,
+    surfaceWatch: null,
+  };
+  rec.exitPromise = new Promise((resolve) => {
+    child.stderr?.setEncoding?.('utf8');
+    child.stderr?.on('data', (chunk) => {
+      rec.stderr += String(chunk);
+      if (rec.stderr.length > 8000) rec.stderr = rec.stderr.slice(-8000);
+    });
+    child.on('error', (err) => { rec.stderr += `\n${err?.message || err}`; });
+    child.on('close', (code) => resolve(code));
+  });
+  nativeOutputRecording = rec;
+  // A layer / Screen target is recreated when its size or the display
+  // changes; follow its new surface as long as the frame size holds (the
+  // pump repeats the last frame through any gap).
+  if (source.kind !== 'output') {
+    rec.surfaceWatch = setInterval(() => {
+      void querySurface().then((state) => {
+        const handle = Number(state?.handle ?? 0);
+        const key = isMac ? String(handle) : String(state?.shared_name ?? state?.name ?? '');
+        const usable = isMac ? handle > 0 : !!key;
+        if (nativeOutputRecording === rec && usable && Number(state.width) === rec.width && Number(state.height) === rec.height) {
+          rec.surfaceId = handle;
+          if (key !== rec.textureKey) {
+            rec.textureKey = key;
+            rec.lastCapturedFrame = 0;
+          }
+        }
+      }).catch(() => {});
+    }, 1000);
+    rec.surfaceWatch.unref?.();
+  }
+
+  const { createPacedFramePump } = require('./recording-frame-pump.cjs');
+  rec.pump = createPacedFramePump({
+    fps,
+    startedAt,
+    capture: () => {
+      // Windows readback is asynchronous: it returns null while the GPU copy
+      // is still in flight, and the pump repeats the previous frame rather
+      // than blocking. Never block here -- this runs on the main thread.
+      const frame = isMac
+        ? addon.readIOSurfacePixels(rec.surfaceId)
+        : addon.readSharedTexturePixels(rec.textureKey, rec.lastCapturedFrame + 1);
+      if (!frame?.data || frame.width !== rec.width || frame.height !== rec.height) return null;
+      if (!isMac) rec.lastCapturedFrame = Number(frame.frame ?? rec.lastCapturedFrame);
+      return frame.data;
+    },
+    write: (data) => nativeRecorderWriteStdin(rec, data).catch((err) => {
+      rec.stderr += `\n${err?.message || err}`;
+      throw err;
+    }),
+  });
+  if (args.nativeAudio === true) {
+    try { rec.audioTap = await startRecordingAudioTap(); }
+    catch (err) { console.warn('[NativeRec] clip audio tap unavailable:', err?.message || err); }
+  }
+
+  console.log(`[NativeRec] recording ${source.label} ${width}x${height}@${fps} ${codec.id} `
+    + `${isMac ? `iosurface:${surfaceId}` : `sharedtexture:${textureKey}`} -> ${outputPath}`);
+  return { success: true, width, height, fps, outputPath, nativeAudio: !!rec.audioTap,
+    codec: codec.id, extension: codec.extension, mime: codec.mime, alpha: source.alpha };
+}
+
+/** Mux a renderer-captured audio track into a finished native recording.
+ *
+ *  The native REC paths encode video in the main process (IOSurface pump)
+ *  or via the broker's frame encoder — neither can hear the app's audio
+ *  graph, which lives in the renderer's WebAudio context. So the renderer
+ *  records an opus/webm sidecar with MediaRecorder while video records,
+ *  ships the bytes here at stop, and ffmpeg remuxes: video stream copied
+ *  bit-for-bit (no re-encode), audio transcoded to AAC for MP4 players.
+ *  `-shortest` trims whichever stream ran long, keeping A/V within one
+ *  MediaRecorder chunk (~1s worst case, typically <100ms).
+ *
+ *  With `nativeAudio`, the core's clip mix held by settleRecordingAudioTap
+ *  is aligned to video frame 0 by wall clock and mixed in at unity gain;
+ *  it can also be the only audio when no sidecar source was active. */
+ipcMain.handle('native_recording_mux_audio', async (_event, args = {}) => {
+  const videoPath = typeof args.videoPath === 'string' ? args.videoPath : '';
+  const audio = args.audio instanceof Uint8Array && args.audio.length > 0 ? args.audio : null;
+  const native = args.nativeAudio === true ? pendingNativeRecordingAudio.get(videoPath) ?? null : null;
+  if (native) pendingNativeRecordingAudio.delete(videoPath);
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    discardPendingRecordingAudio(native);
+    return { success: false, error: 'Video file not found for audio mux.' };
+  }
+  if (!audio && !native) {
+    return { success: false, error: 'No audio data supplied.' };
+  }
+  const audioPath = audio ? `${videoPath}.audio.webm` : null;
+  // Same container as the recording: ProRes / HAP stay .mov (PCM audio).
+  const muxedPath = `${videoPath}.muxed${path.extname(videoPath) || '.mp4'}`;
+  try {
+    if (audio) fs.writeFileSync(audioPath, Buffer.from(audio.buffer, audio.byteOffset, audio.byteLength));
+    const { buildRecordingMuxArgs } = require('./native-audio-tap.cjs');
+    const code = await new Promise((resolve, reject) => {
+      const child = spawn(resolveFfmpegPath(), buildRecordingMuxArgs({
+        videoPath, outputPath: muxedPath, sidecarPath: audioPath,
+        tap: native?.tap ?? null, videoStartUnixMs: native?.videoStartUnixMs ?? 0,
+        audioBitrate: args.audioBitrate ?? 192000,
+      }), { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = '';
+      child.stderr.on('data', (c) => { stderr += c; });
+      child.on('close', (c) => (c === 0 ? resolve(c) : reject(new Error(stderr.trim() || `ffmpeg exited ${c}`))));
+      child.on('error', reject);
+    });
+    void code;
+    fs.renameSync(muxedPath, videoPath);
+    console.log(`[NativeRec] audio muxed into ${videoPath}`);
+    return { success: true, outputPath: videoPath };
+  } catch (err) {
+    // The video is intact either way — a failed mux degrades to the old
+    // silent recording rather than losing the capture.
+    try { fs.rmSync(muxedPath, { force: true }); } catch { /* best-effort */ }
+    console.warn('[NativeRec] audio mux failed:', err?.message || err);
+    return { success: false, error: err?.message || String(err) };
+  } finally {
+    if (audioPath) try { fs.rmSync(audioPath, { force: true }); } catch { /* best-effort */ }
+    discardPendingRecordingAudio(native);
+  }
+});
+
+/** Finish an in-core recording. The core wrote and finalized the MP4, so the
+ *  only work left here is the audio remux and a thumbnail. */
+async function stopCoreNativeRecording(rec) {
+  let frames = 0;
+  let coreDuration = 0;
+  try {
+    const stopped = await nativeRendererBroker.invoke('native_renderer_stop_native_recording', {});
+    frames = Number(stopped?.frames ?? 0);
+    coreDuration = Number(stopped?.duration_seconds ?? 0);
+  } catch (err) {
+    await rec.audioTap?.cancel().catch(() => null);
+    return { success: false, error: `Native recording failed to finalize: ${err?.message || err}` };
+  }
+  if (frames <= 0) {
+    await rec.audioTap?.cancel().catch(() => null);
+    return { success: false, error: 'Recording captured no frames.' };
+  }
+  const nativeAudio = await settleRecordingAudioTap(rec.audioTap, rec.outputPath, rec.startedAt);
+  // No CPU frame was ever produced, so take one snapshot now rather than
+  // paying for a readback on every frame just to have a thumbnail.
+  let thumbnailDataUrl = null;
+  try {
+    // include_pixels defaults to false; without it the snapshot carries no
+    // pixels and the take lands in the library with no thumbnail.
+    const snap = await nativeRendererBroker.invoke('native_renderer_get_frame_snapshot',
+      { max_dim: 320, include_pixels: true });
+    const w = Number(snap?.width ?? 0);
+    const h = Number(snap?.height ?? 0);
+    if (snap?.rgba_b64 && w > 0 && h > 0) {
+      // The core names it rgba_b64 but hands back BGRA, which is exactly what
+      // nativeRecorderThumbnail feeds ffmpeg.
+      thumbnailDataUrl = await nativeRecorderThumbnail(Buffer.from(snap.rgba_b64, 'base64'), w, h);
+    }
+  } catch { /* a missing thumbnail must not fail the take */ }
+  // The core's own timestamps, not frames/fps: a static scene renders rarely,
+  // so the frame count understates how long the take actually runs.
+  const durationSeconds = coreDuration > 0 ? coreDuration : frames / Math.max(1, rec.fps);
+  console.log(`[NativeRec] finished ${frames} frames (${durationSeconds.toFixed(1)}s) in-core -> ${rec.outputPath}`);
+  return {
+    success: true,
+    outputPath: rec.outputPath,
+    frames,
+    durationSeconds,
+    width: rec.width,
+    height: rec.height,
+    fps: rec.fps,
+    codec: rec.codec.id,
+    extension: rec.codec.extension,
+    mime: rec.codec.mime,
+    alpha: rec.source.alpha,
+    nativeAudio,
+    thumbnailDataUrl,
+  };
+}
+
+async function stopNativeOutputRecording() {
+  const rec = nativeOutputRecording;
+  nativeOutputRecording = null;
+  if (!rec) return { success: false, error: 'No native output recording is running.' };
+  if (rec.coreEncoded) return stopCoreNativeRecording(rec);
+  const pumped = await rec.pump.stop();
+  const written = pumped.written;
+  if (rec.surfaceWatch) clearInterval(rec.surfaceWatch);
+  // Stop paying for the extra composite pass the moment capture ends.
+  if (rec.recordTargetSet) await clearNativeRecordTarget();
+  try { rec.child.stdin.end(); } catch { /* already closed */ }
+  const code = await rec.exitPromise;
+  if (written <= 0 || code !== 0) {
+    await rec.audioTap?.cancel().catch(() => null);
+    if (written <= 0) return { success: false, error: `Recording captured no frames.${rec.stderr ? ` ${rec.stderr.trim()}` : ''}` };
+    return { success: false, error: `Recording encoder exited with code ${code}.${rec.stderr ? ` ${rec.stderr.trim()}` : ''}` };
+  }
+  // rec.startedAt (the REC press) is the wall-clock instant of video frame 0.
+  const nativeAudio = await settleRecordingAudioTap(rec.audioTap, rec.outputPath, rec.startedAt);
+  const lastFrame = rec.pump.lastFrame;
+  const thumbnailDataUrl = lastFrame
+    ? await nativeRecorderThumbnail(lastFrame, rec.width, rec.height)
+    : null;
+  if (pumped.firstWriteAt) {
+    console.log(`[NativeRec] encoder took its first frame ${pumped.firstWriteAt - rec.startedAt}ms after REC; peak queue ${(pumped.peakQueuedBytes / 1048576).toFixed(0)}MB`);
+  }
+  const durationSeconds = written / rec.fps;
+  console.log(`[NativeRec] finished ${written} frames (${durationSeconds.toFixed(1)}s) -> ${rec.outputPath}`);
+  return {
+    success: true,
+    outputPath: rec.outputPath,
+    frames: written,
+    fps: rec.fps,
+    nativeAudio,
+    durationSeconds,
+    thumbnailDataUrl,
+    codec: rec.codec.id,
+    extension: rec.codec.extension,
+    mime: rec.codec.mime,
+    alpha: rec.source.alpha,
+    width: rec.width,
+    height: rec.height,
+  };
+}
+
+// ── Deck confidence monitor pump ──
+// Polls the core's bank-monitor shared textures and (re)binds them to the
+// named addon monitor views. Each view repaints itself via its display-link;
+// polling here only tracks surface identity/size changes and frame liveness.
+// ── Native slice presentation ───────────────────────────────────────────
+// Each multi-output slice window gets a native layer parented into it,
+// fed by the core's per-slice shared texture. Same transport the deck
+// monitors and the editor preview use, so the projector shows the native
+// composite instead of a second WebGL renderer's crop of a master frame.
+const sliceNativeAttached = new Set();      // sliceId
+const sliceNativePending = new Set();       // sliceId — attach in progress
+let sliceNativePump = null;
+let sliceNativePumpInFlight = false;
+const sliceNativeLastBinding = new Map();   // sliceId -> `${handle}:${w}x${h}`
+
+function sliceMonitorName(sliceId) {
+  return `slice:${sliceId}`;
+}
+
+/** Can the core present a slice natively right now? Answered before the
+ *  window is created, because the answer decides whether the window is
+ *  transparent (native layer underneath) or opaque black (its own WebGL
+ *  render). Attaching against a stopped core would leave the projector
+ *  permanently black instead of falling back. */
+async function probeSliceNativeAvailable() {
+  // Screens were macOS-only: probe, attach and pump were all gated on darwin
+  // or on monitorSetIOSurface, so on Windows every Screen window fell back to
+  // rendering the scene itself in the page with webgpu-disable=1 -- the
+  // pre-native browser path, in a build that is otherwise native-only. The
+  // DXGI presenter has exported monitorAttach/monitorSetSharedTexture/
+  // monitorDetach all along, the core's slice metadata already carries
+  // shared_name and frame, and the deck-monitor pump next door has been
+  // driving exactly this pair on both platforms.
+  if (!isMac && !isWin) return false;
+  const addon = nativePreviewAddon || loadNativePreviewAddon();
+  const setter = isWin ? 'monitorSetSharedTexture' : 'monitorSetIOSurface';
+  if (!addon || typeof addon.monitorAttach !== 'function' || typeof addon[setter] !== 'function') return false;
+  try {
+    const probe = await nativeRendererBroker.invoke('native_renderer_get_slice_output_state', {});
+    return !!probe?.available;
+  } catch {
+    return false;
+  }
+}
+
+/** Parent a native presentation layer into a slice window, filling it.
+ *  Returns false when the platform or addon can't do it, in which case the
+ *  slice window falls back to its own WebGL render. */
+function attachSliceNativeLayer(sliceId, win) {
+  if (!isMac && !isWin) return false;
+  const addon = nativePreviewAddon || loadNativePreviewAddon();
+  if (!addon || typeof addon.monitorAttach !== 'function') return false;
+  if (!win || win.isDestroyed()) return false;
+  try {
+    const handle = win.getNativeWindowHandle();
+    if (!Buffer.isBuffer(handle) || handle.length === 0) return false;
+    const [width, height] = win.getContentSize();
+    const rect = {
+      x: 0,
+      y: 0,
+      width: Math.max(1, width),
+      height: Math.max(1, height),
+      contentX: 0,
+      contentY: 0,
+      contentWidth: Math.max(1, width),
+      contentHeight: Math.max(1, height),
+      generation: Date.now() & 0x7fffffff,
+    };
+    if (!addon.monitorAttach(sliceMonitorName(sliceId), handle, rect)) return false;
+    sliceNativeAttached.add(sliceId);
+    startSliceNativePump();
+    console.log(`[SliceNative] attached ${sliceId} (${rect.width}x${rect.height})`);
+    return true;
+  } catch (err) {
+    console.warn(`[SliceNative] attach unavailable for ${sliceId}:`, err?.message || err);
+    return false;
+  } finally {
+    sliceNativePending.delete(sliceId);
+  }
+}
+
+function detachSliceNativeLayer(sliceId) {
+  sliceNativePending.delete(sliceId);
+  if (!sliceNativeAttached.has(sliceId)) return;
+  sliceNativeAttached.delete(sliceId);
+  sliceNativeLastBinding.delete(sliceId);
+  const addon = nativePreviewAddon;
+  if (addon && typeof addon.monitorDetach === 'function') {
+    try { addon.monitorDetach(sliceMonitorName(sliceId)); } catch { /* teardown best-effort */ }
+  }
+  if (sliceNativeAttached.size === 0) stopSliceNativePump();
+}
+
+function startSliceNativePump() {
+  if (sliceNativePump) return;
+  sliceNativePump = setInterval(async () => {
+    if (sliceNativePumpInFlight || sliceNativeAttached.size === 0) return;
+    sliceNativePumpInFlight = true;
+    try {
+      const addon = nativePreviewAddon;
+      const setter = isWin ? 'monitorSetSharedTexture' : 'monitorSetIOSurface';
+      if (!addon || typeof addon[setter] !== 'function') return;
+      const state = await nativeRendererBroker.invoke('native_renderer_get_slice_output_state', {});
+      if (!state?.available || !Array.isArray(state.slices)) return;
+      for (const entry of state.slices) {
+        const sliceId = typeof entry?.id === 'string' ? entry.id : '';
+        if (!sliceId || !sliceNativeAttached.has(sliceId)) continue;
+        const surfaceId = Number(entry?.handle ?? 0);
+        // Windows addresses the texture by name; its handle is process-local.
+        const sharedName = String(entry?.shared_name ?? '');
+        const width = Number(entry?.width ?? 0);
+        const height = Number(entry?.height ?? 0);
+        const frame = Number(entry?.frame ?? 0);
+        if ((isWin ? !sharedName : !Number.isFinite(surfaceId) || surfaceId <= 0)
+          || width <= 0 || height <= 0) continue;
+        // macOS installs a display-link source, so binding once is enough and
+        // the core keeps writing into the same IOSurface. The Windows API
+        // presents once per call, so the frame counter has to be part of the
+        // key or the Screen would freeze on its first frame.
+        const binding = isWin
+          ? `${sharedName}:${width}x${height}:${frame}`
+          : `${surfaceId}:${width}x${height}`;
+        if (sliceNativeLastBinding.get(sliceId) === binding) continue;
+        const presented = isWin
+          ? addon.monitorSetSharedTexture(sliceMonitorName(sliceId), sharedName, width, height)
+          : addon.monitorSetIOSurface(sliceMonitorName(sliceId), surfaceId, width, height, false);
+        if (presented) {
+          const first = !sliceNativeLastBinding.has(sliceId);
+          sliceNativeLastBinding.set(sliceId, binding);
+          if (first) {
+            console.log(`[SliceNative] ${sliceId} bound `
+              + `${isWin ? sharedName : `iosurface:${surfaceId}`} ${width}x${height}`);
+          }
+        }
+      }
+    } catch {
+      // Broker restarts surface as transient failures; keep polling.
+    } finally {
+      sliceNativePumpInFlight = false;
+    }
+  }, isWin ? 1000 / 30 : 250);
+  sliceNativePump.unref?.();
+  console.log(`[SliceNative] pump started (${isWin ? 'dxgi per-frame' : 'iosurface bind'})`);
+}
+
+function stopSliceNativePump() {
+  if (!sliceNativePump) return;
+  clearInterval(sliceNativePump);
+  sliceNativePump = null;
+  console.log('[SliceNative] pump stopped');
+}
+
+const deckMonitorAttachedNames = new Set();
+let deckMonitorPump = null;
+let deckMonitorPumpInFlight = false;
+let deckMonitorPumpGeneration = 0;
+const deckMonitorLastBinding = new Map(); // name -> `${handle}:${w}x${h}`
+const deckMonitorLastFrame = new Map();   // name -> { frame, at }
+
+function startDeckMonitorPump() {
+  if (deckMonitorPump) return;
+  const generation = deckMonitorPumpGeneration;
+  deckMonitorPump = setInterval(async () => {
+    if (generation !== deckMonitorPumpGeneration || deckMonitorPumpInFlight || deckMonitorAttachedNames.size === 0) return;
+    deckMonitorPumpInFlight = true;
+    try {
+      const addon = nativePreviewAddon;
+      const windows = process.platform === 'win32';
+      if (!addon || typeof addon[windows ? 'monitorSetSharedTexture' : 'monitorSetIOSurface'] !== 'function') return;
+      const state = await nativeRendererBroker.invoke('native_renderer_get_deck_monitor_state', {});
+      if (generation !== deckMonitorPumpGeneration) return;
+      if (!state?.available || !Array.isArray(state.banks)) return;
+      for (const bank of state.banks) {
+        const name = bank?.bank === 'b' ? 'deck-b' : 'deck-a';
+        if (!deckMonitorAttachedNames.has(name)) continue;
+        const surfaceId = Number(bank?.handle ?? 0);
+        const sharedName = String(bank?.shared_name ?? '');
+        const width = Number(bank?.width ?? 0);
+        const height = Number(bank?.height ?? 0);
+        if ((windows ? !sharedName : !Number.isFinite(surfaceId) || surfaceId <= 0) || width <= 0 || height <= 0) continue;
+        const frame = Number(bank?.frame ?? 0);
+        const now = Date.now();
+        const last = deckMonitorLastFrame.get(name);
+        if (last && last.frame === frame && now - last.at > 1500) {
+          // Core stopped producing monitor frames (crossfader off) — leave
+          // the last frame on screen; the UI hides the containers anyway.
+          continue;
+        }
+        if (!last || last.frame !== frame) deckMonitorLastFrame.set(name, { frame, at: now });
+        // The Windows API presents once per call; macOS installs a display-link
+        // source. Windows must present each new frame, not just bind once.
+        const binding = windows ? `${sharedName}:${width}x${height}:${frame}` : `${surfaceId}:${width}x${height}`;
+        if (deckMonitorLastBinding.get(name) === binding) continue;
+        const presented = windows
+          ? addon.monitorSetSharedTexture(name, sharedName, width, height)
+          : addon.monitorSetIOSurface(name, surfaceId, width, height, false);
+        if (presented) {
+          const firstBinding = !deckMonitorLastBinding.has(name);
+          deckMonitorLastBinding.set(name, binding);
+          if (firstBinding) console.log(`[DeckMonitor] ${name} bound ${windows ? sharedName : `iosurface:${surfaceId}`} ${width}x${height}`);
+        }
+      }
+    } catch (err) {
+      // Broker restarts surface as transient failures; keep polling.
+    } finally {
+      if (generation === deckMonitorPumpGeneration) deckMonitorPumpInFlight = false;
+    }
+  }, process.platform === 'win32' ? 1000 / 30 : 250);
+  deckMonitorPump.unref?.();
+  console.log('[DeckMonitor] pump started');
+}
+
+function stopDeckMonitorPump() {
+  deckMonitorPumpGeneration++;
+  deckMonitorPumpInFlight = false;
+  if (deckMonitorPump) {
+    clearInterval(deckMonitorPump);
+    deckMonitorPump = null;
+  }
+  deckMonitorLastBinding.clear();
+  deckMonitorLastFrame.clear();
+}
+
+// The rectangle the platform presenter takes. Windows positions the preview in
+// physical pixels (see nativePreviewRectToDevicePixels). The renderer sends its
+// devicePixelRatio, which tracks the monitor the window is on right now; the
+// display lookup covers a renderer that did not.
+function nativePreviewAddonRect(rect, rectArgs) {
+  if (process.platform !== 'win32') {
+    // CSS pixels shrink as Chromium zoom increases; AppKit needs host points.
+    return nativePreviewRectToDevicePixels(rect, mainWindow?.webContents.getZoomFactor() || 1);
+  }
+  let ratio = Number(rectArgs?.pixelRatio);
+  if (!Number.isFinite(ratio) || ratio <= 0) {
+    try {
+      ratio = mainWindow && !mainWindow.isDestroyed()
+        ? screen.getDisplayMatching(mainWindow.getBounds()).scaleFactor
+        : 1;
+    } catch {
+      ratio = 1;
+    }
+  }
+  return nativePreviewRectToDevicePixels(rect, ratio);
+}
+
+function attachNativeEditorPreview(rectArgs = {}) {
+  const addon = loadNativePreviewAddon();
+  if (!addon || typeof addon.attach !== 'function') {
+    return getNativePreviewStatus({ attached: false });
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return getNativePreviewStatus({ attached: false, error: 'main window is unavailable' });
+  }
+
+  const rect = normalizeNativePreviewRect(rectArgs, ++nativePreviewGeometryGeneration);
+  if (process.env.GA_DEBUG_PREVIEW_RECT === '1') {
+    console.log(`[NativePreview] attach rect in=${JSON.stringify(rectArgs)} normalized=${rect.x},${rect.y} ${rect.width}x${rect.height}`);
+  }
+  const signature = nativePreviewRectSignature(rect);
+  try {
+    const handle = mainWindow.getNativeWindowHandle();
+    if (!Buffer.isBuffer(handle) || handle.length === 0) {
+      return getNativePreviewStatus({ attached: false, error: 'main window native handle is unavailable' });
+    }
+    const addonRect = nativePreviewAddonRect(rect, rectArgs);
+    const status = nativePreviewAttached && signature === nativePreviewLastRectSignature
+      ? addon.update(addonRect)
+      : addon.attach(handle, addonRect);
+    nativePreviewAttached = !!status?.attached;
+    const geometryMatches = nativePreviewGeometryMatches(addonRect, status);
+    nativePreviewLastRectSignature = geometryMatches ? signature : '';
+    startNativeEditorPreviewPump();
+    return getNativePreviewStatus({ rect, geometryMatches });
+  } catch (err) {
+    nativePreviewAddonLoadError = err?.message || String(err);
+    console.error('[NativePreview] attach/update failed:', nativePreviewAddonLoadError);
+    return getNativePreviewStatus({ attached: false, rect });
+  }
+}
+
+function stabilizeNativeEditorHost() {
+  if (process.platform !== 'darwin' || !mainWindow || mainWindow.isDestroyed()) return false;
+  const addon = loadNativePreviewAddon();
+  if (!addon || typeof addon.stabilizeHost !== 'function') return false;
+  try {
+    const handle = mainWindow.getNativeWindowHandle();
+    if (!Buffer.isBuffer(handle) || handle.length === 0) return false;
+    return addon.stabilizeHost(handle) !== false;
+  } catch (err) {
+    nativePreviewAddonLoadError = err?.message || String(err);
+    console.warn('[NativePreview] failed to stabilize AppKit host:', nativePreviewAddonLoadError);
+    return false;
+  }
+}
+
+function updateNativeEditorPreview(rectArgs = {}) {
+  const addon = nativePreviewAddon || loadNativePreviewAddon();
+  if (!addon || typeof addon.update !== 'function') return getNativePreviewStatus();
+  if (!nativePreviewAttached) return attachNativeEditorPreview(rectArgs);
+  const rect = normalizeNativePreviewRect(rectArgs, ++nativePreviewGeometryGeneration);
+  const signature = nativePreviewRectSignature(rect);
+  try {
+    const handle = mainWindow && !mainWindow.isDestroyed()
+      ? mainWindow.getNativeWindowHandle()
+      : null;
+    if (!Buffer.isBuffer(handle) || handle.length === 0) {
+      return getNativePreviewStatus({
+        attached: false,
+        rect,
+        error: 'main window native handle is unavailable',
+      });
+    }
+    const addonRect = nativePreviewAddonRect(rect, rectArgs);
+    const status = addon.update(handle, addonRect);
+    nativePreviewAttached = !!status?.attached;
+    const geometryMatches = nativePreviewGeometryMatches(addonRect, status);
+    nativePreviewLastRectSignature = geometryMatches ? signature : '';
+    startNativeEditorPreviewPump();
+    return getNativePreviewStatus({ rect, geometryMatches });
+  } catch (err) {
+    nativePreviewAddonLoadError = err?.message || String(err);
+    return getNativePreviewStatus({ rect });
+  }
+}
+
+function detachNativeEditorPreview(reason = 'detach') {
+  stopNativeEditorPreviewPump(reason);
+  const addon = nativePreviewAddon;
+  if (addon && typeof addon.detach === 'function') {
+    try { addon.detach(); } catch (err) {
+      nativePreviewAddonLoadError = err?.message || String(err);
+    }
+  }
+  nativePreviewAttached = false;
+  nativePreviewLastPresentedFrame = 0;
+  nativePreviewLastRectSignature = '';
+  return getNativePreviewStatus();
 }
 
 // NDI native addon — cross-platform sender via NewTek's NDI SDK.
@@ -1491,7 +3596,7 @@ function loadNdiAddon() {
       return null;
     }
     ndiAddonLoadPath = addonPath;
-    ndiAddon = require(addonPath);
+    ndiAddon = require('./ndi-runtime.cjs').loadWithNdiRuntime(addonPath);
     if (!ndiAddon.available()) {
       ndiAddonLoadError = 'NDI runtime not available. Install NDI and restart Ghost Arcade.';
       console.warn(`[NDI] Addon loaded but ${ndiAddonLoadError}.`);
@@ -1509,6 +3614,165 @@ function loadNdiAddon() {
 const ndiSenders = new Set();    // tracks live sender names so we can destroy on quit
 const ndiReceivers = new Set();  // tracks live receiver source names
 
+// ── NDI output pump (macOS/Windows, native composite) ────────────────────────
+// Streams the native renderer's composite output over NDI. Modeled on
+// nativeOutputTextureSharePump: polls the core's shared-texture
+// metadata, dedupes on frame counter, and on macOS reads the IOSurface
+// pixels via the presenter addon (same full-rate CPU tap the native
+// recorder uses), then hands the BGRA buffer to the NDI addon's async
+// sender. Windows uses a nonblocking two-slot DXGI readback ring.
+let ndiOutputPumpGeneration = 0;
+let ndiOutputPumpTextureKey = null;
+let ndiOutputPumpTimer = null;
+let ndiOutputPumpName = null;
+let ndiOutputPumpFps = 0;
+let ndiOutputPumpInFlight = false;
+let ndiOutputPumpLastFrame = 0;
+let ndiOutputPumpFailCount = 0;
+let ndiOutputPumpFrameCount = 0;
+let ndiOutputPumpLastLogTime = 0;
+let ndiOutputPumpLastError = null;
+
+function ndiOutputUnavailableReason() {
+  if (!isMac && process.platform !== 'win32') return 'NDI composite output requires macOS or Windows';
+  if (!loadNdiAddon()) return getNdiLoadStatus()?.error || 'NDI addon not available';
+  const preview = nativePreviewAddon || loadNativePreviewAddon();
+  const capture = isMac ? 'readIOSurfacePixels' : 'readSharedTexturePixels';
+  if (!preview || typeof preview[capture] !== 'function') {
+    return `Presenter addon lacks ${isMac ? 'IOSurface' : 'DXGI'} capture support`;
+  }
+  return null;
+}
+
+function stopNdiOutputPump() {
+  ndiOutputPumpGeneration++;
+  ndiOutputPumpTextureKey = null;
+  try { nativePreviewAddon?.releaseReadback?.(); } catch { /* device already gone */ }
+  if (ndiOutputPumpTimer) {
+    clearInterval(ndiOutputPumpTimer);
+    ndiOutputPumpTimer = null;
+  }
+  ndiOutputPumpInFlight = false;
+  ndiOutputPumpLastFrame = 0;
+  ndiOutputPumpFailCount = 0;
+  const name = ndiOutputPumpName;
+  ndiOutputPumpName = null;
+  if (name && ndiAddon) {
+    try { ndiAddon.destroySender({ name }); } catch { /* already gone */ }
+    ndiSenders.delete(name);
+  }
+  if (name) console.log(`[NDI Out] pump stopped (${name})`);
+}
+
+function startNdiOutputPump({ name, fps } = {}) {
+  const senderName = String(name || 'Ghost Arcade').trim() || 'Ghost Arcade';
+  const rate = Math.max(1, Math.min(60, Number(fps) || OSR_PAINT_FPS || 60));
+  const reason = ndiOutputUnavailableReason();
+  if (reason) return { ok: false, active: false, reason };
+
+  // Restarting with the same name is a no-op; a new name swaps senders.
+  if (ndiOutputPumpTimer && ndiOutputPumpName === senderName && ndiOutputPumpFps === rate) {
+    return { ok: true, active: true, name: senderName, fps: rate };
+  }
+  stopNdiOutputPump();
+
+  const a = loadNdiAddon();
+  try {
+    a.createSender({ name: senderName });
+    ndiSenders.add(senderName);
+  } catch (err) {
+    // "already exists" from a previous run is fine — reuse it.
+    if (!/already exists/i.test(String(err?.message || err))) {
+      return { ok: false, active: false, reason: String(err?.message || err) };
+    }
+  }
+  ndiOutputPumpName = senderName;
+  ndiOutputPumpFps = rate;
+  ndiOutputPumpLastFrame = 0;
+  ndiOutputPumpFailCount = 0;
+  ndiOutputPumpFrameCount = 0;
+  ndiOutputPumpLastLogTime = Date.now();
+  ndiOutputPumpLastError = null;
+
+  const preview = nativePreviewAddon || loadNativePreviewAddon();
+  const generation = ndiOutputPumpGeneration;
+  const tick = async () => {
+    if (generation !== ndiOutputPumpGeneration || !ndiOutputPumpTimer || ndiOutputPumpInFlight) return;
+    ndiOutputPumpInFlight = true;
+    try {
+      const texture = await getNativeOutputSharedTextureMetadata();
+      if (generation !== ndiOutputPumpGeneration || !ndiOutputPumpTimer) return;
+      const textureKey = isMac ? String(texture?.handle ?? 0) : String(texture?.shared_name ?? texture?.name ?? '');
+      const surfaceId = Number(texture?.handle ?? 0);
+      const width = Number(texture?.width ?? 0);
+      const height = Number(texture?.height ?? 0);
+      const frameId = Math.max(0, Math.floor(Number(texture?.frame ?? 0)));
+      if (!texture?.available || (isMac ? !Number.isFinite(surfaceId) || surfaceId <= 0 : !textureKey) ||
+          width <= 0 || height <= 0 || frameId <= 0) {
+        ndiOutputPumpFailCount++;
+        if (ndiOutputPumpFailCount === 5) {
+          ndiOutputPumpLastError = 'Native output shared texture is unavailable';
+          console.warn('[NDI Out] native output shared texture unavailable:', JSON.stringify(texture ?? null));
+        }
+        return;
+      }
+      if (textureKey !== ndiOutputPumpTextureKey) {
+        ndiOutputPumpTextureKey = textureKey;
+        ndiOutputPumpLastFrame = 0;
+      }
+      // Windows must drain queued readback even when the core stops advancing.
+      if (isMac && frameId === ndiOutputPumpLastFrame) return;
+      const frame = isMac ? preview.readIOSurfacePixels(surfaceId)
+        : preview.readSharedTexturePixels(textureKey, frameId);
+      if (!isMac && !frame) return; // Pending GPU copy: never block the UI.
+      const capturedFrame = isMac ? frameId : Number(frame?.frame ?? 0);
+      if (capturedFrame === ndiOutputPumpLastFrame) return;
+      if (!frame?.data || frame.width !== width || frame.height !== height) {
+        ndiOutputPumpFailCount++;
+        return;
+      }
+      const a2 = loadNdiAddon();
+      if (!a2) return;
+      a2.sendImage({ name: senderName, data: frame.data, width, height, fps: rate });
+      ndiOutputPumpLastFrame = capturedFrame;
+      ndiOutputPumpLastError = null;
+      ndiOutputPumpFailCount = 0;
+      ndiOutputPumpFrameCount++;
+      const now = Date.now();
+      if (now - ndiOutputPumpLastLogTime > 5000) {
+        const fpsActual = ndiOutputPumpFrameCount / ((now - ndiOutputPumpLastLogTime) / 1000);
+        console.log(`[NDI Out] ${ndiOutputPumpName} ${width}x${height} @ ${fpsActual.toFixed(1)} fps`);
+        ndiOutputPumpFrameCount = 0;
+        ndiOutputPumpLastLogTime = now;
+      }
+    } catch (err) {
+      if (generation !== ndiOutputPumpGeneration) return;
+      ndiOutputPumpFailCount++;
+      ndiOutputPumpLastError = String(err?.message || err);
+      if (ndiOutputPumpFailCount <= 5) {
+        console.error('[NDI Out] pump error:', ndiOutputPumpLastError);
+      }
+    } finally {
+      if (generation === ndiOutputPumpGeneration) ndiOutputPumpInFlight = false;
+    }
+  };
+  ndiOutputPumpTimer = setInterval(tick, Math.max(4, Math.floor(1000 / rate)));
+  console.log(`[NDI Out] pump started: "${senderName}" @ ${rate} fps`);
+  return { ok: true, active: true, name: senderName, fps: rate };
+}
+
+function ndiOutputPumpStatus() {
+  const reason = ndiOutputUnavailableReason();
+  return {
+    available: !reason,
+    active: !!ndiOutputPumpTimer,
+    name: ndiOutputPumpName,
+    fps: ndiOutputPumpFps || null,
+    reason: reason || undefined,
+    lastError: ndiOutputPumpLastError || undefined,
+  };
+}
+
 // Ableton Link — main-process singleton (Link spawns its own network
 // threads; one session per app). Lazily created on first link_enable.
 // GPLv2 vendor — commercial distribution needs Ableton's no-cost Link
@@ -1517,6 +3781,16 @@ let linkAddon = null;
 let linkAddonLoadAttempted = false;
 let linkAddonLoadError = null;
 let linkSession = null;
+// Feed the native clock from main; editor long tasks cannot suspend phase following.
+const nativeLinkClockTimer = setInterval(() => {
+  if (!linkSession) return;
+  try {
+    const state = linkSession.getState();
+    nativeRendererBroker.notify('submit_commands', { commands: [{ type: 'set_link_clock',
+      enabled: !!state.enabled && state.peers > 0, beat: state.beat, tempo: state.tempo }] });
+  } catch { /* The core expires a stale clock after 500 ms. */ }
+}, 100);
+nativeLinkClockTimer.unref();
 
 function loadLinkAddon() {
   if (linkAddon) return linkAddon;
@@ -1564,7 +3838,7 @@ function shutdownLink() {
  * publishFrameTexture) is now compatibility fallback only, triggered if OSR
  * fails to start or the watchdog drops it after 3s of no frames.
  */
-function createSpoutSender(name, width, height) {
+function createSpoutSender(name, width, height, { startOsr = true } = {}) {
   const addon = loadSpoutAddon();
   if (!addon) {
     console.error(`[${textureShareLabel}] Cannot create sender — addon not loaded`);
@@ -1608,16 +3882,18 @@ function createSpoutSender(name, width, height) {
     spoutCpuFallbackWarned = false;
     console.log(`[${textureShareLabel}] Sender "${name}" created`);
 
-    // Zero-copy OSR path — works on both Windows (DXGI shared handle) and
-    // macOS (IOSurface). The OSR BrowserWindow code below is platform-agnostic;
-    // the addons diverge in what they do with the handle: SpoutOutput opens a
-    // shared D3D11 resource, SyphonOutput looks up an IOSurface. If OSR fails
-    // to start (e.g. Chromium didn't grant a shared texture), the watchdog
-    // falls back to the CPU send pump transparently.
-    try {
-      createSpoutOsrWindow(width, height);
-    } catch (err) {
-      console.error(`[${textureShareLabel}] OSR window creation failed, using CPU path:`, err.message);
+    if (startOsr) {
+      // Zero-copy OSR path — works on both Windows (DXGI shared handle) and
+      // macOS (IOSurface). The OSR BrowserWindow code below is platform-agnostic;
+      // the addons diverge in what they do with the handle: SpoutOutput opens a
+      // shared D3D11 resource, SyphonOutput looks up an IOSurface. If OSR fails
+      // to start (e.g. Chromium didn't grant a shared texture), the watchdog
+      // falls back to the CPU send pump transparently.
+      try {
+        createSpoutOsrWindow(width, height);
+      } catch (err) {
+        console.error(`[${textureShareLabel}] OSR window creation failed, using CPU path:`, err.message);
+      }
     }
 
     return true;
@@ -1629,6 +3905,8 @@ function createSpoutSender(name, width, height) {
 
 function stopSpoutSender() {
   spoutSendActive = false;
+  stopNativeOutputTextureSharePromotion();
+  stopNativeOutputTextureSharePump();
 
   // Tear down OSR window first
   destroySpoutOsrWindow();
@@ -1899,7 +4177,7 @@ function destroySpoutOsrWindow() {
 function notifyMainWindowOsrStatus(active, reason) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {
-      mainWindow.webContents.send('spout-osr-status', {
+      mainWindow?.webContents.send('spout-osr-status', {
         active,
         reason,
         cpuFallbackAllowed: ALLOW_CPU_TEXTURE_SHARE_FALLBACK,
@@ -1962,7 +4240,353 @@ function stopOsrPaintPump() {
   } catch {}
 }
 
+function nativeOutputTextureHandleBuffer(texture) {
+  if (!texture || typeof texture !== 'object') return null;
+  if (
+    isWin &&
+    String(texture.platform ?? '').toLowerCase() === 'dxgi' &&
+    String(texture.handle_scope ?? texture.handleScope ?? '').toLowerCase() === 'process-local'
+  ) {
+    return null;
+  }
+  const encoding = String(texture.handle_encoding ?? texture.handleEncoding ?? '').toLowerCase();
+  const handle = texture.handle;
+  if (Buffer.isBuffer(handle)) return handle.length >= 8 ? handle : null;
+  if (handle instanceof Uint8Array) return handle.byteLength >= 8 ? Buffer.from(handle) : null;
+  if (handle instanceof ArrayBuffer) return handle.byteLength >= 8 ? Buffer.from(handle) : null;
+  if (encoding === 'base64' && typeof handle === 'string') {
+    const buffer = Buffer.from(handle, 'base64');
+    return buffer.length >= 8 ? buffer : null;
+  }
+  if ((encoding === 'integer' || encoding === 'opaque' || !encoding) && handle !== undefined && handle !== null) {
+    try {
+      const value = typeof handle === 'bigint'
+        ? handle
+        : typeof handle === 'number'
+          ? BigInt(Math.trunc(handle))
+          : BigInt(String(handle).trim());
+      if (value <= 0n) return null;
+      const buffer = Buffer.alloc(8);
+      buffer.writeBigUInt64LE(value);
+      return buffer;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function nativeOutputTextureName(texture) {
+  if (!texture || typeof texture !== 'object') return '';
+  return String(texture.name ?? texture.shared_name ?? texture.sharedName ?? '').trim();
+}
+
+function hasNativeOutputTextureSharePublisher(output = spoutOutput) {
+  if (!output) return false;
+  if (isMac) return typeof output.publishIOSurface === 'function';
+  if (isWin) {
+    return typeof output.sendTextureByName === 'function' || typeof output.sendTexture === 'function';
+  }
+  return false;
+}
+
+function nativeOutputTextureShareMethodLabel(texture = null, output = spoutOutput) {
+  if (isMac) return 'publishIOSurface';
+  if (isWin) {
+    if (nativeOutputTextureName(texture) && typeof output?.sendTextureByName === 'function') {
+      return 'sendTextureByName';
+    }
+    if (nativeOutputTextureHandleBuffer(texture) && typeof output?.sendTexture === 'function') {
+      return 'sendTexture';
+    }
+    return 'sendTextureByName/sendTexture';
+  }
+  return 'nativeTextureShare';
+}
+
+function isNativeOutputTextureHandleReady(texture) {
+  if (!texture || typeof texture !== 'object') return false;
+  const surfaceId = Number(texture.handle);
+  const width = Number(texture.width ?? 0);
+  const height = Number(texture.height ?? 0);
+  if (!(texture.available && Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0)) {
+    return false;
+  }
+  if (isMac) {
+    return !!(
+      texture.platform === 'iosurface' &&
+      Number.isFinite(surfaceId) &&
+      surfaceId > 0
+    );
+  }
+  return texture.platform === 'dxgi' && !!(nativeOutputTextureName(texture) || nativeOutputTextureHandleBuffer(texture));
+}
+
+function isPublishableNativeOutputTexture(texture) {
+  return isNativeOutputTextureHandleReady(texture) && Number(texture.frame ?? 0) > 0;
+}
+
+function canPublishNativeOutputTextureWithOutput(texture, output = spoutOutput) {
+  if (!isNativeOutputTextureHandleReady(texture)) return false;
+  if (isMac) return typeof output?.publishIOSurface === 'function';
+  if (isWin) {
+    const sharedName = nativeOutputTextureName(texture);
+    if (sharedName) return typeof output?.sendTextureByName === 'function';
+    return !!(nativeOutputTextureHandleBuffer(texture) && typeof output?.sendTexture === 'function');
+  }
+  return false;
+}
+
+async function getNativeOutputSharedTextureMetadata() {
+  try {
+    return await nativeRendererBroker.invoke('native_renderer_get_output_shared_texture', {});
+  } catch (err) {
+    if (nativeOutputTextureShareFailCount < 5) {
+      console.warn('[NativeRenderer] output shared-texture query failed:', err?.message || err);
+      nativeOutputTextureShareFailCount++;
+    }
+    return null;
+  }
+}
+
+async function canPublishNativeOutputTextureShare() {
+  const addon = loadSpoutAddon();
+  const OutputClass = addon ? getOutputClass(addon) : null;
+  const hasPublisher = !!OutputClass && hasNativeOutputTextureSharePublisher(OutputClass.prototype);
+  const method = nativeOutputTextureShareMethodLabel(null, OutputClass?.prototype);
+  if (!hasPublisher) {
+    return { ok: false, texture: null, reason: `${textureShareLabel} native output ${method} is unavailable` };
+  }
+  const texture = await getNativeOutputSharedTextureMetadata();
+  const canPublish = canPublishNativeOutputTextureWithOutput(texture, OutputClass.prototype);
+  return {
+    ok: canPublish,
+    texture,
+    reason: texture?.reason ||
+      (isWin && isNativeOutputTextureHandleReady(texture) && !canPublish
+        ? 'native DXGI output requires sendTextureByName for process-local handles'
+        : `native renderer output ${isMac ? 'IOSurface' : 'DXGI texture'} is unavailable`),
+  };
+}
+
+function stopNativeOutputTextureSharePump(reason = 'stopped') {
+  const wasActive = nativeOutputTextureShareActive;
+  if (nativeOutputTextureSharePump) {
+    clearInterval(nativeOutputTextureSharePump);
+    nativeOutputTextureSharePump = null;
+  }
+  nativeOutputTextureShareActive = false;
+  nativeOutputTextureShareInFlight = false;
+  nativeOutputTextureShareWaitingForFrame = false;
+  nativeOutputTextureShareLastPublishedFrame = 0;
+  nativeOutputTextureShareLastPublishedHandle = null;
+  if (wasActive) {
+    notifyMainWindowOsrStatus(false, reason);
+  }
+}
+
+function stopNativeOutputTextureSharePromotion() {
+  if (nativeOutputTextureSharePromoteTimer) {
+    clearInterval(nativeOutputTextureSharePromoteTimer);
+    nativeOutputTextureSharePromoteTimer = null;
+  }
+  nativeOutputTextureSharePromoteInFlight = false;
+  nativeOutputTextureSharePromotionReason = null;
+}
+
+function startNativeOutputTextureSharePromotion(reason = 'waiting-for-native-output') {
+  if (nativeOutputTextureShareActive || nativeOutputTextureSharePromoteTimer) {
+    return false;
+  }
+  if (!spoutSendActive || !hasNativeOutputTextureSharePublisher(spoutOutput)) {
+    return false;
+  }
+
+  nativeOutputTextureSharePromoteAttempts = 0;
+  nativeOutputTextureSharePromotionReason = reason;
+
+  const tryPromote = async () => {
+    if (!spoutSendActive || !spoutOutput || nativeOutputTextureShareActive) {
+      stopNativeOutputTextureSharePromotion();
+      return;
+    }
+    if (nativeOutputTextureSharePromoteInFlight) return;
+    nativeOutputTextureSharePromoteInFlight = true;
+    nativeOutputTextureSharePromoteAttempts++;
+
+    try {
+      const texture = await getNativeOutputSharedTextureMetadata();
+      if (!isNativeOutputTextureHandleReady(texture)) {
+        if (nativeOutputTextureSharePromoteAttempts === 1 || nativeOutputTextureSharePromoteAttempts % 10 === 0) {
+          console.log(`[${textureShareLabel} Native] waiting to promote sender to native ${isMac ? 'IOSurface' : 'DXGI'} output: ${texture?.reason || reason}`);
+        }
+        return;
+      }
+      if (!canPublishNativeOutputTextureWithOutput(texture, spoutOutput)) {
+        if (nativeOutputTextureSharePromoteAttempts === 1 || nativeOutputTextureSharePromoteAttempts % 10 === 0) {
+          console.log(`[${textureShareLabel} Native] waiting for ${textureShareLabel} addon support for ${nativeOutputTextureShareMethodLabel(texture, spoutOutput)}`);
+        }
+        return;
+      }
+      if (!isPublishableNativeOutputTexture(texture)) {
+        if (nativeOutputTextureSharePromoteAttempts === 1 || nativeOutputTextureSharePromoteAttempts % 10 === 0) {
+          console.log(`[${textureShareLabel} Native] waiting to promote sender until the native output has a rendered frame`);
+        }
+        return;
+      }
+
+      const started = startNativeOutputTextureSharePump(texture);
+      if (!started) return;
+
+      destroySpoutOsrWindow();
+      console.log(`[${textureShareLabel} Native] promoted sender to native ${isMac ? 'IOSurface' : 'DXGI'} output after ${nativeOutputTextureSharePromoteAttempts} check(s)`);
+      stopNativeOutputTextureSharePromotion();
+    } catch (err) {
+      if (nativeOutputTextureSharePromoteAttempts <= 5) {
+        console.warn(`[${textureShareLabel} Native] promotion check failed:`, err?.message || err);
+      }
+    } finally {
+      nativeOutputTextureSharePromoteInFlight = false;
+    }
+  };
+
+  nativeOutputTextureSharePromoteTimer = setInterval(tryPromote, 1000);
+  void tryPromote();
+  return true;
+}
+
+function startNativeOutputTextureSharePump(initialTexture = null) {
+  stopNativeOutputTextureSharePromotion();
+  stopNativeOutputTextureSharePump();
+
+  if (!hasNativeOutputTextureSharePublisher(spoutOutput)) {
+    return false;
+  }
+
+  const intervalMs = Math.max(4, Math.round(1000 / OSR_PAINT_FPS));
+  nativeOutputTextureShareActive = true;
+  nativeOutputTextureShareFrameCount = 0;
+  nativeOutputTextureShareLastPublishedFrame = 0;
+  nativeOutputTextureShareLastPublishedHandle = null;
+  nativeOutputTextureShareFailCount = 0;
+  nativeOutputTextureShareWaitingForFrame = false;
+  nativeOutputTextureShareWaitingForFrameLogged = false;
+  nativeOutputTextureShareLastLogTime = Date.now();
+  notifyMainWindowOsrStatus(true, isMac ? 'native-iosurface' : 'native-dxgi');
+
+  const publish = async (knownTexture = null) => {
+    if (!nativeOutputTextureShareActive || nativeOutputTextureShareInFlight) return;
+    nativeOutputTextureShareInFlight = true;
+    try {
+      const texture = knownTexture || await getNativeOutputSharedTextureMetadata();
+      if (!nativeOutputTextureShareActive) return;
+      if (!isNativeOutputTextureHandleReady(texture)) {
+        nativeOutputTextureShareFailCount++;
+        if (nativeOutputTextureShareFailCount <= 5) {
+          console.warn(`[${textureShareLabel} Native] output shared texture unavailable:`, JSON.stringify(texture));
+        }
+        if (nativeOutputTextureShareFailCount >= 10) {
+          console.warn(`[${textureShareLabel} Native] falling back to OSR texture share after repeated native output failures`);
+          stopNativeOutputTextureSharePump(isMac ? 'native-iosurface-failed' : 'native-dxgi-failed');
+          if (spoutSendActive && spoutOutput && !spoutOsrWindow) {
+            createSpoutOsrWindow(spoutSendW, spoutSendH);
+            startNativeOutputTextureSharePromotion(isMac ? 'native-iosurface-failed' : 'native-dxgi-failed');
+          }
+        }
+        return;
+      }
+      if (!isPublishableNativeOutputTexture(texture)) {
+        nativeOutputTextureShareWaitingForFrame = true;
+        if (!nativeOutputTextureShareWaitingForFrameLogged) {
+          console.log(`[${textureShareLabel} Native] waiting for first native output frame before publishing shared texture`);
+          nativeOutputTextureShareWaitingForFrameLogged = true;
+        }
+        return;
+      }
+      if (!canPublishNativeOutputTextureWithOutput(texture, spoutOutput)) {
+        nativeOutputTextureShareFailCount++;
+        if (nativeOutputTextureShareFailCount <= 5) {
+          console.warn(`[${textureShareLabel} Native] output shared texture is ready but addon cannot publish it via ${nativeOutputTextureShareMethodLabel(texture, spoutOutput)}`);
+        }
+        return;
+      }
+
+      const width = Number(texture.width);
+      const height = Number(texture.height);
+      const frameId = Math.max(0, Math.floor(Number(texture.frame ?? 0)));
+      const sharedName = nativeOutputTextureName(texture);
+      const handleKey = [
+        texture.platform || 'native',
+        sharedName,
+        texture.handle,
+        width,
+        height,
+        texture.format || '',
+      ].join(':');
+      if (
+        frameId > 0 &&
+        frameId === nativeOutputTextureShareLastPublishedFrame &&
+        handleKey === nativeOutputTextureShareLastPublishedHandle
+      ) {
+        return;
+      }
+      let ok = false;
+      let method = nativeOutputTextureShareMethodLabel(texture, spoutOutput);
+      if (isMac) {
+        const surfaceId = Number(texture.handle);
+        ok = spoutOutput.publishIOSurface(surfaceId, width, height, !!texture.flipped);
+      } else if (sharedName && typeof spoutOutput.sendTextureByName === 'function') {
+        ok = !!spoutOutput.sendTextureByName(sharedName);
+      } else {
+        const handleBuffer = nativeOutputTextureHandleBuffer(texture);
+        method = 'sendTexture';
+        if (!handleBuffer && String(texture.handle_scope ?? texture.handleScope ?? '').toLowerCase() === 'process-local') {
+          method = 'sendTextureByName';
+          ok = false;
+        } else {
+          ok = !!(handleBuffer && spoutOutput.sendTexture(handleBuffer));
+        }
+      }
+      if (!ok) {
+        nativeOutputTextureShareFailCount++;
+        if (nativeOutputTextureShareFailCount <= 5) {
+          console.warn(`[${textureShareLabel} Native] ${method} returned false for ${width}x${height}`);
+        }
+        return;
+      }
+
+      nativeOutputTextureShareFailCount = 0;
+      nativeOutputTextureShareWaitingForFrame = false;
+      nativeOutputTextureShareWaitingForFrameLogged = false;
+      nativeOutputTextureShareLastPublishedFrame = frameId;
+      nativeOutputTextureShareLastPublishedHandle = handleKey;
+      nativeOutputTextureShareFrameCount++;
+      const now = Date.now();
+      if (now - nativeOutputTextureShareLastLogTime > 5000) {
+        const elapsed = (now - nativeOutputTextureShareLastLogTime) / 1000;
+        const fps = nativeOutputTextureShareFrameCount / elapsed;
+        console.log(`[${textureShareLabel} Native] ${method} ${width}x${height} @ ${fps.toFixed(1)} fps`);
+        nativeOutputTextureShareFrameCount = 0;
+        nativeOutputTextureShareLastLogTime = now;
+      }
+    } catch (err) {
+      nativeOutputTextureShareFailCount++;
+      if (nativeOutputTextureShareFailCount <= 5) {
+        console.error(`[${textureShareLabel} Native] publish error:`, err?.message || err);
+      }
+    } finally {
+      nativeOutputTextureShareInFlight = false;
+    }
+  };
+
+  publish(initialTexture);
+  nativeOutputTextureSharePump = setInterval(() => publish(), intervalMs);
+  console.log(`[${textureShareLabel} Native] Output ${isMac ? 'IOSurface' : 'DXGI'} pump started @ ${OSR_PAINT_FPS} fps`);
+  return true;
+}
+
 function getTextureShareSenderMode() {
+  if (nativeOutputTextureShareActive) return isMac ? 'native-iosurface' : 'native-dxgi';
   if (osrActive) return 'zero-copy';
   if (ALLOW_CPU_TEXTURE_SHARE_FALLBACK) return 'cpu-sendimage';
   return osrFailureReason ? 'zero-copy-unavailable' : 'zero-copy-pending';
@@ -2014,7 +4638,7 @@ function stopOsrWatchdog() {
 function notifyMainWindowAtlasStatus(active, reason) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {
-      mainWindow.webContents.send('texshare-atlas-status', { active, reason });
+      mainWindow?.webContents.send('texshare-atlas-status', { active, reason });
     } catch {}
   }
 }
@@ -2353,6 +4977,155 @@ function stopSpoutReceiver() {
   console.log(`[${textureShareLabel}] Receiver stopped`);
 }
 
+function normalizeSharedTextureHandle(handle) {
+  if (!handle) return null;
+  if (Buffer.isBuffer(handle)) return handle;
+  if (ArrayBuffer.isView(handle)) {
+    return Buffer.from(handle.buffer, handle.byteOffset, handle.byteLength);
+  }
+  if (handle instanceof ArrayBuffer) return Buffer.from(handle);
+  return null;
+}
+
+function sharedTextureHandlePayload(handle) {
+  if (!handle || handle.byteLength === 0) return null;
+  if (isMac && handle.byteLength === 4) {
+    return {
+      handle: String(handle.readUInt32LE(0)),
+      handleEncoding: 'integer',
+      handleByteLength: handle.byteLength,
+    };
+  }
+  return {
+    handle: handle.toString('base64'),
+    handleEncoding: 'base64',
+    handleByteLength: handle.byteLength,
+  };
+}
+
+function sharedTextureHandleBufferFromMetadata(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const sharedTexture = payload.shared_texture && typeof payload.shared_texture === 'object'
+    ? payload.shared_texture
+    : null;
+  const handle = payload.shared_handle
+    ?? payload.sharedHandle
+    ?? payload.handle
+    ?? sharedTexture?.handle
+    ?? (typeof payload.shared_texture === 'string' ? payload.shared_texture : undefined);
+  const directBuffer = normalizeSharedTextureHandle(handle);
+  if (directBuffer) return directBuffer.byteLength >= 8 ? Buffer.from(directBuffer) : null;
+  const encoding = String(
+    payload.shared_texture_handle_encoding
+      ?? payload.sharedTextureHandleEncoding
+      ?? payload.handle_encoding
+      ?? payload.handleEncoding
+      ?? sharedTexture?.handle_encoding
+      ?? sharedTexture?.handleEncoding
+      ?? sharedTexture?.encoding
+      ?? '',
+  ).toLowerCase();
+  if (typeof handle === 'string' && (encoding === 'base64' || encoding === 'b64')) {
+    const buffer = Buffer.from(handle, 'base64');
+    return buffer.byteLength >= 8 ? buffer : null;
+  }
+  if (handle !== undefined && handle !== null && (!encoding || encoding === 'integer' || encoding === 'opaque')) {
+    try {
+      const value = typeof handle === 'bigint'
+        ? handle
+        : typeof handle === 'number'
+          ? BigInt(Math.trunc(handle))
+          : BigInt(String(handle).trim());
+      if (value <= 0n) return null;
+      const buffer = Buffer.alloc(8);
+      buffer.writeBigUInt64LE(value);
+      return buffer;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function prepareSharedTextureHandlesForNativeCore(payload, context = {}) {
+  if (!isWin || !payload || typeof payload !== 'object') return payload;
+  if (payload.shared_texture_close_handle_after_import || payload.close_handle_after_import) return payload;
+  const targetPid = Number(context.targetPid ?? 0);
+  if (!Number.isFinite(targetPid) || targetPid <= 0) return payload;
+  const addon = loadSpoutAddon();
+  if (!addon || typeof addon.duplicateSharedHandleForProcess !== 'function') return payload;
+  const handleBuffer = sharedTextureHandleBufferFromMetadata(payload);
+  if (!handleBuffer) return payload;
+  try {
+    const duplicated = addon.duplicateSharedHandleForProcess(handleBuffer, targetPid);
+    const duplicatedBuffer = normalizeSharedTextureHandle(duplicated);
+    if (!duplicatedBuffer || duplicatedBuffer.byteLength < 8) return payload;
+    const sharedHandle = Buffer.from(duplicatedBuffer).toString('base64');
+    const byteLength = duplicatedBuffer.byteLength;
+    return {
+      ...payload,
+      shared_handle: sharedHandle,
+      handle_encoding: 'base64',
+      handle_byte_length: byteLength,
+      shared_texture_handle_encoding: 'base64',
+      shared_texture_handle_byte_length: byteLength,
+      shared_texture_close_handle_after_import: true,
+      close_handle_after_import: true,
+    };
+  } catch (err) {
+    console.warn('[NativeRenderer] DXGI handle duplication failed:', err?.message || err);
+    return payload;
+  }
+}
+
+function receiveSpoutTextureInfo() {
+  if (!spoutReceiver) {
+    return {
+      available: false,
+      platform: textureSharePlatform,
+      label: textureShareLabel,
+      reason: 'receiver-not-started',
+    };
+  }
+
+  if (typeof spoutReceiver.receiveTextureInfo !== 'function') {
+    return {
+      available: false,
+      platform: textureSharePlatform,
+      label: textureShareLabel,
+      reason: 'receiver-texture-info-unavailable',
+      senderName: spoutReceiverName,
+    };
+  }
+
+  const info = spoutReceiver.receiveTextureInfo();
+  if (!info) return null;
+
+  const handle = normalizeSharedTextureHandle(info.handle);
+  const handlePayload = sharedTextureHandlePayload(handle);
+  if (!handlePayload) return null;
+  const format = typeof info.format === 'string'
+    ? info.format
+    : Number(info.format || 0);
+
+  return {
+    available: true,
+    platform: textureSharePlatform,
+    label: textureShareLabel,
+    senderName: String(info.senderName || spoutReceiverName || ''),
+    width: Number(info.width || 0),
+    height: Number(info.height || 0),
+    format,
+    updated: !!info.updated,
+    isNewFrame: !!info.isNewFrame,
+    frame: Number(info.frame || 0),
+    fps: Number(info.fps || 0),
+    handle: handlePayload.handle,
+    handleEncoding: handlePayload.handleEncoding,
+    handleByteLength: handlePayload.handleByteLength,
+  };
+}
+
 function listSpoutSenders() {
   const addon = loadSpoutAddon();
   if (!addon) return [];
@@ -2374,6 +5147,137 @@ function listSpoutSenders() {
 // ============================================================
 // IPC Handlers
 // ============================================================
+
+// ─── MCP server (AI clients operating the app) ──────────────────────
+// The protocol and its auth live in mcp-server.cjs. This is lifecycle plus
+// the bridge to the renderer: tools run there, because that is where the
+// stores are, so each call crosses IPC and waits for a reply.
+const { createMcpHttpServer } = require('./mcp-server.cjs');
+
+let mcpServer = null;
+let mcpToken = null;
+let mcpPort = 7420;
+const mcpPending = new Map();
+let mcpCallSeq = 0;
+
+/** How long to wait for the renderer before giving up on a tool call.
+ *  Long enough for a frame readback, short enough that a wedged renderer
+ *  does not hold a client forever. */
+const MCP_CALL_TIMEOUT_MS = 20_000;
+
+function mcpCallRenderer(win, name, args) {
+  return new Promise((resolve, reject) => {
+    if (!win || win.isDestroyed()) return reject(new Error('app window is not available'));
+    const callId = `mcp-${++mcpCallSeq}`;
+    const timer = setTimeout(() => {
+      mcpPending.delete(callId);
+      reject(new Error(`tool "${name}" timed out`));
+    }, MCP_CALL_TIMEOUT_MS);
+    mcpPending.set(callId, { resolve, reject, timer });
+    win.webContents.send('mcp-tool-call', { callId, name, args });
+  });
+}
+
+async function startMcpServer(win, port) {
+  if (mcpServer) return { ok: true, port: mcpPort, token: mcpToken };
+  mcpPort = Number(port) || 7420;
+  // A fresh token per enable, so revoking access is just toggling it off and
+  // on again rather than hunting for who still holds the old one.
+  mcpToken = randomUUID();
+  try {
+    mcpServer = await createMcpHttpServer({
+      token: mcpToken,
+      port: mcpPort,
+      callRenderer: (name, args) => mcpCallRenderer(win, name, args),
+      onLog: (msg) => console.log('[MCP]', msg),
+    });
+    return { ok: true, port: mcpPort, token: mcpToken };
+  } catch (err) {
+    mcpServer = null;
+    mcpToken = null;
+    const message = err?.code === 'EADDRINUSE'
+      ? `port ${mcpPort} is already in use`
+      : (err?.message || String(err));
+    console.warn('[MCP] failed to start:', message);
+    return { ok: false, error: message };
+  }
+}
+
+function stopMcpServer() {
+  if (mcpServer) {
+    try { mcpServer.close(); } catch {}
+    mcpServer = null;
+  }
+  mcpToken = null;
+  // Anything still waiting will never be answered now, so fail it rather than
+  // leaving the promise dangling.
+  for (const [, pending] of mcpPending) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error('MCP server stopped'));
+  }
+  mcpPending.clear();
+}
+
+// ─── OSC output (feedback to control surfaces) ──────────────
+// Receive-only OSC is fire-and-forget: a fader moved inside the app never
+// reaches the surface, so the two drift apart and a layout cannot show
+// state — no clip button that lights when its clip is live. One shared
+// send socket, addressed per-message, so retargeting host/port costs
+// nothing and an unreachable target cannot wedge the app.
+let oscSendSocket = null;
+
+function ensureOscSendSocket() {
+  if (oscSendSocket) return oscSendSocket;
+  oscSendSocket = dgram.createSocket('udp4');
+  // A destination that is not listening makes the OS return ICMP
+  // port-unreachable, which surfaces here as an error event. That is the
+  // normal state while a controller is closed, so it must not be fatal.
+  oscSendSocket.on('error', (err) => {
+    console.warn('[OSC out] socket error:', err?.message || err);
+  });
+  oscSendSocket.unref();
+  return oscSendSocket;
+}
+
+function closeOscSendSocket() {
+  if (!oscSendSocket) return;
+  try { oscSendSocket.close(); } catch {}
+  oscSendSocket = null;
+}
+
+/**
+ * Send a batch of { address, args } out to one host/port.
+ * Batched because feedback is emitted per state change and a single fader
+ * sweep produces a burst; one IPC call per burst rather than per value.
+ */
+function sendOscBatch(host, port, messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return { ok: true, sent: 0 };
+  const targetPort = Number(port);
+  if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
+    return { ok: false, error: 'OSC output port must be between 1 and 65535' };
+  }
+  const targetHost = typeof host === 'string' && host.trim() ? host.trim() : '127.0.0.1';
+
+  let sock;
+  try {
+    sock = ensureOscSendSocket();
+  } catch (err) {
+    return { ok: false, error: err?.message || 'could not open OSC send socket' };
+  }
+
+  let sent = 0;
+  for (const msg of messages) {
+    const buf = encodeOSCMessage(msg?.address, msg?.args);
+    if (!buf) continue;
+    try {
+      sock.send(buf, targetPort, targetHost);
+      sent += 1;
+    } catch (err) {
+      return { ok: false, error: err?.message || 'OSC send failed', sent };
+    }
+  }
+  return { ok: true, sent };
+}
 
 // ─── OSC (Open Sound Control) UDP listener ──────────────────
 // Pure dgram socket; the parser lives in osc-parser.cjs. State is
@@ -2481,6 +5385,17 @@ function startOSC(port, win) {
 
 function registerIpcHandlers() {
   // --- Diagnostics ---
+  ipcMain.handle('set_interface_scale', (event, { scale } = {}) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+      throw new Error('Interface scale is only available in the main editor');
+    }
+    const value = Number(scale);
+    if (!Number.isFinite(value) || value < 0.75 || value > 2) throw new Error('Invalid interface scale');
+    mainWindow.webContents.setZoomFactor(value);
+    nativePreviewLastRectSignature = '';
+    return { scale: value };
+  });
+
   ipcMain.handle('ping', () => {
     console.log('[IPC] ping received from renderer!');
     return 'pong';
@@ -2494,7 +5409,8 @@ function registerIpcHandlers() {
   //
   // DRGB packet format (WLED protocol 2):
   //   [0]    = 2          (protocol id)
-  //   [1]    = 255        (timeout in seconds; 255 ~= "stay live, don't fall back to effect")
+  //   [1]    = 2          (timeout in seconds; return to normal when frames stop)
+  // 255 would hold realtime indefinitely; use a finite timeout for clean shutdown.
   //   [2..]  = R,G,B,R,G,B,...  for each LED (max ~490 LEDs per packet)
   //
   // For >490 LEDs we'd need DNRGB (protocol 4) with a 16-bit start
@@ -2520,14 +5436,14 @@ function registerIpcHandlers() {
     // pixels arrives as a Buffer (Node serializes Uint8Array → Buffer
     // across IPC). Either way the bytes are R,G,B triples already
     // packed by the renderer.
-    const payload = Buffer.isBuffer(pixels) ? pixels : Buffer.from(pixels);
-    const packet = Buffer.alloc(2 + payload.length);
-    packet[0] = 2;     // DRGB
-    packet[1] = 255;   // timeout
-    payload.copy(packet, 2);
+    let packet;
+    try { packet = buildWLEDRealtimePacket(pixels); }
+    catch (error) { return { ok: false, error: error.message }; }
+    const udpPort = port ?? 21324;
+    if (!Number.isInteger(udpPort) || udpPort < 1 || udpPort > 65535) return { ok: false, error: 'Invalid WLED UDP port' };
     sock._gaInFlight = (sock._gaInFlight || 0) + 1;
     return new Promise((resolve) => {
-      sock.send(packet, 0, packet.length, port || 21324, ip, (err) => {
+      sock.send(packet, 0, packet.length, udpPort, ip, (err) => {
         sock._gaInFlight = Math.max(0, (sock._gaInFlight || 1) - 1);
         resolve({ ok: !err, error: err?.message });
       });
@@ -2543,6 +5459,48 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
+  // --- Art-Net / sACN pixel mapping ---
+  // The renderer packs whole DMX universes; pixelmap-output.cjs validates
+  // them, caps the rate (60fps max), drops frames under backpressure and
+  // keeps sequence numbers. Stop blacks out and terminates every stream.
+  ipcMain.handle('pixelmap_send_frame', async (_, frame) => pixelMapOutput.sendFrame(frame));
+  ipcMain.handle('pixelmap_stop', async () => pixelMapOutput.stop());
+  ipcMain.handle('pixelmap_get_stats', async () => pixelMapOutput.stats());
+
+  // --- Art-Net / sACN DMX input ---
+  // dmx-input.cjs owns the sockets, strict parsing, per-universe merge and
+  // stale-source timeout, and pushes only changed channels on
+  // 'dmx-input-changes' at the configured rate.
+  ipcMain.handle('dmx_input_start', async (_, config) => dmxInput.start(config));
+  ipcMain.handle('dmx_input_stop', async () => dmxInput.stop());
+  ipcMain.handle('dmx_input_update', async (_, patch) => dmxInput.update(patch));
+  ipcMain.handle('dmx_input_status', async () => dmxInput.status());
+  ipcMain.handle('dmx_input_resync', async () => dmxInput.resync());
+  ipcMain.handle('dmx_input_snapshot', async (_, target) => dmxInput.snapshot(target));
+
+  // --- PJLink projector control (class 1, TCP 4352) ---
+  // One short session per request, serialised per projector. Actions are a
+  // fixed vocabulary (power, shutter, input, status); the client builds and
+  // validates the wire commands, so the renderer cannot send arbitrary ones.
+  // The password comes from the credential store by projector id; the
+  // renderer never sends one and never gets one back.
+  ipcMain.handle('pjlink_command', async (_, { projectorId, host, port, action, input, timeoutMs } = {}) => {
+    if (typeof host !== 'string' || !host.trim()) return { ok: false, error: 'no host', responses: [] };
+    return pjlinkClient.run({
+      projectorId: typeof projectorId === 'string' ? projectorId : '',
+      host: host.trim(),
+      port: Number(port) || 4352,
+      action,
+      input,
+      timeoutMs: Math.max(500, Math.min(15000, Number(timeoutMs) || 5000)),
+    });
+  });
+  ipcMain.handle('pjlink_set_password', async (_, { projectorId, password } = {}) => {
+    const { ok, persisted, error } = pjlinkCredentials.set(projectorId, password);
+    return { ok, persisted, ...(error ? { error } : {}) };
+  });
+  ipcMain.handle('pjlink_has_password', async (_, { projectorId } = {}) => pjlinkCredentials.has(projectorId));
+
   // --- OSC ---
   ipcMain.handle('osc_start', async (_, { port }) => {
     return startOSC(port || 8000, mainWindow);
@@ -2550,7 +5508,7 @@ function registerIpcHandlers() {
   ipcMain.handle('osc_stop', () => {
     stopOSC();
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('osc-status', { listening: false, port: oscPort, error: null });
+      mainWindow?.webContents.send('osc-status', { listening: false, port: oscPort, error: null });
     }
     return { ok: true };
   });
@@ -2559,6 +5517,35 @@ function registerIpcHandlers() {
     port: oscPort,
     error: oscLastError,
   }));
+  ipcMain.handle('osc_send', (_, { host, port, messages }) => sendOscBatch(host, port, messages));
+
+  // --- LAN remote pairing ---
+  // The editor shows the token beside the Connect Mobile QR code, puts it in
+  // the QR link, and presents it on its own connection to the server.
+  ipcMain.handle('remote_pairing_info', () => remotePairingInfo());
+  ipcMain.handle('remote_pairing_reset', () => resetRemotePairing());
+
+  // --- MCP ---
+  ipcMain.handle('mcp_start', async (_, { port } = {}) => startMcpServer(mainWindow, port));
+  ipcMain.handle('mcp_stop', () => { stopMcpServer(); return { ok: true }; });
+  ipcMain.handle('mcp_status', () => ({
+    running: mcpServer !== null,
+    port: mcpPort,
+    token: mcpToken,
+  }));
+  // The renderer answers a tool call here; resolve whoever is waiting on it.
+  ipcMain.on('mcp-tool-result', (_e, { callId, result, error }) => {
+    const pending = mcpPending.get(callId);
+    if (!pending) return;
+    mcpPending.delete(callId);
+    clearTimeout(pending.timer);
+    if (error) pending.reject(new Error(error));
+    else pending.resolve(result);
+  });
+  ipcMain.handle('osc_send_stop', () => {
+    closeOscSendSocket();
+    return { ok: true };
+  });
 
   // --- NDI ---
   // available() reflects WHETHER WE CAN SEND: addon built + NDI runtime
@@ -2692,6 +5679,53 @@ function registerIpcHandlers() {
     try { return a.receiveFrame({ sourceName }) || null; }
     catch (err) { return null; }
   });
+  ipcMain.handle('ndi_receive_texture_info', (_, { sourceName }) => {
+    const a = loadNdiAddon();
+    if (!a || typeof a.receiveTextureInfo !== 'function') return null;
+    try {
+      const info = a.receiveTextureInfo({ sourceName });
+      if (!info || !info.available) return null;
+      const handle = normalizeSharedTextureHandle(info.handle);
+      const handlePayload = sharedTextureHandlePayload(handle);
+      if (!handlePayload) return null;
+      return {
+        available: true,
+        platform: 'iosurface',
+        senderName: String(info.senderName || sourceName || ''),
+        width: Number(info.width || 0),
+        height: Number(info.height || 0),
+        format: Number(info.format || 80),
+        frame: Number(info.frame || 0),
+        updated: true,
+        isNewFrame: true,
+        handle: handlePayload.handle,
+        handleEncoding: handlePayload.handleEncoding,
+        handleByteLength: handlePayload.handleByteLength,
+      };
+    } catch (err) {
+      return null;
+    }
+  });
+  // Composite NDI output — pump the native renderer's full-frame
+  // composite over NDI (macOS IOSurface CPU tap; see startNdiOutputPump).
+  ipcMain.handle('ndi_output_start', (_, args) => {
+    try {
+      const result = startNdiOutputPump(args || {});
+      if (!result.ok) ndiOutputPumpLastError = result.reason || 'Could not start NDI output';
+      return result;
+    } catch (err) {
+      ndiOutputPumpLastError = String(err?.message || err);
+      return { ok: false, active: false, reason: ndiOutputPumpLastError };
+    }
+  });
+  ipcMain.handle('ndi_output_stop', () => {
+    try { stopNdiOutputPump(); return { ok: true, active: false }; }
+    catch (err) { return { ok: false, error: String(err?.message || err) }; }
+  });
+  ipcMain.handle('ndi_output_status', () => {
+    try { return ndiOutputPumpStatus(); }
+    catch (err) { return { available: false, active: false, reason: String(err?.message || err) }; }
+  });
 
   // Restart the app. Used when toggling experimental flags
   // (editorWebGPU, etc.) that change which renderer path the
@@ -2724,7 +5758,7 @@ function registerIpcHandlers() {
     return listSpoutSenders();
   });
 
-  ipcMain.handle('spout_start_sender', (_, { name, width, height }) => {
+  ipcMain.handle('spout_start_sender', async (_, { name, width, height }) => {
     const requestedName = name || 'ghostArcade';
 
     // If sender is already active or being created, return existing state
@@ -2742,13 +5776,31 @@ function registerIpcHandlers() {
 
     console.log('[IPC] spout_start_sender:', { name: requestedName, width, height });
     spoutSendCreating = true;
-    const ok = createSpoutSender(requestedName, width || 1920, height || 1080);
+    const targetWidth = width || 1920;
+    const targetHeight = height || 1080;
+    const nativeOutputShare = await canPublishNativeOutputTextureShare();
+    const ok = createSpoutSender(requestedName, targetWidth, targetHeight, {
+      startOsr: !nativeOutputShare.ok,
+    });
+    if (ok && nativeOutputShare.ok) {
+      const nativePumpStarted = startNativeOutputTextureSharePump(nativeOutputShare.texture);
+      if (!nativePumpStarted) {
+        console.warn(`[${textureShareLabel} Native] native output pump could not start; falling back to OSR texture share`);
+        createSpoutOsrWindow(targetWidth, targetHeight);
+        startNativeOutputTextureSharePromotion('native-pump-start-failed');
+      }
+    } else if (nativeOutputShare.reason) {
+      console.log(`[${textureShareLabel} Native] using OSR texture share: ${nativeOutputShare.reason}`);
+      if (ok) {
+        startNativeOutputTextureSharePromotion(nativeOutputShare.reason);
+      }
+    }
     spoutSendCreating = false;
     const result = {
       success: ok,
       name: spoutSendName,
-      width: width || 1920,
-      height: height || 1080,
+      width: targetWidth,
+      height: targetHeight,
       mode: getTextureShareSenderMode(),
       cpuFallbackAllowed: ALLOW_CPU_TEXTURE_SHARE_FALLBACK,
     };
@@ -2771,7 +5823,7 @@ function registerIpcHandlers() {
     // sender is supposedly active, the renderer's send-gate isn't firing
     // the invoke() call (store/flag issue, not a native issue).
     if (spoutSendCallCount < 3) {
-      console.log(`[IPC] spout_send_image call #${spoutSendCallCount} — spoutSendActive=${spoutSendActive} spoutOutput=${!!spoutOutput} osrActive=${osrActive}`);
+      console.log(`[IPC] spout_send_image call #${spoutSendCallCount} — spoutSendActive=${spoutSendActive} spoutOutput=${!!spoutOutput} osrActive=${osrActive} nativeOutput=${nativeOutputTextureShareActive}`);
       spoutSendCallCount++;
     }
 
@@ -2779,7 +5831,7 @@ function registerIpcHandlers() {
 
     // When OSR zero-copy is active, reject CPU readPixels frames —
     // they would stomp on the Spout sender with different resolution/timing
-    if (osrActive) return true;
+    if (osrActive || nativeOutputTextureShareActive) return true;
 
     if (!ALLOW_CPU_TEXTURE_SHARE_FALLBACK) {
       if (!spoutCpuFallbackWarned) {
@@ -2908,6 +5960,21 @@ function registerIpcHandlers() {
     }
   });
 
+  ipcMain.handle('spout_receive_texture_info', () => {
+    try {
+      return receiveSpoutTextureInfo();
+    } catch (err) {
+      console.error('[IPC] spout_receive_texture_info error:', err.message);
+      return {
+        available: false,
+        platform: textureSharePlatform,
+        label: textureShareLabel,
+        reason: err.message || 'texture-info-error',
+        senderName: spoutReceiverName,
+      };
+    }
+  });
+
   ipcMain.handle('spout_get_status', () => {
     return {
       sender_active: spoutSendActive,
@@ -2915,8 +5982,18 @@ function registerIpcHandlers() {
       sender_mode: getTextureShareSenderMode(),
       osr_active: osrActive,
       osr_failure_reason: osrFailureReason,
+      native_output_active: nativeOutputTextureShareActive,
+      native_output_waiting_for_frame: nativeOutputTextureShareWaitingForFrame,
+      native_output_last_published_frame: nativeOutputTextureShareLastPublishedFrame,
+      native_output_pending_promotion: nativeOutputTextureSharePromoteTimer !== null,
+      native_output_promotion_attempts: nativeOutputTextureSharePromoteAttempts,
+      native_output_promotion_reason: nativeOutputTextureSharePromotionReason,
+      native_output_failures: nativeOutputTextureShareFailCount,
       cpu_fallback_allowed: ALLOW_CPU_TEXTURE_SHARE_FALLBACK,
       receiver_active: spoutReceiver !== null,
+      receiver_texture_info_available:
+        spoutReceiver !== null && typeof spoutReceiver.receiveTextureInfo === 'function',
+      receiver_texture_info_supported: getReceiverTextureInfoSupport(spoutAddon),
       receivers: [],
       atlas_active: atlasState.active,
       atlas_sender_count: atlasState.layout?.tiles?.length ?? 0,
@@ -3005,17 +6082,14 @@ function registerIpcHandlers() {
   });
 
   // --- Output window ---
-  // Two experimental flags control output transport:
-  //   - `experimentalZeroCopy` → mounts OutputSharedTextureDisplayApp
-  //     (WebGPU + GPUExternalTexture, the production target). Main
-  //     process pairs the editor and output windows via a
-  //     MessageChannelMain so the editor's MediaStreamTrackProcessor
-  //     can ship VideoFrames directly into the output's WebGPU
-  //     compositor with zero copies.
-  //   - `experimentalWebRTC` → mounts OutputDisplayApp (legacy
-  //     same-process WebRTC peer). Kept as escape hatch.
-  // Selection precedence: zero-copy beats WebRTC beats legacy. The
-  // renderer reads both settings flags and passes them through.
+  // Fallback output transports. Native Rust/wgpu output is opened through
+  // the native_renderer_* bridge before the renderer calls this IPC. If
+  // native output is disabled or unavailable, the renderer passes:
+  //   - `experimentalZeroCopy` → OutputSharedTextureDisplayApp
+  //     (WebGPU + GPUExternalTexture fallback).
+  //   - `experimentalWebRTC` → OutputDisplayApp (legacy same-process
+  //     WebRTC peer, kept as a debugging escape hatch).
+  // Fallback precedence here is zero-copy > WebRTC > legacy.
   ipcMain.handle('create_output_window', (_, { width, height, x, y, fullscreen, displayId, experimentalWebRTC, experimentalZeroCopy }) => {
     createOutputWindow(width, height, x, y, fullscreen, displayId, !!experimentalWebRTC, !!experimentalZeroCopy);
   });
@@ -3027,13 +6101,13 @@ function registerIpcHandlers() {
   // shape inside is identical to a regular full editor (mounts Canvas +
   // Stage3DDesigner with state-sync over BroadcastChannel), so visuals
   // flowing through the editor's layers appear on the LED-screen meshes.
-  ipcMain.handle('open_stage3d_window', () => {
+  ipcMain.handle('open_stage3d_window', (_event, args = {}) => {
     if (stage3dWindow && !stage3dWindow.isDestroyed()) {
       stage3dWindow.show();
       stage3dWindow.focus();
       return { alreadyOpen: true };
     }
-    createStage3DWindow();
+    createStage3DWindow(args?.displayId ?? null);
     return { alreadyOpen: false };
   });
 
@@ -3064,13 +6138,13 @@ function registerIpcHandlers() {
   // ── Projection Simulator pop-out window ───────────────────────────
   // Same performer workflow as Stage 3D: keep the editor/mapping UI
   // available while the 3D simulation lives on another monitor.
-  ipcMain.handle('open_projection_sim_window', () => {
+  ipcMain.handle('open_projection_sim_window', (_event, args = {}) => {
     if (projectionSimWindow && !projectionSimWindow.isDestroyed()) {
       projectionSimWindow.show();
       projectionSimWindow.focus();
       return { alreadyOpen: true };
     }
-    createProjectionSimWindow();
+    createProjectionSimWindow(args?.displayId ?? null);
     return { alreadyOpen: false };
   });
 
@@ -3334,23 +6408,175 @@ function registerIpcHandlers() {
     }
   });
 
+  ipcMain.handle('native_live_capture_available', () => {
+    const addon = loadLiveCaptureAddon();
+    if (!addon) return { available: false, error: liveCaptureAddonLoadError };
+    try {
+      return { ...addon.available(), addonPath: liveCaptureAddonLoadPath };
+    } catch (err) {
+      return { available: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('native_live_capture_list_cameras', () => {
+    const addon = loadLiveCaptureAddon();
+    if (!addon) return [];
+    try { return addon.listCameras(); }
+    catch (err) {
+      console.error('[LiveCapture] Camera enumeration failed:', err?.message || err);
+      return [];
+    }
+  });
+
+  ipcMain.handle('native_live_capture_start_camera', async (_event, args = {}) => {
+    const addon = loadLiveCaptureAddon();
+    if (!addon) return { ok: false, error: liveCaptureAddonLoadError || 'native capture unavailable' };
+    // Ask through Electron before handing off to the addon. Capture moved
+    // into the main process (AVFoundation) where a raw
+    // requestAccessForMediaType can stall without ever drawing the TCC
+    // prompt; Electron's request goes through Chromium's permission
+    // plumbing, which reliably shows it. Without this the addon returns
+    // success and then silently never produces a frame.
+    if (process.platform === 'darwin') {
+      const status = systemPreferences.getMediaAccessStatus('camera');
+      console.log(`[LiveCapture] camera permission status: ${status}`);
+      if (status !== 'granted') {
+        let granted = false;
+        try { granted = await systemPreferences.askForMediaAccess('camera'); }
+        catch (err) { console.warn('[LiveCapture] askForMediaAccess threw:', err?.message || err); }
+        console.log(`[LiveCapture] camera permission after request: ${granted ? 'granted' : 'denied'}`);
+        if (!granted) {
+          return {
+            ok: false,
+            error: 'Camera access was not granted. Enable it in System Settings › Privacy & Security › Camera.',
+          };
+        }
+      }
+    } else if (process.platform === 'win32') {
+      // Windows blocks camera access for desktop apps behind a privacy
+      // setting, and enumeration is not gated by it: cameras list fine and
+      // then starting one fails. Without this the failure surfaced as
+      // "camera did not start", which does not tell anyone what to change.
+      //
+      // There is no programmatic prompt on Windows -- askForMediaAccess is
+      // macOS-only -- so the most that can be done is name the setting.
+      //
+      // Only an explicit refusal is treated as fatal. getMediaAccessStatus
+      // returns 'granted' for every media type on older Windows and can
+      // report 'not-determined' or 'unknown' on setups where capture works,
+      // so failing on anything but denied/restricted would block working
+      // machines to make a message nicer.
+      let status = 'unknown';
+      try { status = systemPreferences.getMediaAccessStatus('camera'); }
+      catch (err) { console.warn('[LiveCapture] getMediaAccessStatus threw:', err?.message || err); }
+      console.log(`[LiveCapture] camera permission status: ${status}`);
+      if (status === 'denied' || status === 'restricted') {
+        return {
+          ok: false,
+          error: 'Windows is blocking camera access for desktop apps. Enable it in '
+            + 'Settings > Privacy & security > Camera, including "Let desktop apps access your camera".',
+        };
+      }
+    }
+    try {
+      const ok = !!addon.startCamera({
+        sessionId: String(args.sessionId || ''),
+        deviceId: String(args.deviceId || ''),
+      });
+      return { ok, error: ok ? null : 'camera did not start' };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('native_live_capture_start_screen', (_event, args = {}) => {
+    const addon = loadLiveCaptureAddon();
+    if (!addon) return { ok: false, error: liveCaptureAddonLoadError || 'native capture unavailable' };
+    try {
+      // Chromium's `display_id` (from desktopCapturer.getSources) is Chromium's
+      // internal Display ID — NOT a DXGI IDXGIOutput index. Resolve it to
+      // physical bounds so the addon can match by DesktopCoordinates. On macOS
+      // the addon ignores these extra fields and continues to use `sourceId`.
+      const displayId = String(args.displayId || '');
+      let bounds = null;
+      if (displayId) {
+        const displays = screen.getAllDisplays();
+        const match = displays.find(d => String(d.id) === displayId);
+        if (match) {
+          const b = match.bounds;
+          bounds = { left: b.x, top: b.y, right: b.x + b.width, bottom: b.y + b.height };
+        }
+      }
+      const ok = !!addon.startScreen({
+        sessionId: String(args.sessionId || ''),
+        sourceId: String(args.sourceId || ''),
+        displayId,
+        kind: args.kind === 'screen' ? 'screen' : 'window',
+        boundsLeft: bounds?.left ?? 0,
+        boundsTop: bounds?.top ?? 0,
+        boundsRight: bounds?.right ?? 0,
+        boundsBottom: bounds?.bottom ?? 0,
+        hasBounds: !!bounds,
+      });
+      return { ok, error: ok ? null : 'screen capture did not start' };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('native_live_capture_stop', (_event, args = {}) => {
+    const addon = loadLiveCaptureAddon();
+    if (!addon) return { ok: false };
+    try { return { ok: !!addon.stop({ sessionId: String(args.sessionId || '') }) }; }
+    catch (err) { return { ok: false, error: err?.message || String(err) }; }
+  });
+
+  ipcMain.handle('native_live_capture_texture_info', (_event, args = {}) => {
+    const addon = loadLiveCaptureAddon();
+    if (!addon) return { available: false, reason: liveCaptureAddonLoadError || 'native capture unavailable' };
+    try {
+      const info = addon.receiveTextureInfo({ sessionId: String(args.sessionId || '') });
+      if (!info || !info.available) return info || null;
+      const handle = normalizeSharedTextureHandle(info.handle);
+      const handlePayload = sharedTextureHandlePayload(handle);
+      if (!handlePayload) return null;
+      // Windows returns a DXGI shared-texture HANDLE; the core's
+      // `import_dxgi_source_frame` rejects anything not tagged `dxgi`.
+      // The addon reports its own platform via `available()`; fall back
+      // to the OS if the addon omits it (older mac builds).
+      const platform = info.platform || (isMac ? 'iosurface' : 'dxgi');
+      return {
+        available: true,
+        platform,
+        label: info.kind === 'webcam' ? 'Webcam' : 'Capture',
+        width: Number(info.width || 0),
+        height: Number(info.height || 0),
+        format: Number(info.format || 80),
+        frame: Number(info.frame || 0),
+        updated: true,
+        isNewFrame: true,
+        handle: handlePayload.handle,
+        handleEncoding: handlePayload.handleEncoding,
+        handleByteLength: handlePayload.handleByteLength,
+      };
+    } catch (err) {
+      return { available: false, reason: err?.message || String(err) };
+    }
+  });
+
   // --- Output fullscreen on external monitor ---
-  // Same `experimentalZeroCopy` / `experimentalWebRTC` opt-in as
-  // create_output_window so fullscreen-direct mode also lands on the
-  // new transport when the flag is on.
+  // Same fallback flags as create_output_window. Native fullscreen output
+  // is opened before this IPC path when the render core is available.
   ipcMain.handle('output_fullscreen_external', (_, args) => {
     const allDisplays = screen.getAllDisplays();
     const primary = screen.getPrimaryDisplay();
     const external = allDisplays.find(d => d.id !== primary.id);
-    if (!external) {
-      return { ok: false, displayId: primary.id, isExternal: false, error: 'No external display connected' };
-    }
-    const target = external;
+    const target = external || primary;
     const experimentalWebRTC = !!(args && args.experimentalWebRTC);
     const experimentalZeroCopy = !!(args && args.experimentalZeroCopy);
 
     createOutputWindow(target.bounds.width, target.bounds.height, target.bounds.x, target.bounds.y, true, target.id, experimentalWebRTC, experimentalZeroCopy);
-    return { ok: true, displayId: target.id, isExternal: true };
+    return { displayId: target.id, isExternal: !!external };
   });
 
   // --- Toggle output fullscreen ---
@@ -3362,43 +6588,6 @@ function registerIpcHandlers() {
       return !isFs;
     }
     return false;
-  });
-
-  ipcMain.handle('output_exit_fullscreen', () => {
-    if (outputWindow && !outputWindow.isDestroyed()) {
-      const wasSimpleFs = typeof outputWindow.isSimpleFullScreen === 'function' && outputWindow.isSimpleFullScreen();
-      const wasFs = outputWindow.isFullScreen() || wasSimpleFs;
-      if (wasFs) {
-        if (wasSimpleFs) outputWindow.setSimpleFullScreen(false);
-        outputWindow.setFullScreen(false);
-        outputWindow.setMenuBarVisibility(true);
-        outputWindow.show();
-        outputWindow.focus();
-      }
-      return { ok: true, wasFullScreen: wasFs, fullScreen: false };
-    }
-    return { ok: false, wasFullScreen: false, fullScreen: false };
-  });
-
-  ipcMain.handle('output_window_status', () => {
-    if (!outputWindow || outputWindow.isDestroyed()) {
-      return { exists: false, fullScreen: false, isExternal: false };
-    }
-    const primary = screen.getPrimaryDisplay();
-    const bounds = outputWindow.getBounds();
-    const cx = bounds.x + bounds.width / 2;
-    const cy = bounds.y + bounds.height / 2;
-    const target = screen.getDisplayNearestPoint({ x: Math.round(cx), y: Math.round(cy) });
-    const simpleFullScreen = typeof outputWindow.isSimpleFullScreen === 'function' && outputWindow.isSimpleFullScreen();
-    const fullScreen = outputWindow.isFullScreen() || simpleFullScreen;
-    return {
-      exists: true,
-      fullScreen,
-      simpleFullScreen,
-      isExternal: target.id !== primary.id,
-      displayId: target.id,
-      bounds,
-    };
   });
 
   // --- Set cursor visibility on output window ---
@@ -3422,11 +6611,20 @@ function registerIpcHandlers() {
   // Multiple slice windows can be open simultaneously — one per slice
   // assigned `targetType: 'display'`. The `sliceWindows` Map keeps the
   // references so we can close/move them later without re-opening.
-  ipcMain.handle('output_open_slice_window', (_e, args) => {
+  ipcMain.handle('output_open_slice_window', async (_e, args) => {
     const { sliceId, displayId } = args || {};
     if (!sliceId || typeof sliceId !== 'string') {
       return { ok: false, error: 'sliceId required' };
     }
+    // Decide the presentation path before creating the window: a native
+    // slice needs a transparent window (the layer sits under the page),
+    // while the WebGL fallback needs opaque black so the desktop never
+    // shows through before its first painted frame.
+    const useNative = await probeSliceNativeAvailable();
+    if ((isMac || isWin) && !useNative) {
+      return { ok: false, error: 'Native Screen output is unavailable. Wait for the renderer to start, then open the screen again. No uncalibrated fallback output was opened.' };
+    }
+    if (useNative) sliceNativePending.add(sliceId);
 
     // Resolve the target display. Falls back to the primary display if
     // the requested id is gone (operator unplugged a projector between
@@ -3453,11 +6651,16 @@ function registerIpcHandlers() {
       y: bounds.y,
       title: `Ghost Arcade Output — slice ${sliceId}`,
       frame: false,
-      fullscreen: true,
-      simpleFullscreen: process.platform === 'darwin',
+      // macOS enters simple fullscreen just below instead (see
+      // enterSliceFullscreen): built fullscreen, the window never closes.
+      fullscreen: process.platform !== 'darwin',
       autoHideMenuBar: true,
       skipTaskbar: false,
-      backgroundColor: '#000000',
+      // Transparent only when the core will present this slice natively —
+      // the layer is parented under the page, the same underlay arrangement
+      // the editor preview uses.
+      backgroundColor: useNative ? '#00000000' : '#000000',
+      transparent: useNative,
       hasShadow: false,
       webPreferences: {
         preload: path.join(__dirname, 'preload.cjs'),
@@ -3468,6 +6671,14 @@ function registerIpcHandlers() {
       },
     });
     win.setMenuBarVisibility(false);
+    enterSliceFullscreen(win);
+    // Claim the window for native presentation before the page loads, so
+    // the slice renderer's first state query already has the answer.
+    if (useNative && !attachSliceNativeLayer(sliceId, win)) {
+      sliceNativePending.delete(sliceId);
+      win.destroy();
+      return { ok: false, error: 'Could not attach the native Screen presenter. Close and reopen the screen; if this persists, export diagnostics. Calibration was not bypassed.' };
+    }
 
     const devUrl = process.env.VITE_DEV_SERVER_URL || 'http://localhost:1420';
     const isDev = !app.isPackaged;
@@ -3484,7 +6695,20 @@ function registerIpcHandlers() {
     }
 
     sliceWindows.set(sliceId, win);
+    // Attach the native presentation layer once the page exists, so the
+    // addon has a real content view to parent into.
+    // Re-attach after load as a safety net; monitorAttach reuses the view
+    // already registered under this name, so a second call is a no-op.
+    win.webContents.once('did-finish-load', () => {
+      if (useNative && !sliceNativeAttached.has(sliceId)) attachSliceNativeLayer(sliceId, win);
+    });
     win.on('closed', () => {
+      // The layer is registered by slice id. A reopen closes the old window
+      // after the new one has attached, so only the window that still owns
+      // the slice (or a slice nobody reopened) may take the layer down.
+      if (!sliceWindows.has(sliceId) || sliceWindows.get(sliceId) === win) {
+        detachSliceNativeLayer(sliceId);
+      }
       if (sliceWindows.get(sliceId) === win) sliceWindows.delete(sliceId);
     });
 
@@ -3568,7 +6792,7 @@ function registerIpcHandlers() {
         chunks.push(value);
         received += value.length;
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('update-download-progress', {
+          mainWindow?.webContents.send('update-download-progress', {
             received,
             total: contentLength,
             percent: contentLength > 0 ? Math.round((received / contentLength) * 100) : -1,
@@ -3636,6 +6860,32 @@ function registerIpcHandlers() {
   });
 
   // --- Project save dialog ---
+  const projectMedia = require('./project-media.cjs');
+  ipcMain.handle('inspect_video_import', async (_, args) => {
+    const inputPath = assertAbsolutePath(args?.inputPath, 'input video path');
+    if (!fs.statSync(inputPath).isFile()) throw new Error('Choose a video file.');
+    return require('./video-import.cjs').inspectVideoForImport(resolveFfmpegPath(), inputPath);
+  });
+  const mediaRequest = args => {
+    if (typeof args?.json !== 'string') throw new Error('Project data is required.');
+    const data = JSON.parse(args.json);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Invalid project data.');
+    const dir = args.projectPath ? path.dirname(assertAbsolutePath(args.projectPath, 'project path')) : undefined;
+    return { data, dir };
+  };
+  ipcMain.handle('project_media_scan', async (_, args) => {
+    const { data, dir } = mediaRequest(args);
+    return projectMedia.scanProjectMedia(data, dir);
+  });
+  ipcMain.handle('project_media_relink', async (_, args) => {
+    const { data, dir } = mediaRequest(args);
+    return JSON.stringify(await projectMedia.relinkProjectMedia(data, dir, args.id, args.replacementPath));
+  });
+  ipcMain.handle('project_media_collect', async (_, args) => {
+    const { data, dir } = mediaRequest(args);
+    return projectMedia.collectProjectMedia(data, dir, assertAbsolutePath(args.outputPath, 'output path'));
+  });
+
   // Returns the user-chosen file path (absolute) or null if cancelled.
   // Renderer uses this to save .gha files to a known directory so we can
   // materialize blob URLs alongside as portable sibling files.
@@ -4074,6 +7324,15 @@ function registerIpcHandlers() {
     }
   });
 
+  ipcMain.handle('jpeg_sequence_write_frame_file', async (_, args = {}) => {
+    try {
+      return await writeJpegSequenceFrameFile(args);
+    } catch (err) {
+      console.error('[Main] jpeg_sequence_write_frame_file error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
   ipcMain.handle('jpeg_sequence_finish', async (_, args = {}) => {
     try {
       return await finishJpegSequenceJob(args.jobId);
@@ -4088,6 +7347,138 @@ function registerIpcHandlers() {
       return await cancelJpegSequenceJob(args.jobId);
     } catch (err) {
       console.error('[Main] jpeg_sequence_cancel error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('jpeg_frame_encoder_start', async (_, args = {}) => {
+    try {
+      const job = startJpegFrameEncoderJob(args);
+      return { success: true, ...job };
+    } catch (err) {
+      console.error('[Main] jpeg_frame_encoder_start error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('jpeg_frame_encoder_encode_file', async (_, args = {}) => {
+    try {
+      return await encodeJpegFrameFromFile(args);
+    } catch (err) {
+      console.error('[Main] jpeg_frame_encoder_encode_file error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('jpeg_frame_encoder_finish', async (_, args = {}) => {
+    try {
+      return await finishJpegFrameEncoderJob(args.jobId);
+    } catch (err) {
+      console.error('[Main] jpeg_frame_encoder_finish error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('jpeg_frame_encoder_cancel', async (_, args = {}) => {
+    try {
+      return await cancelJpegFrameEncoderJob(args.jobId);
+    } catch (err) {
+      console.error('[Main] jpeg_frame_encoder_cancel error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('mp4_frame_encoder_start', async (_, args = {}) => {
+    try {
+      const { recordingCodec } = require('./recording-formats.cjs');
+      const codec = recordingCodec(args.codec);
+      let hardwareProRes = false;
+      if (codec.id !== 'h264') {
+        const probed = await nativeRecordingCodecs();
+        if (!probed.codecs.find(entry => entry.id === codec.id)?.available) {
+          throw new Error(`${codec.label} is not available in this FFmpeg build.`);
+        }
+        hardwareProRes = probed.hardwareProRes;
+      }
+      const job = startMp4FrameEncoderJob({ ...args, hardwareProRes });
+      return { success: true, ...job };
+    } catch (err) {
+      console.error('[Main] mp4_frame_encoder_start error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('mp4_frame_encoder_write_frame', async (_, args = {}) => {
+    try {
+      return await writeMp4FrameEncoderFrame(args);
+    } catch (err) {
+      console.error('[Main] mp4_frame_encoder_write_frame error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('mp4_frame_encoder_capture_live', (_, args) => captureLiveMp4Frame(args));
+  ipcMain.handle('mp4_frame_encoder_live_control', async (event, args = {}) => {
+    const job = activeMp4FrameEncoderJobs.get(String(args.jobId || ''));
+    if (!job || job.cancelled || job.closing || job.settled) return { success: false, error: 'Recording encoder is not running' };
+    if (args.action === 'start') {
+      if (job.liveClock || job.captureBusy || job.writtenFrames) return { success: false, error: 'Recording already started' };
+      const owner = event.sender;
+      const ownerGone = () => {
+        job.detachCaptureOwner?.();
+        // Preserve completed footage if the editor closes or crashes.
+        void finishMp4FrameEncoderJob(job.id).catch(() => cancelMp4FrameEncoderJob(job.id));
+      };
+      job.detachCaptureOwner = () => {
+        owner.removeListener('destroyed', ownerGone);
+        owner.removeListener('render-process-gone', ownerGone);
+        job.detachCaptureOwner = null;
+      };
+      owner.once('destroyed', ownerGone);
+      owner.once('render-process-gone', ownerGone);
+      if (args.nativeAudio === true && !job.audioTap) {
+        try { job.audioTap = await startRecordingAudioTap(); }
+        catch (err) { console.warn('[NativeRec] clip audio tap unavailable:', err?.message || err); }
+        if (job.cancelled || job.closing) { await job.audioTap?.cancel().catch(() => null); job.audioTap = null; return { success: false, error: 'Recording encoder is not running' }; }
+      }
+      const { createLiveCaptureClock } = require('./live-capture-clock.cjs');
+      // Frame 0 is the REC press: the first capture fills the slots the
+      // renderer spent probing and starting the encoder.
+      job.liveStartedUnixMs = recordingStartUnixMs(args.startedAtUnixMs);
+      job.liveClock = createLiveCaptureClock({ fps: job.fps, started: job.liveStartedUnixMs, now: Date.now, capture: async (fromIndex, toIndex) => {
+        const result = await captureLiveMp4Frame({ jobId: job.id, fromIndex, toIndex }, true);
+        if (!result.success) throw new Error(result.error);
+      } });
+    } else if (args.action === 'stop') {
+      await job.liveClock?.stop();
+    } else if (args.action !== 'status') return { success: false, error: 'Invalid live recording action' };
+    return { success: true, ...job.liveClock?.status(), frames: job.writtenFrames,
+      ...(args.action === 'start' ? { nativeAudio: !!job.audioTap } : {}) };
+  });
+
+  ipcMain.handle('mp4_frame_encoder_write_frame_file', async (_, args = {}) => {
+    try {
+      return await writeMp4FrameEncoderFrameFile(args);
+    } catch (err) {
+      console.error('[Main] mp4_frame_encoder_write_frame_file error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('mp4_frame_encoder_finish', async (_, args = {}) => {
+    try {
+      return await finishMp4FrameEncoderJob(args.jobId);
+    } catch (err) {
+      console.error('[Main] mp4_frame_encoder_finish error:', err?.message || err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('mp4_frame_encoder_cancel', async (_, args = {}) => {
+    try {
+      return await cancelMp4FrameEncoderJob(args.jobId);
+    } catch (err) {
+      console.error('[Main] mp4_frame_encoder_cancel error:', err?.message || err);
       return { success: false, error: err?.message || String(err) };
     }
   });
@@ -4183,7 +7574,9 @@ function registerIpcHandlers() {
             args: makeXfadeArgs(true),
           });
         } catch (hardwareErr) {
-          if (process.platform !== 'darwin') throw hardwareErr;
+          // macOS retried in software here while Windows threw, so a failed
+          // NVENC/QSV encode lost the whole job instead of falling back to
+          // x264. The software path is platform-neutral; both get the retry.
           console.warn('[VideoLoop] hardware encode failed, retrying software x264:', hardwareErr?.message || hardwareErr);
           try { fs.rmSync(outputPath, { force: true }); } catch { /* ignore */ }
           await spawnFfmpegVideoLoop({
@@ -4282,7 +7675,9 @@ function registerIpcHandlers() {
           args: appendArgs(true),
         });
       } catch (hardwareErr) {
-        if (process.platform !== 'darwin') throw hardwareErr;
+        // macOS retried in software here while Windows threw, so a failed
+        // NVENC/QSV encode lost the whole job instead of falling back to
+        // x264. The software path is platform-neutral; both get the retry.
         console.warn('[VideoAppend] hardware encode failed, retrying software x264:', hardwareErr?.message || hardwareErr);
         try { fs.rmSync(outputPath, { force: true }); } catch { /* ignore */ }
         await spawnFfmpegVideoLoop({
@@ -4314,9 +7709,8 @@ function registerIpcHandlers() {
   ipcMain.handle('video_converter_pick_webm', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
       properties: ['openFile'],
-      title: 'Choose WebM Video',
+      title: 'Choose Video',
       filters: [
-        { name: 'WebM Video', extensions: ['webm'] },
         { name: 'Video Files', extensions: ['webm', 'mkv', 'mov', 'mp4'] },
         { name: 'All Files', extensions: ['*'] },
       ],
@@ -4336,7 +7730,7 @@ function registerIpcHandlers() {
   ipcMain.handle('video_converter_pick_sequence_folder', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
       properties: ['openDirectory'],
-      title: 'Choose JPG Frame Sequence Folder',
+      title: 'Choose Image Sequence Folder',
     });
     if (result.canceled || !result.filePaths[0]) return null;
     const sequence = listImageSequenceFrames(result.filePaths[0]);
@@ -4352,18 +7746,13 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('video_converter_pick_output', async (_, args = {}) => {
-    const suggested = typeof args.defaultPath === 'string' && args.defaultPath
-      ? args.defaultPath
-      : path.join(app.getPath('videos'), `${sanitizeOutputBase(args.defaultName, 'converted-video')}.mp4`);
-    const result = await dialog.showSaveDialog(mainWindow, {
-      title: 'Save MP4',
-      defaultPath: suggested,
-      filters: [
-        { name: 'MP4 Video', extensions: ['mp4'] },
-      ],
-    });
+    const format = conversionFormat(args.format);
+    const suggested = typeof args.defaultPath === 'string' && args.defaultPath ? args.defaultPath
+      : path.join(app.getPath('videos'), `${sanitizeOutputBase(args.defaultName, 'converted-video')}-${format.id}.${format.extension}`);
+    const result = await dialog.showSaveDialog(mainWindow, { title: `Save ${format.label}`, defaultPath: suggested,
+      filters: [{ name: format.label, extensions: [format.extension] }] });
     if (result.canceled || !result.filePath) return null;
-    return { path: result.filePath.toLowerCase().endsWith('.mp4') ? result.filePath : `${result.filePath}.mp4` };
+    return { path: result.filePath.toLowerCase().endsWith(`.${format.extension}`) ? result.filePath : `${result.filePath}.${format.extension}` };
   });
 
   ipcMain.handle('video_converter_reveal_path', async (_, args = {}) => {
@@ -4387,100 +7776,49 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('video_converter_start', async (event, args = {}) => {
+    if (activeVideoConverterJob) throw new Error('A video conversion is already running.');
     const mode = args.mode === 'sequence' ? 'sequence' : 'webm';
+    const format = conversionFormat(args.format);
     const jobId = typeof args.jobId === 'string' && args.jobId ? args.jobId : `vc-${Date.now().toString(36)}`;
     const outputPath = assertAbsolutePath(args.outputPath, 'output path');
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-
-    const crf = Math.round(clampNumber(args.crf, 10, 32, 18));
-    const preset = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium'].includes(args.preset)
-      ? args.preset
-      : 'veryfast';
-    const commonOutput = [
-      '-c:v', 'libx264',
-      '-preset', preset,
-      '-crf', String(crf),
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
-      outputPath,
-    ];
-
-    if (mode === 'sequence') {
-      const sequence = listImageSequenceFrames(args.folderPath);
-      const fps = clampNumber(args.fps, 1, 240, 30);
-      const { tmpDir, listPath } = makeConcatList(sequence.frames, fps);
-      const durationSec = sequence.frameCount / fps;
-      publishVideoConverterProgress(event.sender, {
-        jobId,
-        stage: 'scanning',
-        progress: 0,
-        message: `Found ${sequence.frameCount} frames. Preparing encoder...`,
-        outputPath,
+    const staged = stageConversionOutput(outputPath, format.id);
+    let sequenceTemp = null;
+    const cleanup = () => {
+      staged.cleanup();
+      if (sequenceTemp) fs.rmSync(sequenceTemp, { recursive: true, force: true });
+    };
+    const reservedJob = { id: jobId, process: null, cancelled: false, cleanup };
+    activeVideoConverterJob = reservedJob;
+    try {
+      const ffmpegPath = await require('./conversion-ffmpeg.cjs').resolveConversionFfmpeg(resolveFfmpegPath(), format.id);
+      if (reservedJob.cancelled) throw new Error('Conversion cancelled.');
+      const input = [];
+      let durationSec = 0, totalFrames = 0;
+      if (mode === 'sequence') {
+        const sequence = listImageSequenceFrames(args.folderPath);
+        const fps = clampNumber(args.fps, 1, 240, 30);
+        const { tmpDir, listPath } = makeConcatList(sequence.frames, fps);
+        sequenceTemp = tmpDir;
+        totalFrames = sequence.frameCount;
+        durationSec = totalFrames / fps;
+        input.push('-f', 'concat', '-safe', '0', '-i', listPath, '-r', String(fps), '-frames:v', String(totalFrames), '-an');
+      } else {
+        const inputPath = assertAbsolutePath(args.inputPath, 'input video path');
+        if (!fs.existsSync(inputPath)) throw new Error('Input video not found.');
+        const decoderArgs = format.alpha ? await probeConversionInput(ffmpegPath, inputPath, reservedJob) : [];
+        if (reservedJob.cancelled) throw new Error('Conversion cancelled.');
+        input.push('-fflags', '+genpts', ...decoderArgs, '-i', inputPath, '-map', '0:v:0', '-map', '0:a:0?');
+      }
+      return await spawnFfmpegConversion({ sender: event.sender, jobId, durationSec, totalFrames, outputPath, reservedJob, ffmpegPath,
+        startMessage: `Converting to ${format.label}...`, completeMessage: `${format.label} conversion complete.`,
+        progressMode: mode === 'sequence' ? 'frames' : 'time', cleanup, finalize: () => staged.complete(),
+        args: ['-hide_banner', '-nostdin', '-n', '-progress', 'pipe:2', '-nostats', ...input,
+          ...conversionOutputArgs(format.id, args), staged.temporaryPath],
       });
-      return spawnFfmpegConversion({
-        sender: event.sender,
-        jobId,
-        durationSec,
-        outputPath,
-        startMessage: `Encoding ${sequence.frameCount} frames at ${fps} fps...`,
-        completeMessage: 'Image sequence MP4 complete.',
-        progressMode: 'frames',
-        totalFrames: sequence.frameCount,
-        cleanup: () => {
-          try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        },
-        args: [
-          '-hide_banner',
-          '-nostdin',
-          '-y',
-          '-progress', 'pipe:2',
-          '-nostats',
-          '-f', 'concat',
-          '-safe', '0',
-          '-i', listPath,
-          '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
-          '-r', String(fps),
-          ...commonOutput,
-        ],
-      });
+    } catch (error) {
+      if (activeVideoConverterJob === reservedJob) activeVideoConverterJob = null;
+      cleanup(); throw error;
     }
-
-    const inputPath = assertAbsolutePath(args.inputPath, 'input video path');
-    if (!fs.existsSync(inputPath)) throw new Error('Input video not found.');
-    publishVideoConverterProgress(event.sender, {
-      jobId,
-      stage: 'preparing',
-      progress: 0,
-      message: 'Preparing native FFmpeg encoder...',
-      outputPath,
-    });
-    return spawnFfmpegConversion({
-      sender: event.sender,
-      jobId,
-      durationSec: 0,
-      outputPath,
-      startMessage: 'Converting WebM to MP4...',
-      completeMessage: 'WebM MP4 conversion complete.',
-      args: [
-        '-hide_banner',
-        '-nostdin',
-        '-y',
-        '-progress', 'pipe:2',
-        '-nostats',
-        '-fflags', '+genpts',
-        '-i', inputPath,
-        '-map', '0:v:0',
-        '-map', '0:a:0?',
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-ar', '48000',
-        '-ac', '2',
-        '-avoid_negative_ts', 'make_zero',
-        '-max_muxing_queue_size', '1024',
-        ...commonOutput,
-      ],
-    });
   });
 
   // --- Save binary file from base64 ---
@@ -4608,19 +7946,238 @@ function registerIpcHandlers() {
     return { content, dir: path.dirname(filePath) };
   });
 
-  // Native renderer commands — stub as not available in Electron mode
-  // (these are only used by the Tauri D3D11 native renderer)
-  const nativeRendererStubs = [
-    'native_renderer_start', 'native_renderer_stop', 'native_renderer_submit_batch',
-    'native_renderer_submit_commands', 'native_renderer_upload_source_gpu_shared_texture',
-    'native_renderer_prefetch_media', 'native_renderer_set_decode_policy',
-    'native_renderer_set_present_policy', 'native_renderer_set_prefetch_policy',
-    'native_renderer_get_stats', 'native_renderer_reset_stats',
-    'native_renderer_get_decode_capabilities', 'native_renderer_set_output_window',
-  ];
-  for (const cmd of nativeRendererStubs) {
-    ipcMain.handle(cmd, () => { throw new Error('Native renderer not available in Electron mode'); });
+  // Window controls for the frameless editor. On Windows/Linux the native
+  // preview underlay requires a transparent BrowserWindow, which drops the OS
+  // title bar — so the DOM toolbar carries min/maximize/close, wired here.
+  ipcMain.handle('win_minimize', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) win.minimize();
+  });
+  ipcMain.handle('win_maximize_toggle', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return false;
+    if (win.isMaximized()) win.unmaximize();
+    else win.maximize();
+    return win.isMaximized();
+  });
+  ipcMain.handle('win_is_maximized', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return !!(win && !win.isDestroyed() && win.isMaximized());
+  });
+  ipcMain.handle('win_close', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) win.close();
+  });
+
+  // Toolbar-as-title-bar drag. `-webkit-app-region: drag` can move the window
+  // but Chromium then swallows all mouse input over that region in the browser
+  // process, so the renderer never sees the double-click that should maximize.
+  // Driving the move from here instead keeps both gestures working: the
+  // renderer reports press/release, and we follow the OS cursor directly so no
+  // renderer-side coordinate or DPI conversion is involved.
+  let winDragTimer = null;
+  let winDragOrigin = null;
+  const stopWindowDrag = () => {
+    if (winDragTimer) clearInterval(winDragTimer);
+    winDragTimer = null;
+    winDragOrigin = null;
+  };
+  ipcMain.handle('win_drag_start', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || win.isMaximized()) return false;
+    stopWindowDrag();
+    const cursor = screen.getCursorScreenPoint();
+    const [wx, wy] = win.getPosition();
+    winDragOrigin = { cx: cursor.x, cy: cursor.y, wx, wy };
+    winDragTimer = setInterval(() => {
+      if (!win || win.isDestroyed() || !winDragOrigin) return stopWindowDrag();
+      const p = screen.getCursorScreenPoint();
+      win.setPosition(
+        winDragOrigin.wx + (p.x - winDragOrigin.cx),
+        winDragOrigin.wy + (p.y - winDragOrigin.cy),
+      );
+    }, 8);
+    return true;
+  });
+  ipcMain.handle('win_drag_end', () => {
+    stopWindowDrag();
+    return true;
+  });
+
+  // Native renderer bridge. Electron is the long-term UI shell for 2.0;
+  // the render core runs as a separate Rust/wgpu process so a renderer
+  // crash does not take the control surface down.
+  ipcMain.handle('native_preview_attach', async (_event, args = {}) => {
+    return attachNativeEditorPreview(args?.rect ?? args);
+  });
+
+  ipcMain.handle('native_preview_update', async (_event, args = {}) => {
+    return updateNativeEditorPreview(args?.rect ?? args);
+  });
+
+  ipcMain.handle('native_preview_set_overlay', async (_event, args = {}) => {
+    const addon = nativePreviewAddon || loadNativePreviewAddon();
+    if (!addon || typeof addon.setOverlay !== 'function') return getNativePreviewStatus();
+    try {
+      addon.setOverlay(args?.overlay ?? args ?? {});
+    } catch (err) {
+      nativePreviewAddonLoadError = err?.message || String(err);
+    }
+    return getNativePreviewStatus();
+  });
+
+  ipcMain.handle('native_preview_detach', async (_event, args = {}) => {
+    return detachNativeEditorPreview(args?.reason || 'ipc-detach');
+  });
+
+  ipcMain.handle('native_preview_get_status', async () => {
+    return getNativePreviewStatus();
+  });
+
+  // ── Native output live recording (main-process IOSurface capture) ──
+  ipcMain.handle('native_output_recording_start', async (_event, args = {}) => {
+    try {
+      return await startNativeOutputRecording(args);
+    } catch (err) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+  ipcMain.handle('native_recording_codecs', async () => {
+    try {
+      return { success: true, ...(await nativeRecordingCodecs()) };
+    } catch (err) {
+      return { success: false, error: err?.message || String(err), codecs: [] };
+    }
+  });
+  ipcMain.handle('native_output_recording_stop', async () => {
+    try {
+      return await stopNativeOutputRecording();
+    } catch (err) {
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
+
+  // ── Deck confidence monitors ──
+  // Two small named presenter views (deck-a / deck-b) fed by the core's
+  // bank-monitor shared textures. The addon's per-view display-link pump
+  // repaints on its own; this pump only refreshes surface bindings.
+  // Lets a slice window ask whether the core is presenting it natively. If
+  // so it skips its own WebGL render entirely and stays transparent.
+  ipcMain.handle('slice_native_presentation_state', async (_event, args = {}) => {
+    const sliceId = typeof args?.sliceId === 'string' ? args.sliceId : '';
+    return {
+      active: !!sliceId && sliceNativeAttached.has(sliceId),
+      // `pending` tells the slice window to wait rather than start its own
+      // renderer — the attach probe is still in flight.
+      pending: !!sliceId && sliceNativePending.has(sliceId),
+      platform: process.platform,
+    };
+  });
+
+  ipcMain.handle('deck_monitor_attach', async (_event, args = {}) => {
+    if (!['darwin', 'win32'].includes(process.platform)) return { attached: false, reason: 'unsupported platform' };
+    const addon = nativePreviewAddon || loadNativePreviewAddon();
+    if (!addon || typeof addon.monitorAttach !== 'function') {
+      return { attached: false, reason: 'presenter addon lacks monitor support' };
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) return { attached: false };
+    const monitors = Array.isArray(args?.monitors) ? args.monitors : [];
+    try {
+      const handle = mainWindow.getNativeWindowHandle();
+      if (!Buffer.isBuffer(handle) || handle.length === 0) return { attached: false };
+      for (const monitor of monitors) {
+        const name = typeof monitor?.name === 'string' ? monitor.name : '';
+        if (!name || !monitor?.rect) continue;
+        if (addon.monitorAttach(name, handle, nativePreviewAddonRect(normalizeNativePreviewRect(monitor.rect), monitor.rect))) {
+          deckMonitorAttachedNames.add(name);
+        }
+      }
+      startDeckMonitorPump();
+      return { attached: deckMonitorAttachedNames.size > 0 };
+    } catch (err) {
+      console.warn('[DeckMonitor] attach failed:', err?.message || err);
+      return { attached: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('deck_monitor_detach', async () => {
+    stopDeckMonitorPump();
+    const addon = nativePreviewAddon;
+    if (addon && typeof addon.monitorDetach === 'function') {
+      for (const name of deckMonitorAttachedNames) {
+        try { addon.monitorDetach(name); } catch { /* teardown best-effort */ }
+      }
+    }
+    deckMonitorAttachedNames.clear();
+    return { attached: false };
+  });
+
+  // Pointer-rate viewport mutations must never wait behind scene rebuilds,
+  // media uploads, readiness probes, or request/response timeouts. Keep only
+  // the newest geometry for each layer and write it to the core on the next
+  // main-process turn as an id=0 notification.
+  const pendingNativeViewportInteractions = new Map();
+  let nativeViewportInteractionFlushScheduled = false;
+  const flushNativeViewportInteractions = () => {
+    nativeViewportInteractionFlushScheduled = false;
+    const pending = Array.from(pendingNativeViewportInteractions.values());
+    pendingNativeViewportInteractions.clear();
+    for (const interaction of pending) {
+      nativeRendererBroker.notify('set_layer_interaction', interaction);
+    }
+  };
+  ipcMain.handle('native_viewport_set_layer_interaction', async (_event, args = {}) => {
+    const layerId = typeof args?.layer_id === 'string' ? args.layer_id.trim() : '';
+    if (!layerId) return { accepted: false };
+    pendingNativeViewportInteractions.set(layerId, { ...args, layer_id: layerId });
+    if (!nativeViewportInteractionFlushScheduled) {
+      nativeViewportInteractionFlushScheduled = true;
+      setImmediate(flushNativeViewportInteractions);
+    }
+    return { accepted: true };
+  });
+
+  for (const cmd of nativeRendererCommandNames()) {
+    ipcMain.handle(cmd, async (_event, args = {}) => {
+      if (cmd !== 'native_renderer_start') {
+        if (cmd === 'native_renderer_stop') {
+          detachNativeEditorPreview('native-renderer-stop');
+          // Their frames have nowhere to go; the sync reopens them on restart.
+          jsSourceHost.closeAll();
+        }
+        return nativeRendererBroker.invoke(cmd, args);
+      }
+      const startArgs = args && typeof args === 'object' ? { ...args } : {};
+      const config = startArgs.config && typeof startArgs.config === 'object'
+        ? { ...startArgs.config }
+        : {};
+      const wantsEditorPreviewWindowPresenter =
+        config.editor_preview_window_presenter === true ||
+        startArgs.editor_preview_window_presenter === true;
+      if (wantsEditorPreviewWindowPresenter && mainWindow && !mainWindow.isDestroyed() && !config.editor_parent_window_handle_hex) {
+        try {
+          const handle = mainWindow.getNativeWindowHandle();
+          if (Buffer.isBuffer(handle) && handle.length > 0) {
+            config.editor_parent_window_handle_hex = handle.toString('hex');
+            config.editor_parent_window_handle_platform =
+              process.platform === 'darwin' ? 'appkit-nsview'
+                : process.platform === 'win32' ? 'win32-hwnd'
+                  : process.platform;
+          }
+        } catch (err) {
+          console.warn('[NativeRenderer] failed to read main window native handle:', err?.message || err);
+        }
+      }
+      return nativeRendererBroker.invoke(cmd, { ...startArgs, config });
+    });
   }
+
+  ipcMain.handle('js_source_open', (_event, args = {}) => jsSourceHost.open(args));
+  ipcMain.handle('js_source_close', (_event, args = {}) => jsSourceHost.close(args?.id));
+  ipcMain.handle('js_source_params', (_event, args = {}) => jsSourceHost.setParams(args?.id, args?.values));
+  ipcMain.handle('js_source_audio', (_event, args = {}) => jsSourceHost.setAudio(args?.fields));
+  ipcMain.handle('js_source_status', () => jsSourceHost.status());
+  ipcMain.handle('js_source_thumbnail', (_event, args = {}) => jsSourceHost.thumbnail(args));
 
   // License IPC removed in OSS build — every install is unlocked, no
   // activation, no machine fingerprinting, no online validation.
@@ -4785,7 +8342,26 @@ function createMainWindow() {
     minWidth: 1200,
     minHeight: 700,
     title: 'Ghost Arcade',
-    backgroundColor: '#0a0a0c',
+    // Keep the real OS window chrome even though the editor content is
+    // transparent on macOS for the embedded Metal preview underlay. Relying
+    // on Electron's implicit transparent-window style can drop the title bar
+    // and traffic lights, leaving the editor looking like a floating panel.
+    // Windows/Linux run frameless: the transparent window the native preview
+    // underlay needs has no usable OS title bar anyway, and Chromium only
+    // honours `-webkit-app-region: drag` (which makes the toolbar act as the
+    // caption — drag to move, double-click to maximize) on a frameless window.
+    frame: process.platform === 'darwin',
+    ...(process.platform === 'darwin' ? {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 12, y: 9 },
+    } : {}),
+    // Windows joins macOS in transparent-Chromium mode so the editor canvas is a
+    // real hole the native preview underlay shows through (the whole DOM stack —
+    // body/#app/canvas-container — already computes to rgba(0,0,0,0)). App panels
+    // paint opaque, so nothing but the canvas hole is see-through.
+    backgroundColor: process.platform === 'darwin' || process.platform === 'win32' ? '#00000000' : '#05070b',
+    transparent: process.platform === 'darwin' || process.platform === 'win32',
+    hasShadow: true,
     autoHideMenuBar: true,
     // Window icon — single source-of-truth lives in build-resources/icons.
     // Was previously pointing at src-tauri/icons/icon.png (legacy from a
@@ -4810,6 +8386,40 @@ function createMainWindow() {
     },
   });
 
+  // Keep Chromium alpha-capable for the embedded Metal underlay, but make the
+  // owning NSWindow itself opaque before the first renderer frame arrives.
+  // The native addon reapplies this contract on every preview attach/update.
+  stabilizeNativeEditorHost();
+  mainWindow.once('ready-to-show', stabilizeNativeEditorHost);
+
+  if (process.platform === 'darwin') {
+    mainWindow.setWindowButtonVisibility(true);
+  }
+
+  if (process.platform === 'win32' && typeof mainWindow.hookWindowMessage === 'function') {
+    // Double-click the toolbar to maximize/restore, like a real title bar.
+    // Chromium handles mouse input over `-webkit-app-region: drag` inside the
+    // browser process, so the renderer never receives a dblclick there — the
+    // gesture arrives as a non-client caption double-click instead.
+    const WM_NCLBUTTONDBLCLK = 0x00a3;
+    if (process.env.GA_DEBUG_CAPTION === '1') {
+      for (const msg of [0x00a1, 0x00a3, 0x0201, 0x0203, 0x00a0, 0x0084]) {
+        try {
+          mainWindow.hookWindowMessage(msg, () => console.log(`[Caption] msg 0x${msg.toString(16)}`));
+        } catch {}
+      }
+    }
+    try {
+      mainWindow.hookWindowMessage(WM_NCLBUTTONDBLCLK, () => {
+        if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isMaximizable()) return;
+        if (mainWindow.isMaximized()) mainWindow.unmaximize();
+        else mainWindow.maximize();
+      });
+    } catch (err) {
+      console.warn('[Main] Could not hook caption double-click:', err?.message || err);
+    }
+  }
+
   // Force zoom factor to 1.0 to prevent DPI scaling from misaligning overlays
   mainWindow.webContents.setZoomFactor(1.0);
 
@@ -4823,7 +8433,7 @@ function createMainWindow() {
         submenu: [
           { label: 'About Ghost Arcade', role: 'about' },
           { type: 'separator' },
-          { label: 'Settings', accelerator: 'Cmd+,', click: () => mainWindow.webContents.send('open-settings') },
+          { label: 'Settings', accelerator: 'Cmd+,', click: () => mainWindow?.webContents.send('open-settings') },
           { type: 'separator' },
           { label: 'Hide Ghost Arcade', accelerator: 'Cmd+H', role: 'hide' },
           { label: 'Hide Others', accelerator: 'Cmd+Alt+H', role: 'hideOthers' },
@@ -4856,7 +8466,7 @@ function createMainWindow() {
       {
         label: 'Window',
         submenu: [
-          { label: 'Minimize', accelerator: 'Cmd+M', role: 'minimize' },
+          { label: 'Minimize', accelerator: 'Cmd+Alt+M', role: 'minimize' },
           { label: 'Close', accelerator: 'Cmd+W', role: 'close' },
           { type: 'separator' },
           { label: 'Bring All to Front', role: 'front' },
@@ -4951,8 +8561,10 @@ function createMainWindow() {
         title: isSliceWin ? 'Ghost Arcade Output — slice' : 'Ghost Arcade Output',
         resizable: !isSliceWin,
         frame: !isSliceWin,
-        fullscreen: isSliceWin ? true : fullscreen,
-        simpleFullscreen: process.platform === 'darwin',
+        // A slice window enters simple fullscreen once created (see
+        // enterSliceFullscreen); built fullscreen on macOS it never closes.
+        fullscreen: isSliceWin ? process.platform !== 'darwin' : fullscreen,
+        simpleFullscreen: process.platform === 'darwin' && !isSliceWin,
         autoHideMenuBar: true,
         skipTaskbar: false,
         backgroundColor: '#000000',
@@ -5000,7 +8612,6 @@ function createMainWindow() {
             try { existing.close(); } catch { /* */ }
           }
           sliceWindows.set(sliceId, newWindow);
-          installOutputEscapeHandler(newWindow, { closeOnEscape: true });
           newWindow.on('closed', () => {
             if (sliceWindows.get(sliceId) === newWindow) sliceWindows.delete(sliceId);
           });
@@ -5010,13 +8621,13 @@ function createMainWindow() {
         console.warn('[Output] slice display capture failed:', err);
       }
       try { newWindow.setMenuBarVisibility(false); } catch { /* */ }
+      enterSliceFullscreen(newWindow);
       if (process.env.GHOSTARCADE_SLICE_DEVTOOLS === '1') {
         try { newWindow.webContents.openDevTools({ mode: 'detach' }); } catch { /* */ }
       }
       return;
     }
     outputWindow = newWindow;
-    installOutputEscapeHandler(newWindow);
     try { newWindow.setMenuBarVisibility(false); } catch { /* */ }
     console.log('[Output] zero-copy output window captured into outputWindow global');
     // DevTools opt-in via env var to match the perf baseline of the
@@ -5076,6 +8687,8 @@ function createMainWindow() {
       message.includes('AutoMap') ||
       message.includes('[KF') ||
       message.includes('[GPU]') ||       // surface WebGL renderer info from Canvas.svelte
+      message.includes('[NativeRendererSync]') || // native render-core bridge diagnostics
+      message.includes('[StageFX') ||    // stage-effects engine + native FX bridge diagnostics
       message.includes('[animate-') ||   // animate-tick / animate-dbg diagnostics
       message.includes('[syphon-') ||    // syphon-gate / syphon-path send-flow diagnostics
       message.includes('[Syphon')        // any Syphon-tagged renderer log
@@ -5120,18 +8733,57 @@ function createMainWindow() {
 // frame: true (so they get OS chrome to drag + close), and persists
 // across the editor lifetime only: closing the main app window also
 // closes this pop-out so it cannot keep Electron alive by itself.
-function createStage3DWindow() {
+
+/*
+ * Tell the editor where a sim window ended up.
+ *
+ * The user asked that dragging a window to another screen be remembered, so the
+ * renderer maps these bounds back to a display and stores the assignment. Fired
+ * on 'moved' (debounced -- macOS emits it continuously during a drag) and once
+ * more when the window closes.
+ */
+function reportSimWindowDisplay(surface, win) {
+  if (!win || win.isDestroyed()) return;
+  try {
+    const bounds = win.getBounds();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('sim-window-moved', { surface, bounds });
+    }
+  } catch { /* window torn down mid-report */ }
+}
+
+function trackSimWindowMoves(surface, win) {
+  if (!win) return;
+  let timer = null;
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; reportSimWindowDisplay(surface, win); }, 400);
+  };
+  win.on('moved', schedule);
+  win.on('close', () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    reportSimWindowDisplay(surface, win);
+  });
+}
+
+function createStage3DWindow(targetDisplayId = null) {
   // Default size: a wide 16:10 that's bigger than typical editor
   // sidebars but doesn't try to fill the whole screen. Users can
   // resize or drag to a second monitor freely.
   const winW = 1400;
   const winH = 900;
 
-  // Place on a second display if one's available — Stage 3D is a
-  // performance / preview surface, the main editor wants the primary.
+  /*
+   * The renderer resolves which display this belongs on and passes the id --
+   * see src/lib/output/displayAssignment.ts. Picking "first non-primary" here
+   * is what made Live Output, Stage Sim and Map Sim all land on the same screen
+   * on a projector-plus-monitor rig.
+   */
   const allDisplays = screen.getAllDisplays();
   const primary = screen.getPrimaryDisplay();
-  const target = allDisplays.find(d => d.id !== primary.id) || primary;
+  const target = allDisplays.find(d => d.id === targetDisplayId)
+    || allDisplays.find(d => d.id !== primary.id)
+    || primary;
   const winX = Math.round(target.bounds.x + (target.bounds.width - winW) / 2);
   const winY = Math.round(target.bounds.y + (target.bounds.height - winH) / 2);
 
@@ -5155,6 +8807,16 @@ function createStage3DWindow() {
   });
   stage3dWindow.setMenuBarVisibility(false);
 
+
+  // Forward this window's console to the terminal. Only the main window was
+  // wired up, so anything that went wrong inside the 3D stage window — the
+  // render loop throwing, a WebGL failure — was invisible while debugging.
+  stage3dWindow.webContents.on('console-message', (_event, level, message) => {
+    if (level >= 2 || message.includes('[Canvas]') || message.includes('[GPU]') || message.includes('[animate-')) {
+      console.log(`[Stage3DWindow${level >= 2 ? ':err' : ''}] ${message}`);
+    }
+  });
+
   const devUrl = process.env.VITE_DEV_SERVER_URL || 'http://localhost:1420';
   const isDev = !app.isPackaged;
   if (isDev) {
@@ -5165,20 +8827,33 @@ function createStage3DWindow() {
     });
   }
 
+  trackSimWindowMoves('stageSim', stage3dWindow);
+
   stage3dWindow.on('closed', () => {
     stage3dWindow = null;
+    // The 3D stage window owns the native stage scene; when it closes the
+    // core must drop the scene or the venue keeps compositing into the 2D
+    // output as ghost washes.
+    try {
+      nativeRendererBroker
+        .invoke('native_renderer_set_stage3d_scene', { scene: null })
+        .catch(() => {});
+    } catch {}
   });
   stage3dWindow.on('enter-full-screen', () => publishStage3DFullscreenState(true));
   stage3dWindow.on('leave-full-screen', () => publishStage3DFullscreenState(false));
 }
 
-function createProjectionSimWindow() {
+function createProjectionSimWindow(targetDisplayId = null) {
   const winW = 1400;
   const winH = 900;
 
+  // Same as Stage Sim: the renderer owns the assignment, this honours it.
   const allDisplays = screen.getAllDisplays();
   const primary = screen.getPrimaryDisplay();
-  const target = allDisplays.find(d => d.id !== primary.id) || primary;
+  const target = allDisplays.find(d => d.id === targetDisplayId)
+    || allDisplays.find(d => d.id !== primary.id)
+    || primary;
   const winX = Math.round(target.bounds.x + (target.bounds.width - winW) / 2);
   const winY = Math.round(target.bounds.y + (target.bounds.height - winH) / 2);
 
@@ -5212,36 +8887,34 @@ function createProjectionSimWindow() {
     });
   }
 
+  trackSimWindowMoves('mapSim', projectionSimWindow);
+
   projectionSimWindow.on('closed', () => {
     projectionSimWindow = null;
+    // Mirror the stage3d window: drop the native projection-sim scene so
+    // its overlay never lingers in the 2D output after the window closes.
+    try {
+      nativeRendererBroker
+        .invoke('native_renderer_set_projection_sim_scene', { scene: null })
+        .catch(() => {});
+    } catch {}
   });
   projectionSimWindow.on('enter-full-screen', () => publishProjectionSimFullscreenState(true));
   projectionSimWindow.on('leave-full-screen', () => publishProjectionSimFullscreenState(false));
 }
 
-function installOutputEscapeHandler(win, { closeOnEscape = false } = {}) {
-  if (!win || win.isDestroyed()) return;
-  win.webContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown' || input.key !== 'Escape') return;
-    event.preventDefault();
-    if (closeOnEscape) {
-      try { win.close(); } catch { /* noop */ }
-      return;
-    }
-    try {
-      if (typeof win.isSimpleFullScreen === 'function' && win.isSimpleFullScreen()) {
-        win.setSimpleFullScreen(false);
-      }
-      if (win.isFullScreen()) {
-        win.setFullScreen(false);
-      }
-      win.setMenuBarVisibility(true);
-      win.show();
-      win.focus();
-    } catch (err) {
-      console.warn('[Output] Escape fullscreen fallback failed:', err?.message || err);
-    }
-  });
+/**
+ * Borderless full-display screen (slice) window. On macOS a window built
+ * with `fullscreen: true` while `simpleFullscreen` is set never finishes
+ * Electron's fullscreen transition, and Electron defers close() until it
+ * does: "Close on display" and Esc left the window up, and every reopen
+ * stacked another one over the display. Entering simple fullscreen after
+ * construction gives the same window and closes normally. Other platforms
+ * are built with `fullscreen: true` and need nothing here.
+ */
+function enterSliceFullscreen(win) {
+  if (process.platform !== 'darwin' || !win || win.isDestroyed()) return;
+  try { win.setSimpleFullScreen(true); } catch { /* */ }
 }
 
 function createOutputWindow(width, height, x, y, fullscreen = false, displayId = null, experimentalWebRTC = false, experimentalZeroCopy = false) {
@@ -5298,7 +8971,6 @@ function createOutputWindow(width, height, x, y, fullscreen = false, displayId =
     },
   });
   outputWindow = win;
-  installOutputEscapeHandler(win);
 
   // Hide menu bar for clean look
   win.setMenuBarVisibility(false);
@@ -5314,7 +8986,9 @@ function createOutputWindow(width, height, x, y, fullscreen = false, displayId =
   // (webgpuCapability.ts) to report unsupported, which the lifecycle
   // gate also honors. Two independent failsafes, neither of which
   // requires the other to work.
-  // Output mode selection. Three transports, in precedence order:
+  // Fallback output mode selection. Native render-core output is selected
+  // by the renderer before createOutputWindow is invoked; this function
+  // covers the non-native paths, in precedence order:
   //
   //   webgpu-display → mounts OutputSharedTextureDisplayApp. Editor
   //                    side runs MediaStreamTrackProcessor on
@@ -5324,7 +8998,7 @@ function createOutputWindow(width, height, x, y, fullscreen = false, displayId =
   //                    Output side calls
   //                    `device.importExternalTexture({source: frame})`
   //                    and renders a fullscreen quad in WebGPU. True
-  //                    zero-copy GPU pipeline — the production target.
+  //                    zero-copy GPU pipeline — the primary fallback.
   //                    NOTE: `webgpu-disable=1` is NOT appended on this
   //                    path because we *need* WebGPU here. The output
   //                    process is still safe from the S4 pilot because
@@ -5337,7 +9011,7 @@ function createOutputWindow(width, height, x, y, fullscreen = false, displayId =
   //
   //   output         → mounts SpoutOutputApp (the original full
   //                    renderer with state-sync + per-layer rendering).
-  //                    Production default before zero-copy.
+  //                    Production default before zero-copy/native output.
   //
   // Auto-DevTools detached so the OutputDisplayApp logs (signaling
   // state, getStats() values when ?stats=1) are visible without
@@ -5588,6 +9262,9 @@ function scheduleHardExit(delayMs) {
 }
 
 function destroyNdiSenders() {
+  // Stop the composite output pump first — it owns one of the senders
+  // and would otherwise keep sending into a destroyed instance.
+  try { stopNdiOutputPump(); } catch { /* best effort on quit */ }
   if (!ndiAddon || ndiSenders.size === 0) return;
   for (const name of Array.from(ndiSenders)) {
     runCleanupStep(`NDI sender ${name}`, () => ndiAddon.destroySender({ name }));
@@ -5622,22 +9299,38 @@ function cleanupAndQuit() {
   }
   isQuitting = true;
   console.log('[Main] Cleaning up before quit...');
+  // app.exit skips renderer beforeunload. Notify MIDI owners explicitly so
+  // Cmd+Q also clears pads and releases controller modes before exiting.
+  runCleanupStep('notifyRendererQuit', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('app-before-quit');
+  });
 
   // Schedule first so a stuck native addon/socket teardown cannot keep the
   // single-instance lock alive in Task Manager.
   scheduleHardExit(750);
 
+  runCleanupStep('stopVideoConverter', () => {
+    if (!activeVideoConverterJob) return;
+    activeVideoConverterJob.cancelled = true;
+    killChildProcess(activeVideoConverterJob.process, 'video converter');
+    activeVideoConverterJob.cleanup?.();
+    activeVideoConverterJob = null;
+  });
   runCleanupStep('closeAuxiliaryWindows', closeAuxiliaryWindows);
+  runCleanupStep('detachNativeEditorPreview', () => detachNativeEditorPreview('app-quit'));
   runCleanupStep('stopSpoutSender', stopSpoutSender);
   runCleanupStep('stopSpoutReceiver', stopSpoutReceiver);
   runCleanupStep('destroyNdiSenders', destroyNdiSenders);
   runCleanupStep('destroyNdiReceivers', destroyNdiReceivers);
+  runCleanupStep('stopNativeRenderer', () => nativeRendererBroker.shutdownSync());
   runCleanupStep('shutdownLink', shutdownLink);
   runCleanupStep('stopOSC', stopOSC);
+  runCleanupStep('stopPowerSaveBlocker', stopPowerSaveBlocker);
   runCleanupStep('stopServer', stopServer);
   runCleanupStep('closeAllWledSockets', closeAllWledSockets);
+  runCleanupStep('stopPixelMapOutput', () => pixelMapOutput.stop());
+  runCleanupStep('stopDmxInput', () => dmxInput.stop());
   runCleanupStep('killPluginProcesses', killPluginProcesses);
-  runCleanupStep('stopPowerSaveBlocker', stopPowerSaveBlocker);
 
-  app.exit(0);
+  setTimeout(() => app.exit(0), 150);
 }

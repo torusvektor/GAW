@@ -48,7 +48,7 @@
 </script>
 
 {#if !vjOpen}
-<div class="bottom-dock">
+<div data-help-page="interface" class="bottom-dock">
   <button class="pill" class:on={presetsOpen} onclick={onTogglePresets} title="Presets (⌘P)">
     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M6 15l6-6 6 6"/>
@@ -76,13 +76,14 @@
 
 <style>
   /* Hide the legacy per-panel toggle buttons (Presets, Sequencer,
-     Keyframes) since the dock now serves as the single entry point.
-     Keeping both visible meant three near-identical pills stacking at
+     Keyframes, Show) since the dock now serves as the single entry point.
+     Keeping both visible meant near-identical pills stacking at
      bottom:24px and competing for the same chunk of screen real estate.
      The actual panels stay mounted; we just suppress their toggles. */
   :global(.tray-toggle),
   :global(.seq-toggle),
-  :global(.kf-toggle) { display: none !important; }
+  :global(.kf-toggle),
+  :global(.show-toggle) { display: none !important; }
 
   .bottom-dock {
     position: fixed;

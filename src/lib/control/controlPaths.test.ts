@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONTROL_PATH_EXAMPLES,
+  isVideoScratchPath,
   normalizeControlPath,
   validateControlPath,
 } from './controlPaths';
@@ -22,6 +23,17 @@ describe('control parameter paths', () => {
     }
   });
 
+  it('keeps scratch control distinct from external timeline position', () => {
+    for (const path of ['map:media:scratch', 'vj:0:video:scratch', 'vj-b:2:video:scratch', 'VJ:Layer:3:Video:Scratch']) {
+      expect(isVideoScratchPath(path), path).toBe(true);
+      expect(validateControlPath(path).valid, path).toBe(true);
+    }
+    for (const path of ['map:media:position', 'vj:0:video:position', 'vj-b:2:video:play']) {
+      expect(isVideoScratchPath(path), path).toBe(false);
+      expect(validateControlPath(path).valid, path).toBe(true);
+    }
+  });
+
   it('returns useful validation errors for invalid targets', () => {
     expect(validateControlPath('vj:layer:0:nope')).toEqual({
       valid: false,
@@ -30,4 +42,9 @@ describe('control parameter paths', () => {
     });
     expect(validateControlPath('map:preset:not-a-number').reason).toContain('zero-based index');
   });
+});
+
+it('validates stable group control paths without accepting incomplete actions', () => {
+  for (const path of ['vj:group:group-id:level', 'vj-b:group:group-id:column:2', 'vj:group:group-id:fx:fx-id:mix', 'vj:group:group-id:fx:fx-id:param:blurRadius']) expect(validateControlPath(path).valid).toBe(true);
+  for (const path of ['vj:group::level', 'vj:group:group-id:column:bad', 'vj:group:group-id:fx:fx-id:param', 'vj:group:group-id:unknown']) expect(validateControlPath(path).valid).toBe(false);
 });

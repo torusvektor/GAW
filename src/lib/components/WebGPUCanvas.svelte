@@ -22,8 +22,8 @@
    *        canvas as a sampleable WebGPU texture. Same-process,
    *        GPU-resident, zero CPU readback.
    *      • runs our render callback with the resulting external
-   *        texture (fullscreen quad + adv-lightpaint + stroke
-   *        particles + per-layer pixel-fx renderers)
+   *        texture (fullscreen quad + paint drips + adv-lightpaint
+   *        + stroke particles + per-layer pixel-fx renderers)
    *      • try/finally releases the frame at the end — guaranteed,
    *        even on early return or thrown exception. Without this,
    *        each leaked VideoFrame holds ~8MB at 1080p / ~33MB at 4K.
@@ -33,8 +33,8 @@
    *
    * Net effect: editor visually identical to the WebGL-only path,
    * but the FINAL present surface is a WebGPU canvas. This unblocks
-   * the migration roadmap — per-layer WebGPU renderers (advPaint,
-   * strokeParticles, pixelFX) composite over the bridge
+   * the migration roadmap — per-layer WebGPU renderers (paintDrip,
+   * advPaint, strokeParticles, pixelFX) composite over the bridge
    * frame inside the same render pass, and over time more of the
    * scene migrates off WebGL.
    *
@@ -48,20 +48,17 @@
    *     all interactions fall through to Canvas.svelte's wrapper
    *     (mapping clicks, layer selection, etc.).
    *   - One device for the whole edition: ensureWebGPUDevice() is a
-   *     singleton, so the bridge, gpuEffectRunner, advPaint,
-   *     strokeParticles, and every pixel-fx renderer share
+   *     singleton, so the bridge, gpuEffectRunner, paintDrip,
+   *     advPaint, strokeParticles, and every pixel-fx renderer share
    *     ONE device — the only way they can share textures without
    *     CPU round-trip.
    *
    * ───────────────────────────────────────────────────────────────
-   * RELATED: mid-chain GPU effects (gpuEffectRunner.ts) are now
-   * DEMOTED to opt-in via `experimental.allowMidChainGpuEffects`
-   * (default OFF). That runner does CPU-readback because it has to
-   * bridge mid-WebGL-chain — no public API gives us a zero-copy
-   * import at an arbitrary point in a WebGL effect chain. This
-   * downstream-compositor bridge runs ONCE per frame AFTER the WebGL
-   * chain is fully composited, which is the only spot where
-   * `new VideoFrame(canvas)` gets us the GpuMemoryBuffer for free.
+   * RELATED: mid-chain GPU effects (gpuEffectRunner.ts) can still run
+   * in the legacy comparison renderer through
+   * `experimental.allowMidChainGpuEffects`. That runner does CPU
+   * readback because it has to bridge mid-WebGL-chain. Native v2
+   * disables it and requires a native graph/effect-pass port instead.
    *
    * See docs/WEBGPU_MIGRATION.md for the full roadmap.
    */
@@ -70,6 +67,7 @@
   import { stopOutputSharedTexturePresenter, setOutputCursor, setOutputCursorStyle } from '$lib/sync/outputSharedTexturePresenter';
   import { reconcileMasterWarpOutput, disposeMasterWarpOutput } from '$lib/sync/outputComposite';
   import { settings, outputFrozen, masterWarpIsActive } from '$lib/stores/settings';
+  import { WebGPUPaintDrip } from '$lib/renderer/webgpuPaintDrip';
   import { WebGPUAdvLightPaint } from '$lib/renderer/webgpuAdvLightPaint';
   import { WebGPUStrokeParticles, collectGPUStrokes } from '$lib/renderer/webgpuStrokeParticles';
   import { setGPUBrushCanvas } from '$lib/lightpainting/gpuBrushBridge';
@@ -218,6 +216,13 @@
   // subscription below. Null until the analyzer ticks once.
   let lastAudioBands: { bass: number; mid: number; treble: number } | null = null;
 
+  // Phase 3.1 showcase: WebGPU compute-shader paint drip system.
+  // Mounted after WebGPU init succeeds; runs an additive overlay
+  // pass on top of the bridge frame each tick. Defaults OFF now —
+  // it's a "press D to play" extra. The proper feature is the new
+  // adv-lightpaint layer type below.
+  let paintDrip: WebGPUPaintDrip | null = null;
+  let paintEnabled = false;
   let audioUnsub: (() => void) | null = null;
 
   // Phase 3.2 feature: 3D physics-driven WebGPU paint with brush
@@ -669,7 +674,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     try {
       // Use the shared WebGPU device so the bridge presenter, the
       // GPU effect runner, and all the other compute renderers
-      // (advPaint, strokeParticles, pixel-fx) talk to
+      // (paintDrip, advPaint, strokeParticles, pixel-fx) talk to
       // ONE device. That's the only way they can share textures
       // without going through the CPU.
       const shared = await ensureWebGPUDevice();
@@ -721,6 +726,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         addressModeU: 'clamp-to-edge',
         addressModeV: 'clamp-to-edge',
       });
+
+      // Phase 3.1: instantiate the paint-drip particle showcase.
+      // Failure here is non-fatal — bridge still works, just no
+      // particles. Logs the error and continues.
+      try {
+        paintDrip = await WebGPUPaintDrip.create(device, preferredFormat);
+      } catch (err: any) {
+        console.error('[WebGPUCanvas] paint drip init failed (non-fatal):', err?.message || err);
+        paintDrip = null;
+      }
 
       // Phase 3.2: 3D adv-lightpaint compute renderer. Same
       // failure semantics — non-fatal, the bridge keeps working.
@@ -936,6 +951,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       pass.setBindGroup(0, bindGroup);
       pass.draw(6, 1, 0, 0);
       pass.end();
+
+      // Phase 3.1 paint drip overlay (D-key showcase). Default OFF
+      // now — only runs when user hits D explicitly. Routes mouse
+      // input only when no adv-lightpaint layer is selected (so the
+      // two systems don't double-spawn).
+      if (paintDrip && paintEnabled && !advPaintSelected) {
+        paintDrip.setSpawnPosition(mouseSpawnU, mouseSpawnV, mouseDown);
+        paintDrip.setViewport(presentCanvas.width, presentCanvas.height);
+        paintDrip.encodeFrame(encoder, view);
+      }
 
       // Phase 3.2 adv-lightpaint compute renderer. Active any time
       // an adv-lightpaint layer exists in the project; mouse drives
@@ -1408,6 +1433,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       e.stopPropagation();
     }
   }
+  function onKeyDown(e: KeyboardEvent): void {
+    // 'D' toggles paint drip. Ignore if user is typing into an input.
+    if ((e.target as HTMLElement)?.tagName === 'INPUT' || (e.target as HTMLElement)?.tagName === 'TEXTAREA') return;
+    if (e.key === 'd' || e.key === 'D') {
+      paintEnabled = !paintEnabled;
+    }
+  }
+
   onMount(async () => {
     await initWebGPU();
     if (initStatus === 'no-source' || initStatus === 'running') {
@@ -1452,14 +1485,16 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     window.addEventListener('mousemove', onMouseMove, { capture: true });
     window.addEventListener('mousedown', onMouseDown, { capture: true });
     window.addEventListener('mouseup', onMouseUp, { capture: true });
+    window.addEventListener('keydown', onKeyDown);
 
-    // Subscribe to the shared visual-audio bus so light painting and
-    // flythrough motion inherit the same Milkdrop-style smoothing as the rest of
+    // Subscribe to the shared visual-audio bus so drips and flythrough
+    // motion inherit the same Milkdrop-style smoothing as the rest of
     // the renderer. Also snapshots the full bass/mid/treble vector into
     // `lastAudioBands` so the per-frame flythrough loop can read
     // it without re-subscribing per layer.
     audioUnsub = visualAudio.subscribe((audio) => {
       const bassEnergy = Math.max(audio.bassFast, audio.kick * 0.85);
+      if (paintDrip) paintDrip.setBassEnergy(bassEnergy);
       if (advPaint) advPaint.setBassEnergy(bassEnergy);
       lastAudioBands = { bass: bassEnergy, mid: audio.mid, treble: audio.high };
     });
@@ -1519,6 +1554,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     window.removeEventListener('mousemove', onMouseMove, { capture: true } as any);
     window.removeEventListener('mousedown', onMouseDown, { capture: true } as any);
     window.removeEventListener('mouseup', onMouseUp, { capture: true } as any);
+    window.removeEventListener('keydown', onKeyDown);
     if (audioUnsub) { try { audioUnsub(); } catch { /* */ } audioUnsub = null; }
     if (frozenUnsub) { try { frozenUnsub(); } catch { /* */ } frozenUnsub = null; }
     setGPUBrushCanvas(null);
@@ -1526,6 +1562,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     if (projectUnsub) { try { projectUnsub(); } catch { /* */ } projectUnsub = null; }
     if (selectedLayerUnsub) { try { selectedLayerUnsub(); } catch { /* */ } selectedLayerUnsub = null; }
     if (settingsUnsub) { try { settingsUnsub(); } catch { /* */ } settingsUnsub = null; }
+    try { paintDrip?.dispose?.(); } catch { /* */ }
+    paintDrip = null;
     try { advPaint?.dispose?.(); } catch { /* */ }
     advPaint = null;
     try { strokeParticles?.dispose?.(); } catch { /* */ }
@@ -1547,7 +1585,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       <div class="error-title">WebGPU bridge error</div>
       <div class="error-body">{initError}</div>
       <div class="error-hint">
-        Toggle <code>experimental.editorWebGPU</code> off to fall back to WebGL only.
+        Turn off <strong>Editor frame bridge</strong> in Settings → Performance → Renderer to fall back to WebGL only.
       </div>
     </div>
   {/if}
@@ -1593,7 +1631,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     color: var(--text-primary, #ddd);
     padding: 10px 14px;
     border-radius: 4px;
-    font-family: var(--ga-font-mono, 'IBM Plex Mono', ui-monospace, monospace);
+    font-family: var(--ga-font-mono, 'Geist Mono', ui-monospace, monospace);
     font-size: 12px;
     line-height: 1.5;
     pointer-events: none;

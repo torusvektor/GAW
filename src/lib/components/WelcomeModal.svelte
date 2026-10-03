@@ -14,10 +14,10 @@
   }
 </script>
 
-<div class="welcome-overlay">
+<div data-help-page="getting-started" class="welcome-overlay">
   <div class="welcome-panel">
     <div class="welcome-logo">
-      <img src="{import.meta.env.BASE_URL}logo.png" alt="Ghost Arcade" class="logo-img" />
+      <img src="{import.meta.env.BASE_URL}icon-new.png" alt="Ghost Arcade" class="logo-img" />
     </div>
     <h1 class="welcome-title">Welcome to Ghost Arcade</h1>
     <p class="welcome-subtitle">Open-source projection mapping &amp; VJ software</p>

@@ -1,9 +1,12 @@
+import type { ProjectorCalibration, OverlapBand } from '../output/projectorCalibration';
+import { createCoalescedWriter } from '../utils/coalescedWriter';
 // Settings Store
 // Manages app-wide settings including recording preferences
 
 import { writable, get } from 'svelte/store';
 import { invoke, isDesktopApp } from '$lib/bridge';
-import type { WarpCorners, MeshWarpGrid, Effect } from '../types';
+import type { WarpCorners, MeshWarpGrid, Effect, Point2D, BezierPoint } from '../types';
+import { meshGridHasTangents } from '../utils/meshWarp';
 
 // ============================================================================
 // COLOR SCHEME DEFINITIONS
@@ -40,22 +43,25 @@ export interface ColorScheme {
 }
 
 // Midnight Coral - Dark with red/coral accents (DEFAULT - based on reference images)
+// Ghost Chrome — the default accent. Ghostly white core with metallic
+// light blue-grey support (the coral era lives on only in the scheme id,
+// kept for saved-settings compatibility).
 export const SCHEME_MIDNIGHT_CORAL: ColorScheme = {
   id: 'midnight-coral',
-  name: 'Midnight Coral',
-  description: 'Dark theme with red/coral accents',
+  name: 'Ghost Chrome',
+  description: 'Ghostly white and metallic ice blue-grey accents',
   colors: {
     bgPrimary: '#0a0a0c',
     bgSecondary: 'rgba(18, 18, 22, 0.95)',
     bgTertiary: '#141418',
     bgOverlay: 'rgba(0, 0, 0, 0.85)',
-    accentPrimary: '#FF725F',      // Coral red
-    accentSecondary: '#FF9A84',    // Lighter coral
-    accentHover: '#FF5F4C',        // Brighter on hover
+    accentPrimary: '#dfe9f2',      // Ghostly white with an ice-blue tinge
+    accentSecondary: '#9fb6c9',    // Metallic light blue-grey
+    accentHover: '#f4f9fd',        // Near-white on hover
     textPrimary: '#e8e8e8',
     textSecondary: '#a0a0a0',
     textMuted: '#666666',
-    borderPrimary: 'rgba(255, 114, 95, 0.22)',
+    borderPrimary: 'rgba(207, 223, 236, 0.28)',
     borderSecondary: 'rgba(255, 255, 255, 0.06)',
     danger: '#FF4757',
     success: '#2ED573',
@@ -256,6 +262,7 @@ export interface UISettings {
 }
 
 export type FluidQualityMode = 'live' | 'balanced' | 'quality';
+export type GpuInstrumentQualityMode = 'auto' | 'low' | 'balanced' | 'high' | 'ultra';
 
 export interface RecordingSettings {
   // Video format: 'webm-vp9', 'webm-vp8', 'mp4-h264'
@@ -272,6 +279,10 @@ export interface RecordingSettings {
   includeAudio: boolean;
   // Audio bitrate in bits per second (default: 128000 = 128 kbps)
   audioBitrate: number;
+  // Desktop recordings: the file the native recorder writes. H.264 MP4 by
+  // default; ProRes / HAP (MOV) when the bundled FFmpeg can encode them.
+  // ProRes 4444 and HAP Alpha keep transparency.
+  nativeCodec?: 'h264' | 'prores_hq' | 'prores_4444' | 'hap' | 'hap_alpha';
 }
 
 /**
@@ -281,6 +292,8 @@ export interface RecordingSettings {
  * Electron window on a physical display.
  */
 export interface OutputSlice {
+  projectorCalibration?: ProjectorCalibration;
+  overlapBand?: OverlapBand;
   id: string;
   name: string;                // User-friendly label (e.g. "Left", "Center", "Right")
   enabled: boolean;
@@ -381,6 +394,41 @@ export interface OutputSlice {
   // for each projector pixel — content stays bounded by the original
   // screen rectangle even when the warp pushes corners inward.
   outputWarp?: OutputWarp;
+
+  // ─── Masks ───────────────────────────────────────────────────────
+  // Polygon masks cut from THIS screen's frame, after its crop and warp
+  // have been resolved (the same place edge blend runs). Points are
+  // normalized 0..1 in the screen's own content space with y=0 at the
+  // top, so a mask drawn around a doorway stays on the doorway when the
+  // screen is corner-pinned or mesh-warped. Absent on files saved
+  // before masks existed; migrateOutputSlice fills in an empty list.
+  masks?: ScreenMask[];
+
+  // ─── Source ──────────────────────────────────────────────────────
+  /** When set, this Screen shows what that Map Sim projector must emit
+   *  (the 3D model seen through its calibrated lens, with the content
+   *  mapped onto it) instead of a slice of the master. Rendered by the
+   *  native core on physical-display outputs. */
+  mapSimProjectorId?: string | null;
+}
+
+/** One polygon mask on a Screen. See OutputSlice.masks for the
+ *  coordinate space. */
+export interface ScreenMask {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** Polygon vertices. An edge is straight unless the point it leaves has
+   *  a `cpOut` or the point it reaches has a `cpIn` (absolute handle
+   *  positions in the same space, as on layer custom shapes); then it is
+   *  the cubic through those handles. Fewer than 3 renders nothing. */
+  points: BezierPoint[];
+  /** Edge softness 0..1 in screen units, ramping inward from the edge. */
+  feather: number;
+  /** false keeps the inside of the polygon, true cuts a hole instead.
+   *  Normal masks keep the union of their insides; when a screen has
+   *  only inverted masks the whole frame stays and the holes are cut. */
+  invert: boolean;
 }
 
 /** Output warp — see OutputSlice.outputWarp for context. */
@@ -430,7 +478,46 @@ export function createDefaultSlice(id: string, name: string, spoutSuffix: string
     effects: [],
     stageEffectId: null,
     outputWarp: { enabled: false, mode: 'corners' },
+    masks: [],
   };
+}
+
+/** True when a mask would actually change the screen's output. */
+export function screenMaskIsActive(mask: ScreenMask | null | undefined): boolean {
+  return !!mask && mask.enabled !== false && Array.isArray(mask.points) && mask.points.length >= 3;
+}
+
+/** Bring a saved mask list to the current shape. Files from before masks
+ *  existed have no list at all and come back empty; a damaged vertex is
+ *  dropped rather than failing the whole screen. */
+export function migrateScreenMasks(masks: unknown): ScreenMask[] {
+  if (!Array.isArray(masks)) return [];
+  return masks.map((m: any, index: number) => {
+    const handle = (h: any): Point2D | undefined =>
+      Number.isFinite(h?.x) && Number.isFinite(h?.y) ? { x: Number(h.x), y: Number(h.y) } : undefined;
+    const points = Array.isArray(m?.points)
+      ? m.points
+          .filter((p: any) => Number.isFinite(p?.x) && Number.isFinite(p?.y))
+          .map((p: any) => {
+            // Curve handles are optional; a damaged one leaves that side straight.
+            const point: BezierPoint = { x: Number(p.x), y: Number(p.y) };
+            const cpIn = handle(p.cpIn);
+            const cpOut = handle(p.cpOut);
+            if (cpIn) point.cpIn = cpIn;
+            if (cpOut) point.cpOut = cpOut;
+            return point;
+          })
+      : [];
+    const feather = Number(m?.feather);
+    return {
+      id: typeof m?.id === 'string' && m.id ? m.id : `mask-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+      name: typeof m?.name === 'string' && m.name ? m.name : `Mask ${index + 1}`,
+      enabled: m?.enabled !== false,
+      points,
+      feather: Number.isFinite(feather) ? Math.max(0, Math.min(1, feather)) : 0,
+      invert: m?.invert === true,
+    };
+  });
 }
 
 /** Identity output-warp corners — the projector's unit quad untouched.
@@ -517,6 +604,8 @@ export function masterWarpIsActive(warp?: OutputWarp | null): boolean {
   );
   if (cornersWarped) return true;
   const g = warp.meshGrid;
+  // A Bezier handle bends the output without moving a point.
+  if (meshGridHasTangents(g)) return true;
   if (g && g.rows >= 2 && g.cols >= 2) {
     for (let r = 0; r < g.rows; r++) {
       for (let cc = 0; cc < g.cols; cc++) {
@@ -537,6 +626,8 @@ export function migrateOutputSlice(s: Partial<OutputSlice> & { id: string }): Ou
     id: s.id,
     name: s.name ?? 'Slice',
     enabled: s.enabled ?? true,
+    projectorCalibration: s.projectorCalibration,
+    overlapBand: s.overlapBand,
     cropX: s.cropX ?? 0,
     cropY: s.cropY ?? 0,
     cropW: s.cropW ?? 1,
@@ -570,6 +661,8 @@ export function migrateOutputSlice(s: Partial<OutputSlice> & { id: string }): Ou
     // Output warp — projector-side distortion. Defaults to disabled
     // so legacy slices behave unchanged.
     outputWarp: s.outputWarp ?? { enabled: false, mode: 'corners' },
+    masks: migrateScreenMasks(s.masks),
+    mapSimProjectorId: typeof s.mapSimProjectorId === 'string' && s.mapSimProjectorId ? s.mapSimProjectorId : null,
   };
 }
 
@@ -582,6 +675,22 @@ export interface OutputSettings {
   customHeight: number;
   // Output window state (not persisted — runtime only)
   outputWindowOpen: boolean;
+  /*
+   * Which physical display each output surface opens on.
+   *
+   * null means "auto": claim the first non-primary display nothing else has
+   * taken. Every surface used to resolve `allDisplays.find(d => d.id !==
+   * primary.id)` independently, so with a projector AND a monitor all three
+   * landed on whichever the OS listed first and stacked on top of each other.
+   *
+   * Display ids are not stable across replug, so a stored id that no longer
+   * exists falls back to auto rather than opening nothing.
+   */
+  displayAssignments: {
+    liveOutput: number | 'windowed' | null;
+    stageSim: number | 'windowed' | null;
+    mapSim: number | 'windowed' | null;
+  };
   // Projection controls
   blackout: boolean;
   testPattern: string;
@@ -672,18 +781,13 @@ export const DEFAULT_LAYER_SHADERS: { id: DefaultLayerShader; label: string }[] 
 ];
 
 /**
- * Experimental flags for in-progress feature work. These are
- * deliberately NOT surfaced in the normal settings UI — the
- * preferences panel only renders them when a dev-mode URL override
- * (`?dev=1`) is present. Production users see no UI for these
- * regardless of localStorage state.
+ * Renderer transition and diagnostic flags.
  *
- * Each flag has its own kill switch via URL param so a feature in
- * trouble can be disabled without re-launching the app:
- *   - `?webgpu-disable=1` forces webgpuPilot off (overrides
- *     localStorage). Combined with the capability probe so a
- *     machine without WebGPU also sees the pilot disabled even
- *     when the user toggled it on.
+ * These still live under `experimental` in persisted settings so older
+ * installs migrate cleanly, but several of them are now production controls:
+ * native core output is the v2 target route. The schema keeps the older
+ * transport flags so 1.9-era settings load cleanly, but native-only desktop
+ * builds force them off in `enforceNativeEngineOnly()`.
  */
 export interface ExperimentalSettings {
   /** S4 pilot: enable the WebGPU + TSL particle-flow effect.
@@ -699,35 +803,17 @@ export interface ExperimentalSettings {
    *  presentation-only `<video srcObject>` fed by the editor's
    *  `canvas.captureStream(60)` over a same-process WebRTC peer.
    *
-   *  Now superseded by `outputZeroCopy` below — kept as an escape
-   *  hatch in case the WebGPU presenter falls back to CPU on a
-   *  specific driver/GPU combo and we need to diff transports
-   *  in the field. The selection precedence is:
-   *      outputZeroCopy && WebGPU available  →  webgpu-display
-   *      outputWebRTC                         →  webrtc-display
-   *      else                                 →  output (legacy)
+   *  Superseded in native-only desktop builds. Remains in the schema for
+   *  loading older settings and non-native diagnostic builds.
    */
   outputWebRTC: boolean;
 
-  /** Phase 2 of the WebGPU migration: swap the editor's main
-   *  renderer from THREE.WebGLRenderer to THREE.WebGPURenderer.
-   *
-   *  Default false. When on AND the WebGPU capability probe
-   *  returns supported, Canvas.svelte instantiates WebGPUEngine
-   *  (renderer/webgpuEngine.ts) instead of RenderEngine (engine.ts).
-   *
-   *  Phase 2 scope: editor canvas shows clear color only — per-layer
-   *  rendering is intentionally NOT in this phase. The point of
-   *  Phase 2 is proving (a) WebGPURenderer works as the main
-   *  renderer in this Electron build, and (b) canvas.captureStream()
-   *  (which the output presenter depends on) keeps working with a
-   *  WebGPU canvas. Once those success criteria pass, Phase 3
-   *  begins porting per-layer renderers one at a time.
-   *
-   *  See docs/WEBGPU_MIGRATION.md for the full roadmap. */
+  /** Editor VideoFrame bridge for non-native diagnostic builds. Native-only
+   *  desktop mode disables it because the editor preview must be the core's
+   *  single composite, not a browser-rendered copy. */
   editorWebGPU: boolean;
 
-  /** Zero-copy GPU output transport — the production target.
+  /** Zero-copy GPU output transport for non-native diagnostic builds.
    *
    *  When true (default), the visible output window mounts
    *  OutputSharedTextureDisplayApp: a WebGPU presenter that receives
@@ -751,9 +837,8 @@ export interface ExperimentalSettings {
    *      what Resolume builds in C++. We just consume it through web
    *      APIs.
    *
-   *  Falls back to `outputWebRTC` (if also true) or to the legacy
-   *  SpoutOutputApp when WebGPU is unavailable (`webgpuCapability`
-   *  probe fails) or when MessagePortMain delivery fails.
+   *  Native-only desktop builds force this off; output comes from the
+   *  Rust/wgpu core or stays unavailable.
    *
    *  Health monitoring: each VideoFrame's `format` field is logged on
    *  the first 5 frames; `'NV12'` / `'I420'` indicate GPU-backed
@@ -761,29 +846,20 @@ export interface ExperimentalSettings {
    *  The output's health badge surfaces this so the operator can spot
    *  a degraded link mid-show. */
   outputZeroCopy: boolean;
+  /** Route the visible output command to the Rust/wgpu render core's
+   *  managed window. This is the v2.0 desktop output transport. */
+  outputNativeCore: boolean;
   /**
-   * Allow the legacy `gpuEffectRunner` CPU-readback bridge to run when
-   * the user has a WebGPU effect (e.g. `gpuFluidSim`) in their layer's
-   * effect chain.
+   * Allow the legacy `gpuEffectRunner` CPU-readback bridge to run in the
+   * comparison renderer when the user has a WebGPU effect (e.g. `gpuFluidSim`)
+   * in their layer's effect chain.
    *
-   * Why opt-in: `gpuEffectRunner` does a per-frame GPU→CPU readback via
-   * `readRenderTargetPixels` then a CPU→GPU upload via `writeTexture`,
-   * costing ~3ms at 1080p per affected effect. That round-trip is the
-   * single biggest "WebGPU effects are slow" complaint. The strategic
-   * shift in the GPU edition is to push WebGPU work to the downstream
-   * compositor stage (via the WebGPUCanvas VideoFrame +
-   * importExternalTexture bridge), where the transfer is zero-copy.
+   * Native v2 always ignores this bridge. If an effect cannot be expressed
+   * as a native graph/effect-pass, it should be disabled or ported rather
+   * than mirrored through CPU pixels.
    *
-   * When this flag is OFF (default in the GPU edition):
-   *  - `gpuFluidSim` and any future `gpu*`-prefixed effects in the
-   *    middle of a layer's effect chain are skipped (pass-through).
-   *  - Output / compositor-stage WebGPU work is unaffected — that runs
-   *    through `WebGPUCanvas.svelte` and never touches gpuEffectRunner.
-   *
-   * When ON: mid-chain WebGPU effects work as before, paying the
-   * CPU-readback cost. Useful when the effect needs to compose with
-   * downstream WebGL effects (warp, blend, etc.) before the final
-   * bridge to WebGPU at output time.
+   * When ON with native output disabled: mid-chain WebGPU effects work as
+   * before, paying the CPU-readback cost.
    */
   allowMidChainGpuEffects: boolean;
 }
@@ -798,6 +874,10 @@ export interface ExperimentalSettings {
 export interface PerformanceSettings {
   previewMaxDim: number;
   previewFrameRate: 60 | 30 | 15;
+  /** Internal budget tier for WebGPU instrument layers. `auto` follows
+   *  the device caps plus the adaptive live governor; fixed tiers keep
+   *  counts/grid sizes stable for predictable show operation. */
+  gpuInstrumentQuality: GpuInstrumentQualityMode;
   outputFrameRate: 60 | 30 | 24;
   outputMaxBitrate: number;
   outputDegradationPreference: 'maintain-resolution' | 'maintain-framerate' | 'balanced';
@@ -835,6 +915,26 @@ export interface AppSettings {
   performance: PerformanceSettings;
 }
 
+// Ghost Arcade 2.0 native branch policy. The old renderer flags remain in the
+// schema so older projects/settings load cleanly, but the desktop app no
+// longer exposes or honors legacy renderer routes while this is true.
+export const NATIVE_ENGINE_ONLY = true;
+
+function enforceNativeEngineOnly(settings: AppSettings): AppSettings {
+  if (!NATIVE_ENGINE_ONLY || !isDesktopApp) return settings;
+  return {
+    ...settings,
+    experimental: {
+      ...settings.experimental,
+      outputNativeCore: true,
+      outputZeroCopy: false,
+      outputWebRTC: false,
+      editorWebGPU: false,
+      allowMidChainGpuEffects: false,
+    },
+  };
+}
+
 // Check which formats are supported by this browser
 export function getSupportedFormats(): { id: string; label: string; mimeType: string; supported: boolean }[] {
   const formats = [
@@ -866,6 +966,63 @@ export function getFileExtension(formatId: string): string {
 }
 
 // Default settings
+/**
+ * The output stage: every setting that changes what the composition looks
+ * like on the way out.
+ *
+ * Deliberately excludes how this machine is plugged in — display assignments,
+ * output window state, output resolution, Spout sender wiring, cursor
+ * preferences. Clearing those breaks a rig that is already working: the output
+ * lands on the wrong monitor, or a downstream app listening for a Spout name
+ * goes quiet. They are not decisions a project made.
+ *
+ * One list, used by capture, apply and the new-project reset, so the three
+ * cannot disagree about what "the screen setup" means.
+ */
+export const OUTPUT_STAGE_KEYS = [
+  'slices',
+  'masterCanvasWidth',
+  'masterCanvasHeight',
+  'masterWarp',
+  'blackout',
+  'testPattern',
+  'domeEnabled',
+  'domeMode',
+  'domeFOV',
+  'domeRotation',
+  'domeTilt',
+  'domeOffsetX',
+  'domeOffsetY',
+  'domeCurvature',
+  'domeTruncation',
+  'outputRotation',
+  'outputCropX',
+  'outputCropY',
+  'outputCropWidth',
+  'outputCropHeight',
+  'edgeBlendLeft',
+  'edgeBlendRight',
+  'edgeBlendTop',
+  'edgeBlendBottom',
+  'edgeBlendGamma',
+  'brightness',
+  'contrast',
+  'gamma',
+] as const satisfies readonly (keyof OutputSettings)[];
+
+/** A saved output stage. Partial because a setup saved by an older build
+ *  will not carry settings added since. */
+export type OutputStageSnapshot = Partial<Record<(typeof OUTPUT_STAGE_KEYS)[number], unknown>>;
+
+/**
+ * The part of the output stage that undo covers: the Screens (crop, warp,
+ * masks, grade, blend) and the Master Warp, the geometry an operator
+ * drags on the canvas. Blackout and the test pattern are live-performance
+ * switches and stay out, so an undo can never flip a blackout; so do the
+ * dome and output grade, which are set, not sculpted.
+ */
+export const OUTPUT_HISTORY_KEYS = ['slices', 'masterWarp'] as const satisfies readonly (typeof OUTPUT_STAGE_KEYS)[number][];
+
 function createDefaultSettings(): AppSettings {
   // Find best supported format
   const supported = getSupportedFormats().filter(f => f.supported);
@@ -873,7 +1030,7 @@ function createDefaultSettings(): AppSettings {
     || supported.find(f => f.id === 'webm-vp8')?.id
     || 'webm-vp8';
 
-  return {
+  return enforceNativeEngineOnly({
     recording: {
       format: defaultFormat as RecordingSettings['format'],
       videoBitrate: 5000000, // 5 Mbps
@@ -882,6 +1039,7 @@ function createDefaultSettings(): AppSettings {
       saveDirectoryName: 'Downloads (default)',
       includeAudio: true,
       audioBitrate: 128000, // 128 kbps
+      nativeCodec: 'h264',
     },
     output: {
       spoutEnabled: false,
@@ -890,6 +1048,11 @@ function createDefaultSettings(): AppSettings {
       customWidth: 1920,
       customHeight: 1080,
       outputWindowOpen: false,
+      displayAssignments: {
+        liveOutput: null,
+        stageSim: null,
+        mapSim: null,
+      },
       blackout: false,
       testPattern: 'none',
       edgeBlendLeft: 0,
@@ -964,40 +1127,27 @@ function createDefaultSettings(): AppSettings {
       // toggle in dev preferences AND `webgpuCapability.probeWebGPU()`
       // succeeding — neither alone unlocks the pilot.
       webgpuPilot: false,
-      // WebRTC output transport. Off by default — the legacy
-      // SpoutOutputApp renderer is the proven baseline. Flipping
-      // this on routes the output window to OutputDisplayApp +
-      // canvas.captureStream + RTCPeerConnection. Stays opt-in
-      // until the success-criteria sweep proves out.
+      // Non-native diagnostic transport only. Native-only desktop builds
+      // force this off through enforceNativeEngineOnly().
       outputWebRTC: false,
-      // S5: WebGPU + MediaStreamTrackProcessor + GPUExternalTexture.
-      // Default ON — this is the production zero-copy path. Falls
-      // back to outputWebRTC (if also on) or legacy SpoutOutputApp
-      // when the WebGPU capability probe says no or when the
-      // MessagePort handshake fails.
-      outputZeroCopy: true,
-      // Phase 2 of the WebGPU migration. Default ON in the GPU edition
-      // as of the bridge-as-default shift — the VideoFrame +
-      // importExternalTexture bridge in WebGPUCanvas.svelte is the
-      // primary WebGL → WebGPU path now, and the output zero-copy
-      // transport above depends on it. Falls back automatically when
-      // `webgpuCapability.probeWebGPU()` fails.
-      editorWebGPU: true,
-      // Mid-chain CPU-readback bridge (gpuEffectRunner). Was opt-in to
-      // protect users from the ~3ms GPU→CPU→GPU round-trip per affected
-      // effect — but that meant dropping the only WebGPU effect we
-      // ship (`gpuFluidSim`) on a layer did nothing, which is a wrong
-      // default for the GPU edition. Now ON by default: users who add
-      // a `gpu*` effect actually get the effect. Power users can flip
-      // it off in Settings → Experimental to keep the steady-state
-      // path purely WebGL when they're not using GPU effects.
-      allowMidChainGpuEffects: true,
+      // Non-native diagnostic transport only. Native-only desktop builds
+      // force this off through enforceNativeEngineOnly().
+      outputZeroCopy: false,
+      // Native render-core managed output. This is the v2.0 desktop path.
+      outputNativeCore: true,
+      // Non-native diagnostic bridge only. Native-only desktop builds
+      // force this off so preview pixels come from the core composite.
+      editorWebGPU: false,
+      // Legacy comparison-only CPU-readback bridge (gpuEffectRunner).
+      // Native v2 ignores this even if a saved project has it enabled.
+      allowMidChainGpuEffects: false,
     },
     performance: {
       // Defaults match the historical full-quality behaviour. Users on
       // weak hardware step these down via Settings → Performance.
       previewMaxDim: 0,               // 0 = no cap (match main canvas)
       previewFrameRate: 60,
+      gpuInstrumentQuality: 'auto',
       outputFrameRate: 60,
       outputMaxBitrate: 80_000_000,   // 80 Mbps
       outputDegradationPreference: 'maintain-resolution',
@@ -1006,7 +1156,7 @@ function createDefaultSettings(): AppSettings {
       stage3DFrameRate: 30,           // external Stage 3D view renders its own compositor
       useWebGL2LightPainting: true,   // WebGL2 instanced renderer ON by default
     },
-  };
+  });
 }
 
 // Local storage key
@@ -1014,9 +1164,9 @@ const STORAGE_KEY = 'ghost-arcade_settings';
 const APP_VERSION_KEY = 'ill_app_version';
 // Bump this whenever stale localStorage may break the new build.
 // Any mismatch clears problematic caches on startup.
-// 0.3.8 bump: forces the `allowMidChainGpuEffects` migration to run for
-// existing users so `gpuFluidSim` actually fires when dropped on a layer.
-const CURRENT_APP_VERSION = '0.3.8';
+// 0.3.10 bump: clears stale renderer/output state after native compositor
+// fixes while keeping the v2 native managed output path enabled for testing.
+const CURRENT_APP_VERSION = '0.3.10';
 
 /**
  * Clear known-problematic localStorage on version change so a fresh install
@@ -1059,19 +1209,16 @@ function runVersionMigration(): { versionChanged: boolean } {
         if (parsed.defaultLayerShader === 'crosshair' || parsed.defaultLayerShader == null) {
           parsed.defaultLayerShader = 'grid';
         }
-        // Flip `allowMidChainGpuEffects` from old default (false) to new
-        // default (true) for existing users. Without this migration,
-        // anyone who launched a prior version keeps `false` saved and
-        // the only WebGPU effect (`gpuFluidSim`) silently does nothing
-        // when added to a layer. We only flip the explicit `false`;
-        // if the user has explicitly toggled it off in Settings →
-        // Experimental, that's a `false` too — but we have no way to
-        // distinguish "default" from "explicitly turned off" without
-        // versioning the field, so we forcibly enable for everyone on
-        // the version that introduces hero `gpuFluidSim` integration.
-        if (parsed.experimental && parsed.experimental.allowMidChainGpuEffects === false) {
-          parsed.experimental.allowMidChainGpuEffects = true;
-        }
+        // v2 native renderer target: keep existing installs on the native
+        // managed output path and disable comparison transports in this branch.
+        parsed.experimental = {
+          ...(parsed.experimental || {}),
+          outputNativeCore: true,
+          outputZeroCopy: false,
+          outputWebRTC: false,
+          editorWebGPU: false,
+          allowMidChainGpuEffects: false,
+        };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
       }
     } catch {}
@@ -1100,7 +1247,7 @@ function loadSettings(): AppSettings {
       const legacyGemini = localStorage.getItem('ai_gemini_key') || '';
       const legacyProvider = localStorage.getItem('ai_provider') || '';
 
-      const settings = {
+      const settings = enforceNativeEngineOnly({
         ...defaults,
         ...parsed,
         recording: {
@@ -1152,7 +1299,7 @@ function loadSettings(): AppSettings {
           ...defaults.performance,
           ...(parsed.performance || {}),
         },
-      };
+      });
 
       // Clean up legacy keys after migration
       if (legacyClaude) localStorage.removeItem('ai_claude_key');
@@ -1202,34 +1349,28 @@ function loadSettings(): AppSettings {
       // localStorage might be full or blocked. Nothing more we can do.
     }
   }
-  const defaults = createDefaultSettings();
+  const defaults = enforceNativeEngineOnly(createDefaultSettings());
   // Apply default color scheme
   applyColorScheme(getColorScheme(defaults.ui.colorScheme));
   return defaults;
 }
 
 // Save settings to localStorage (with API key encryption)
-function saveSettings(settings: AppSettings) {
-  try {
-    // Don't save the directory handle (not serializable)
-    const toSave = {
-      ...settings,
-      recording: {
-        ...settings.recording,
-        saveDirectoryHandle: null,
-      },
-    };
-    // Encrypt API keys before saving
-    encryptApiKeys(toSave.ai).then(encryptedAi => {
-      toSave.ai = encryptedAi;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
-    }).catch(() => {
-      // Fallback: save without encryption
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
-    });
-  } catch (err) {
-    console.warn('Failed to save settings:', err);
-  }
+// Settings setters stay synchronous for live controls; persistence is coalesced.
+const settingsWriter = createCoalescedWriter<AppSettings, AppSettings>(async settings => {
+  const normalized = enforceNativeEngineOnly(settings);
+  return { ...normalized, recording: { ...normalized.recording, saveDirectoryHandle: null },
+    ai: await encryptApiKeys(normalized.ai) };
+}, value => localStorage.setItem(STORAGE_KEY, JSON.stringify(value)),
+error => console.warn('Failed to save settings:', error));
+
+function saveSettings(settings: AppSettings) { settingsWriter.write(settings); }
+export const flushSettings = () => settingsWriter.flush();
+if (typeof window !== 'undefined') {
+  window.addEventListener?.('pagehide', () => { void flushSettings(); });
+  if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void flushSettings();
+  });
 }
 
 import { encryptValue, decryptValue, isEncrypted } from '../utils/crypto';
@@ -1305,6 +1446,28 @@ function createSettingsStore() {
         const newSettings = {
           ...s,
           recording: { ...s.recording, autoDownload: enabled }
+        };
+        saveSettings(newSettings);
+        return newSettings;
+      });
+    },
+
+    setNativeRecordingCodec(codec: NonNullable<RecordingSettings['nativeCodec']>) {
+      update(s => {
+        const newSettings = {
+          ...s,
+          recording: { ...s.recording, nativeCodec: codec }
+        };
+        saveSettings(newSettings);
+        return newSettings;
+      });
+    },
+
+    setIncludeAudio(enabled: boolean) {
+      update(s => {
+        const newSettings = {
+          ...s,
+          recording: { ...s.recording, includeAudio: enabled }
         };
         saveSettings(newSettings);
         return newSettings;
@@ -1431,6 +1594,20 @@ function createSettingsStore() {
       });
     },
 
+    /** Assign an output surface to a display, or null to go back to auto. */
+    setDisplayAssignment(
+      surface: 'liveOutput' | 'stageSim' | 'mapSim',
+      displayId: number | 'windowed' | null,
+    ) {
+      update((s) => ({
+        ...s,
+        output: {
+          ...s.output,
+          displayAssignments: { ...s.output.displayAssignments, [surface]: displayId },
+        },
+      }));
+    },
+
     setOutputWindowOpen(open: boolean) {
       update(s => ({
         ...s,
@@ -1484,6 +1661,17 @@ function createSettingsStore() {
         const newSettings = {
           ...s,
           ui: { ...s.ui, shaderQuality: mode }
+        };
+        saveSettings(newSettings);
+        return newSettings;
+      });
+    },
+
+    setGpuInstrumentQuality(mode: GpuInstrumentQualityMode) {
+      update(s => {
+        const newSettings = {
+          ...s,
+          performance: { ...s.performance, gpuInstrumentQuality: mode }
         };
         saveSettings(newSettings);
         return newSettings;
@@ -1623,6 +1811,78 @@ function createSettingsStore() {
     },
 
     // Dome projection settings
+    /**
+     * Snapshot the output stage — everything that shapes the image, nothing
+     * about how this computer is wired.
+     */
+    captureOutputStage(): OutputStageSnapshot {
+      const out = get({ subscribe }).output as unknown as Record<string, unknown>;
+      const snapshot: Record<string, unknown> = {};
+      for (const key of OUTPUT_STAGE_KEYS) snapshot[key] = out[key];
+      return structuredClone(snapshot) as OutputStageSnapshot;
+    },
+
+    /** The undoable part of the output stage (OUTPUT_HISTORY_KEYS). Not
+     *  cloned: history serializes it on the spot. */
+    captureOutputHistory(): OutputStageSnapshot {
+      const out = get({ subscribe }).output as unknown as Record<string, unknown>;
+      const snapshot: Record<string, unknown> = {};
+      for (const key of OUTPUT_HISTORY_KEYS) snapshot[key] = out[key];
+      return snapshot as OutputStageSnapshot;
+    },
+
+    /** Apply a snapshot taken by captureOutputStage. */
+    applyOutputStage(snapshot: OutputStageSnapshot) {
+      update(s => {
+        const output = { ...s.output } as unknown as Record<string, unknown>;
+        for (const key of OUTPUT_STAGE_KEYS) {
+          // Only keys the snapshot actually carries, so a setup saved before a
+          // new setting existed leaves that setting alone rather than
+          // blanking it to undefined.
+          if (key in snapshot) output[key] = structuredClone((snapshot as any)[key]);
+        }
+        const next = { ...s, output } as unknown as AppSettings;
+        saveSettings(next);
+        return next;
+      });
+    },
+
+    /**
+     * Reset the output stage for a brand-new project.
+     *
+     * Output settings live in global localStorage, not the project, so
+     * everything the last session set up stays on: a user hit dome projection
+     * that had latched from an earlier session and could not tell what was
+     * transforming their output. Screens are worse than confusing — the
+     * project saves outputSlices and restores them on load, so a NEW project
+     * (which has none) simply inherited the previous project's screens.
+     *
+     * A saved default setup wins over the factory defaults. A permanent
+     * install — a dome, a projector wall — has a rig that is a property of the
+     * room, not of any one project, and should not be dismantled every time
+     * someone starts fresh.
+     *
+     * Machine wiring is untouched either way: display assignments, output
+     * window state, resolution, Spout sender name, cursor preferences. Those
+     * are how the computer is plugged in, not decisions a project made.
+     */
+    resetOutputStageForNewProject(defaultSetup?: OutputStageSnapshot | null) {
+      // Taken from the defaults factory rather than restated, so a new output
+      // setting cannot be added there and silently miss this reset.
+      const defaults = createDefaultSettings().output as unknown as Record<string, unknown>;
+      update(s => {
+        const output = { ...s.output } as unknown as Record<string, unknown>;
+        for (const key of OUTPUT_STAGE_KEYS) {
+          output[key] = structuredClone(
+            defaultSetup && key in defaultSetup ? (defaultSetup as any)[key] : defaults[key],
+          );
+        }
+        const next = { ...s, output } as unknown as AppSettings;
+        saveSettings(next);
+        return next;
+      });
+    },
+
     setDomeEnabled(enabled: boolean) {
       update(s => {
         const newSettings = { ...s, output: { ...s.output, domeEnabled: enabled } };
@@ -1674,7 +1934,7 @@ function createSettingsStore() {
     // Generic update — for settings sections without dedicated setters
     update(fn: (s: AppSettings) => AppSettings) {
       update(s => {
-        const newSettings = fn(s);
+        const newSettings = enforceNativeEngineOnly(fn(s));
         saveSettings(newSettings);
         return newSettings;
       });
