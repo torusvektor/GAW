@@ -6,6 +6,7 @@
   import { projectionSimHistoryVersion } from './lib/projectionSim/store';
   import { startProjectionSimSceneSync } from './lib/projectionSim/sceneSync';
   import WebGPUCanvas from './lib/components/WebGPUCanvas.svelte';
+  import { probeWebGPU } from './lib/renderer/webgpuCapability';
   import AudioInputPicker from './lib/components/AudioInputPicker.svelte';
   import ClipAudioMasterControl from './lib/components/ClipAudioMasterControl.svelte';
   import AudioMeterPanel from './lib/components/AudioMeterPanel.svelte';
@@ -585,7 +586,19 @@
     document.documentElement.classList.toggle('native-primary-presenter', nativePreviewGlassActive);
     document.body.classList.toggle('native-primary-presenter', nativePreviewGlassActive);
   }
-  $: if (!nativePrimaryRenderer && $settings.experimental?.editorWebGPU && !showStage3D && canvasComponent && webgpuBridgeComponent) {
+  // Browsers without WebGPU (Safari before macOS 26 / iOS 26, Firefox,
+  // older Android Chrome) fall back to the plain WebGL editor instead of
+  // showing the bridge error. Runtime-only: the saved setting is kept so
+  // the same profile in a WebGPU-capable browser still uses the bridge.
+  let webgpuUnavailable = false;
+  void probeWebGPU().then((ok) => {
+    if (!ok) {
+      webgpuUnavailable = true;
+      console.warn('[App] WebGPU unavailable — editor using WebGL only');
+    }
+  });
+  $: editorWebGPUActive = !!$settings.experimental?.editorWebGPU && !webgpuUnavailable;
+  $: if (!nativePrimaryRenderer && editorWebGPUActive && !showStage3D && canvasComponent && webgpuBridgeComponent) {
     const source = canvasComponent.getCanvas?.();
     if (source && (source !== lastReactiveBridgeSource || webgpuBridgeComponent !== lastReactiveBridge)) {
       webgpuBridgeComponent.setSourceCanvas(source);
@@ -1383,7 +1396,7 @@
     const unsubscribeSettings = settings.subscribe((s) => {
       if (!appMounted) return;
       if (isDesktopApp && s.experimental?.outputNativeCore) return;
-      if (!s.experimental?.editorWebGPU) return;
+      if (!s.experimental?.editorWebGPU || webgpuUnavailable) return;
       // Idempotent — only re-wire when the canvas or bridge instance
       // actually changes (component remount). Otherwise every settings
       // emit (every corner-drag frame) re-pushes the same canvas and
@@ -6917,7 +6930,7 @@
 
           See docs/WEBGPU_MIGRATION.md for the full roadmap.
         -->
-        {#if !nativePrimaryRenderer && $settings.experimental?.editorWebGPU && !showStage3D}
+        {#if !nativePrimaryRenderer && editorWebGPUActive && !showStage3D}
           <Canvas bind:this={canvasComponent} bridgeMode={true} stage3DOutput={showStage3D} />
           <WebGPUCanvas bind:this={webgpuBridgeComponent} />
         {:else}
