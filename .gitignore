@@ -101,3 +101,7 @@ native-mobile/android/keystore.properties
 
 # Local render scratch (1.5GB of project output, not source)
 /output/
+
+# Web core prototype build output
+web-core/target/
+web-core/demo/pkg/

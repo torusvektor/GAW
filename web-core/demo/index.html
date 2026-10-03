@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Ghost Web Core</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400&display=swap" />
+<style>
+  /* Layout: full-bleed output canvas like a projector monitor, with a console strip of deck controls below. Single dark look on purpose (VJ booth). */
+  :root {
+    --bg: #07080b;
+    --console: #111319;
+    --line: #262a35;
+    --text: #e6e8ef;
+    --muted: #8d93a6;
+    --accent: #c18cff;
+    --danger: #ff8f8f;
+    --font-display: 'Chakra Petch', 'Avenir Next Condensed', 'Arial Narrow', sans-serif;
+    --font-body: 'IBM Plex Sans', -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 var(--font-body); display: grid; grid-template-rows: 1fr auto; }
+  #stage { position: relative; min-height: 220px; overflow: hidden; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; background: var(--bg); }
+  #hud { position: absolute; left: 16px; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 4px; pointer-events: none; }
+  #hud h1 { margin: 0; font: 600 13px/1 var(--font-display); letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+  #status { margin: 0; font: 12px/1.5 var(--font-mono); color: var(--text); white-space: pre-wrap; max-width: 60ch; text-shadow: 0 1px 2px var(--bg); }
+  #status.error { color: var(--danger); }
+  #controls { display: flex; flex-wrap: wrap; gap: 12px 20px; padding-block: 12px calc(12px + env(safe-area-inset-bottom, 0px)); padding-inline: 16px; background: var(--console); border-top: 1px solid var(--line); }
+  .control { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .control span { font: 500 11px/1 var(--font-display); letter-spacing: 0.08em; text-transform: uppercase; }
+  input[type=range] { width: 130px; accent-color: var(--accent); }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px; font: inherit; }
+  select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
+  @media (max-width: 480px) { input[type=range] { width: 100px; } #controls { gap: 10px 14px; } }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="canvas"></canvas>
+  <div id="hud">
+    <h1>Ghost Web Core · Wasm + WebGPU</h1>
+    <p id="status">Načítám jádro…</p>
+  </div>
+</div>
+<div id="controls">
+  <label class="control" for="source"><span>Vrstva B</span>
+    <select id="source">
+      <option value="gpu:planet">GPU planeta</option>
+      <option value="isf-proxy">ISF proxy</option>
+      <option value="color">Barva</option>
+    </select></label>
+  <label class="control" for="blend"><span>Prolnutí</span>
+    <select id="blend">
+      <option>normal</option><option selected>screen</option><option>add</option><option>multiply</option>
+      <option>difference</option><option>overlay</option><option>hue</option>
+    </select></label>
+  <label class="control" for="opacity"><span>Krytí B</span><input id="opacity" type="range" min="0" max="1" step="0.01" value="0.85" /></label>
+  <label class="control" for="effect"><span>Efekt</span>
+    <select id="effect">
+      <option value="">žádný</option><option value="invert:1">invert</option><option value="hue:0.5">hue</option>
+      <option value="posterize:6">posterize</option><option value="grayscale:1">grayscale</option>
+    </select></label>
+  <label class="control" for="audio"><span>Audio</span><input id="audio" type="range" min="0" max="1" step="0.01" value="0.4" /></label>
+  <label class="control" for="pin"><input id="pin" type="checkbox" checked /><span>Corner pin</span></label>
+  <label class="control" for="scale"><span>Rozlišení</span>
+    <select id="scale">
+      <option value="auto" selected>Auto</option><option value="1">100 %</option><option value="0.75">75 %</option><option value="0.5">50 %</option><option value="0.25">25 %</option>
+    </select></label>
+  <label class="control" for="gate"><input id="gate" type="checkbox" /><span>Blackout</span></label>
+</div>
+
+<script type="module">
+  import init, { WebCore } from './pkg/ghost_web_core.js';
+
+  const canvas = document.getElementById('canvas');
+  const statusEl = document.getElementById('status');
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (text, error = false) => { statusEl.textContent = text; statusEl.classList.toggle('error', error); };
+
+  // Manual picks set the scale directly; "auto" lets the core's dynamic
+  // resolution choose it from measured GPU time.
+  let core = null;
+  const isAuto = () => $('scale').value === 'auto';
+  const currentScale = () => (isAuto() ? (core ? core.renderScale : 1) : Number($('scale').value));
+  function fitCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2) * currentScale();
+    canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  }
+
+  // The same command shapes the editor sends the native core.
+  function sceneCommands(t) {
+    const pin = $('pin').checked;
+    const w = pin ? 0.06 * Math.sin(t * 0.7) : 0;
+    const corners = pin
+      ? { topLeft: { x: 0.12 + w, y: 0.88 }, topRight: { x: 0.9, y: 0.82 - w },
+          bottomRight: { x: 0.86 - w, y: 0.1 }, bottomLeft: { x: 0.08, y: 0.16 + w } }
+      : { topLeft: { x: 0, y: 1 }, topRight: { x: 1, y: 1 }, bottomRight: { x: 1, y: 0 }, bottomLeft: { x: 0, y: 0 } };
+    const level = Number($('audio').value);
+    const beat = Math.sin(t * Math.PI * 4) > 0.9 ? 1 : 0; // 120 BPM pulse
+    return [
+      { type: 'upsert_layer', layer_id: 'A', z_index: 0, opacity: 1, blend_mode: 'normal' },
+      { type: 'set_layer_source', layer_id: 'A', source_type: 'color' },
+      { type: 'set_layer_color', layer_id: 'A', rgba: [0.06 + 0.04 * Math.sin(t), 0.05, 0.16, 1] },
+      { type: 'upsert_layer', layer_id: 'B', z_index: 1, opacity: Number($('opacity').value), blend_mode: $('blend').value, corners },
+      { type: 'set_layer_source', layer_id: 'B', source_type: $('source').value },
+      { type: 'set_layer_color', layer_id: 'B', rgba: [0.9, 0.3, 0.8, 1] },
+      { type: 'set_layer_effects', layer_id: 'B', effects: $('effect').value ? [$('effect').value] : [] },
+      { type: 'set_audio_state', level, bass: level * (0.6 + 0.4 * beat), mid: level * 0.5, treble: level * 0.3, beat, kick: beat, bpm: 120, active: level > 0 },
+      { type: 'set_output_gate', enabled: !$('gate').checked },
+    ];
+  }
+
+  async function main() {
+    if (!navigator.gpu) {
+      setStatus('Tento prohlížeč nemá WebGPU.\nOtevři stránku v Chrome nebo Edge (Mac, Android), nebo v Safari na iOS/macOS 26.', true);
+      return;
+    }
+    await init();
+    fitCanvas();
+    try {
+      core = await WebCore.create(canvas);
+    } catch (error) {
+      setStatus('WebGPU se nepodařilo spustit:\n' + error, true);
+      return;
+    }
+    core.apply(JSON.stringify([{ type: 'set_beat_clock', beat: 0, bpm: 120 }]));
+    const refit = () => { fitCanvas(); core.resize(canvas.width, canvas.height); };
+    new ResizeObserver(refit).observe(canvas);
+    let appliedScale = 1;
+    const applyMode = () => { core.setAutoResolution(isAuto(), 1); appliedScale = currentScale(); refit(); };
+    $('scale').addEventListener('change', applyMode);
+    applyMode();
+
+    // Per-window stats: frame intervals bucketed by display refresh, the
+    // JS + Wasm time spent per frame, and the GPU submit-to-done time.
+    let win = null;
+    const reset = (now) => { win = { start: now, frames: 0, cpu: 0, gpu: 0, gpuMax: 0, fast: 0, mid: 0, slow: 0 }; };
+    let prev = performance.now();
+    reset(prev);
+    const loop = (now) => {
+      const t = now / 1000;
+      const cpuStart = performance.now();
+      try {
+        core.apply(JSON.stringify(sceneCommands(t)));
+        core.render(t);
+      } catch (error) {
+        setStatus('Chyba vykreslení:\n' + error, true);
+        return;
+      }
+      if (isAuto() && core.renderScale !== appliedScale) {
+        appliedScale = core.renderScale;
+        refit();
+      }
+      const interval = now - prev;
+      prev = now;
+      win.frames++;
+      win.cpu += performance.now() - cpuStart;
+      const gpu = core.gpuMs;
+      win.gpu += gpu;
+      win.gpuMax = Math.max(win.gpuMax, gpu);
+      if (interval < 20) win.fast++; else if (interval < 40) win.mid++; else win.slow++;
+      if (now - win.start > 1000) {
+        const n = win.frames, ms = (v) => v.toFixed(1);
+        const fps = Math.round(n * 1000 / (now - win.start));
+        setStatus(
+          `${core.adapter || 'WebGPU'}\n` +
+          `${canvas.width}×${canvas.height} px (${isAuto() ? 'auto ' : ''}${Math.round(currentScale() * 100)} %) · ${fps} fps · ${core.layerCount} vrstvy\n` +
+          `GPU ${ms(win.gpu / n)} ms (max ${ms(win.gpuMax)}) · JS+Wasm ${ms(win.cpu / n)} ms\n` +
+          `snímky ≤20 ms: ${win.fast} · 20–40 ms: ${win.mid} · >40 ms: ${win.slow}`
+        );
+        reset(now);
+      }
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+  main().catch((error) => setStatus(String(error), true));
+</script>
+</body>
+</html>

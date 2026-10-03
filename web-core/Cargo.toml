@@ -1,0 +1,31 @@
+[package]
+name = "ghost-web-core"
+version = "0.1.0"
+edition = "2024"
+description = "Prototype: the native render core's compositor (heartbeat.wgsl) running in the browser via WebAssembly + WebGPU"
+license = "AGPL-3.0-only"
+publish = false
+
+# Kept out of the native-renderer crate on purpose: this crate reuses its
+# shader and pure-Rust helpers by path and never edits them, so upstream
+# releases merge without conflicts.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytemuck = "1.24.0"
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+serde_json = "1.0"
+wgpu = { version = "30.0.0", default-features = false, features = ["webgpu", "wgsl"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Performance", "Window", "console"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
