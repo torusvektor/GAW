@@ -8,26 +8,9 @@
 // Overrides: `?ui=desktop` or `?ui=mobile` forces a layout and is
 // remembered; `?ui=auto` clears the remembered choice.
 
-const UI_KEY = 'ga-web-ui';
-type WebUi = 'desktop' | 'mobile';
+import { readStoredUi, storeUi, switchWebUi, type WebUi } from './lib/webUi';
 
 const MOBILE_MODES = new Set(['mobile-standalone', 'standalone', 'mobile-remote', 'remote']);
-
-function readStoredUi(): WebUi | null {
-  try {
-    const raw = localStorage.getItem(UI_KEY);
-    return raw === 'desktop' || raw === 'mobile' ? raw : null;
-  } catch {
-    return null;
-  }
-}
-
-function storeUi(ui: WebUi | null) {
-  try {
-    if (ui) localStorage.setItem(UI_KEY, ui);
-    else localStorage.removeItem(UI_KEY);
-  } catch { /* private mode */ }
-}
 
 function looksLikeTouchDevice(): boolean {
   const ua = navigator.userAgent;
@@ -73,8 +56,29 @@ const params = new URLSearchParams(window.location.search);
 document.documentElement.dataset.webUi = pickUi(params);
 registerServiceWorker();
 
-if (document.documentElement.dataset.webUi === 'mobile') {
+// The full editor on a touch device gets a way back to the mobile layout;
+// the editor itself has no such control.
+function addMobileLayoutButton() {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = 'Mobile layout';
+  button.setAttribute('aria-label', 'Switch to the mobile layout');
+  button.style.cssText = [
+    'position:fixed', 'z-index:2147483000',
+    'right:calc(12px + env(safe-area-inset-right, 0px))',
+    'bottom:calc(44px + env(safe-area-inset-bottom, 0px))',
+    'padding:8px 12px', 'border-radius:999px', 'border:1px solid rgba(187,134,252,.6)',
+    'background:rgba(10,10,12,.85)', 'color:#e8e8ee', 'font:600 13px -apple-system,system-ui,sans-serif',
+  ].join(';');
+  button.addEventListener('click', () => switchWebUi('mobile'));
+  document.body.appendChild(button);
+}
+
+const ui = document.documentElement.dataset.webUi as WebUi;
+const isPopup = params.has('mode');
+if (ui === 'mobile') {
   void import('./native-mobile-main');
 } else {
   void import('./main');
+  if (!isPopup && looksLikeTouchDevice()) addMobileLayoutButton();
 }
