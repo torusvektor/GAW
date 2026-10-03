@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Ghost Web Core</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0a0a0c; --panel: #15161b; --line: #2a2c35; --text: #e8e8ee; --muted: #8a8c99; --accent: #bb86fc; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body { display: grid; grid-template-rows: 1fr auto; }
+    #stage { position: relative; min-height: 0; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #status { position: absolute; left: 12px; top: 12px; padding: 6px 10px; border-radius: 6px; background: rgba(0,0,0,.6); font: 12px ui-monospace, monospace; white-space: pre; pointer-events: none; }
+    #status.error { color: #ff8a8a; }
+    #controls { display: flex; flex-wrap: wrap; gap: 12px 20px; padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); background: var(--panel); border-top: 1px solid var(--line); }
+    label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+    input[type=range] { width: 140px; accent-color: var(--accent); }
+    select, button { background: #1f2027; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit; }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="status">Načítám…</div>
+  </div>
+  <div id="controls">
+    <label>Vrstva B <select id="source">
+      <option value="gpu:planet">GPU planeta</option>
+      <option value="isf-proxy">ISF proxy</option>
+      <option value="color">Barva</option>
+    </select></label>
+    <label>Prolnutí <select id="blend">
+      <option>normal</option><option selected>screen</option><option>add</option><option>multiply</option>
+      <option>difference</option><option>overlay</option><option>hue</option>
+    </select></label>
+    <label>Krytí B <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.85" /></label>
+    <label>Efekt <select id="effect">
+      <option value="">žádný</option><option value="invert:1">invert</option><option value="hue:0.5">hue</option>
+      <option value="posterize:6">posterize</option><option value="grayscale:1">grayscale</option>
+    </select></label>
+    <label>Audio (simulace) <input id="audio" type="range" min="0" max="1" step="0.01" value="0.4" /></label>
+    <label><input id="pin" type="checkbox" checked /> Corner pin</label>
+  </div>
+  <script type="module">
+    import init, { WebCore } from './pkg/ghost_web_core.js';
+
+    const canvas = document.getElementById('canvas');
+    const statusEl = document.getElementById('status');
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (text, error = false) => { statusEl.textContent = text; statusEl.classList.toggle('error', error); };
+
+    function fitCanvas() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+      canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    }
+
+    function sceneCommands(t) {
+      const pin = $('pin').checked;
+      const wobble = pin ? 0.06 * Math.sin(t * 0.7) : 0;
+      const corners = pin
+        ? { topLeft: { x: 0.12 + wobble, y: 0.88 }, topRight: { x: 0.9, y: 0.82 - wobble },
+            bottomRight: { x: 0.86 - wobble, y: 0.1 }, bottomLeft: { x: 0.08, y: 0.16 + wobble } }
+        : { topLeft: { x: 0, y: 1 }, topRight: { x: 1, y: 1 }, bottomRight: { x: 1, y: 0 }, bottomLeft: { x: 0, y: 0 } };
+      const level = Number($('audio').value);
+      const beat = (Math.sin(t * Math.PI * 4) > 0.9) ? 1 : 0; // 120 bpm pulse
+      return [
+        { type: 'upsert_layer', layer_id: 'A', z_index: 0, opacity: 1, blend_mode: 'normal' },
+        { type: 'set_layer_source', layer_id: 'A', source_type: 'color' },
+        { type: 'set_layer_color', layer_id: 'A', rgba: [0.06 + 0.04 * Math.sin(t), 0.05, 0.16, 1] },
+        { type: 'upsert_layer', layer_id: 'B', z_index: 1, opacity: Number($('opacity').value), blend_mode: $('blend').value, corners },
+        { type: 'set_layer_source', layer_id: 'B', source_type: $('source').value },
+        { type: 'set_layer_color', layer_id: 'B', rgba: [0.9, 0.3, 0.8, 1] },
+        { type: 'set_layer_effects', layer_id: 'B', effects: $('effect').value ? [$('effect').value] : [] },
+        { type: 'set_audio_state', level, bass: level * (0.6 + 0.4 * beat), mid: level * 0.5, treble: level * 0.3, beat, kick: beat, bpm: 120, active: level > 0 },
+      ];
+    }
+
+    async function main() {
+      if (!navigator.gpu) {
+        setStatus('Tento prohlížeč nemá WebGPU.\nZkus Chrome/Edge (Mac, Android) nebo Safari na iOS/macOS 26.', true);
+        return;
+      }
+      await init();
+      fitCanvas();
+      let core;
+      try {
+        core = await WebCore.create(canvas);
+      } catch (error) {
+        setStatus('WebGPU se nepodařilo spustit:\n' + error, true);
+        return;
+      }
+      core.apply(JSON.stringify([{ type: 'set_beat_clock', beat: 0, bpm: 120 }]));
+      window.__core = core;
+      window.addEventListener('resize', () => { fitCanvas(); core.resize(canvas.width, canvas.height); });
+
+      let frames = 0, last = performance.now(), fps = 0, failed = false;
+      const loop = (now) => {
+        if (failed) return;
+        const t = now / 1000;
+        try {
+          core.apply(JSON.stringify(sceneCommands(t)));
+          core.render(t);
+        } catch (error) {
+          failed = true;
+          setStatus('Chyba vykreslení:\n' + error, true);
+          return;
+        }
+        frames++;
+        if (now - last > 500) { fps = Math.round(frames * 1000 / (now - last)); frames = 0; last = now; }
+        setStatus(`Ghost Web Core (Wasm + WebGPU)\n${core.adapter}\n${canvas.width}×${canvas.height} · ${fps} fps · ${core.layerCount} vrstvy\n${core.layoutInfo}`);
+        window.__frames = (window.__frames || 0) + 1;
+        requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    }
+    main().catch((error) => setStatus(String(error), true));
+  </script>
+</body>
+</html>
